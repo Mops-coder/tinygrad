@@ -26,6 +26,9 @@ class AMFirmware:
     self.adev = adev
     def fmt_ver(hwip): return '_'.join(map(str, adev.ip_ver[hwip]))
 
+    # mi50 fork: Vega 20 ships under linux-firmware's legacy names (amdgpu_ucode_legacy_naming: "vega20") with v1.0 headers
+    if adev.ip_ver[am.MP0_HWIP] == (11,0,2): return self._init_vega20()
+
     # Load SOS firmware
     self.sos_fw = {}
 
@@ -106,6 +109,44 @@ class AMFirmware:
         self.descs += [self.desc(blob, off, sz, getattr(am, f'GFX_FW_TYPE_RLC_{mem}'))]
 
     self.descs += [self.desc(blob, hdr0.header.ucode_array_offset_bytes, hdr0.header.ucode_size_bytes, am.GFX_FW_TYPE_RLC_G)]
+
+  def _init_vega20(self):
+    """Vega 20 / MI50 firmware set, measured 2026-10-13 (egpu/mi50/port/Vega20 Firmware Facts.md):
+    vega20_sos.bin is a psp v1.0 header = sys driver + sOS back to back (Linux psp_init_sos_microcode: sys = ucode[0:sos.offset_bytes],
+    sos = ucode[sos.offset_bytes:+sos.size_bytes]); no KDB/TOC/SPL/RL. The PSP hands the non-PSP firmware over in Linux's ucode enum
+    order (amdgpu_psp.c psp_load_non_psp_fw): SDMA0, SDMA1, MEC1 code, MEC1 JT, RLC restore lists (v2.1, when sized), RLC_G, then
+    SMC (amdgpu_cgs.c registers vega20_smc.bin as AMDGPU_UCODE_ID_SMC -> GFX_FW_TYPE_SMU) - so SMC goes LAST in descs here and
+    smu_psp_desc (which AM_PSP loads before the TMR) is deliberately not set. CE/PFP/ME (gfx ring) and MEC2 are not loaded:
+    compute uses MEC1 pipe 0 only; add them if bring-up shows the sOS needs them. ASD is kept for a LOAD_ASD command."""
+    self.sos_fw, self.ucode_start, self.descs = {}, {}, []
+    blob, hdr = self.load_fw("vega20_sos.bin", am.struct_psp_firmware_header_v1_0)
+    assert (hdr.header.header_version_major, hdr.header.header_version_minor) == (1, 0), "vega20_sos.bin: expected a v1.0 psp header"
+    base = hdr.header.ucode_array_offset_bytes
+    self.sos_fw[am.PSP_FW_TYPE_PSP_SYS_DRV] = blob[base:base + hdr.sos.offset_bytes]
+    self.sos_fw[am.PSP_FW_TYPE_PSP_SOS] = blob[base + hdr.sos.offset_bytes:base + hdr.sos.offset_bytes + hdr.sos.size_bytes]
+
+    for fname, fw_type in [("vega20_sdma.bin", am.GFX_FW_TYPE_SDMA0), ("vega20_sdma1.bin", am.GFX_FW_TYPE_SDMA1)]:
+      blob, hdr = self.load_fw(fname, am.struct_sdma_firmware_header_v1_0)
+      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, fw_type)]
+
+    blob, hdr = self.load_fw("vega20_mec.bin", am.struct_gfx_firmware_header_v1_0)
+    ucode_off = hdr.header.ucode_array_offset_bytes
+    self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes - hdr.jt_size * 4, am.GFX_FW_TYPE_CP_MEC)]
+    self.descs += [self.desc(blob, ucode_off + hdr.jt_offset * 4, hdr.jt_size * 4, am.GFX_FW_TYPE_CP_MEC_ME1)]
+
+    blob, hdr0, hdr1 = self.load_fw("vega20_rlc.bin", am.struct_rlc_firmware_header_v2_0, am.struct_rlc_firmware_header_v2_1)
+    if hdr0.header.header_version_minor >= 1:
+      for mem, fmem in [('LIST_SRM_CNTL', 'list_cntl'), ('LIST_GPM_MEM', 'list_gpm'), ('LIST_SRM_MEM', 'list_srm')]:
+        off, sz = getattr(hdr1, f'save_restore_{fmem}_offset_bytes'), getattr(hdr1, f'save_restore_{fmem}_size_bytes')
+        if sz: self.descs += [self.desc(blob, off, sz, getattr(am, f'GFX_FW_TYPE_RLC_RESTORE_{mem}'))]   # Linux amdgpu_rlc.c: only when sized
+    self.descs += [self.desc(blob, hdr0.header.ucode_array_offset_bytes, hdr0.header.ucode_size_bytes, am.GFX_FW_TYPE_RLC_G)]
+
+    blob, hdr = self.load_fw("vega20_smc.bin", am.struct_smc_firmware_header_v1_0)
+    self.smu_version = hdr.header.ucode_version
+    self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, am.GFX_FW_TYPE_SMU)]
+
+    blob, hdr = self.load_fw("vega20_asd.bin", am.struct_psp_firmware_header_v1_0)
+    self.asd_fw = blob[hdr.header.ucode_array_offset_bytes:hdr.header.ucode_array_offset_bytes + hdr.header.ucode_size_bytes]
 
   def load_fw(self, fname:str, *headers, versioned_header:str|None=None):
     blob = memoryview(bytearray(fetch_fw("amdgpu", fname, fw.hashes[fname])))
@@ -258,7 +299,13 @@ class AMDev:
   def paddr2xgmi(self, paddr:int) -> int: return self.gmc.paddr_base + paddr
   def xgmi2paddr(self, xgmi_paddr:int) -> int: return xgmi_paddr - self.gmc.paddr_base
 
-  def reg(self, reg:str) -> AMRegister: return self.__dict__[reg]
+  def reg(self, reg:str) -> AMRegister: return getattr(self, reg)
+  def __getattr__(self, name:str):
+    # mi50 fork: Vega-era asic_reg headers (gc_9_0, mmhub_1_0, nbio_7_4, hdp_4_0, osssys_4_0, sdma0_4_2, mp_11_0, thm_11_0_2) name
+    # registers mm*, the driver code says reg*; same fallback AMDIP.__getattr__ has in support/amd.py. Only reached when normal
+    # attribute lookup fails, so gfx11/gfx12/MI300 (reg* names) are untouched.
+    if name.startswith('reg') and (alt:='mm' + name[3:]) in self.__dict__: return self.__dict__[alt]
+    raise AttributeError(f"{type(self).__name__} has no attribute {name}")
 
   def rreg(self, reg:int) -> int:
     val = self.indirect_rreg(reg) if reg >= len(self.mmio) else self.mmio[reg]

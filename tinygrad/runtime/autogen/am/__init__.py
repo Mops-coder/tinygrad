@@ -16,8 +16,19 @@ reg_files = {
   "mmhub": [(1,8,0), (3,0,0), (3,0,1), (3,0,2), (3,3,0), (4,1,0)],
   "nbio": [(4,3,0), (7,2,0), (7,7,0), (7,9,0), (7,11,0)], "nbif": [(6,3,1)],
   "mp": [(11,0,0), (13,0,0), (14,0,2)], "hdp": [(4,4,2), (6,0,0), (7,0,0)],
-  "osssys": [(4,4,2), (6,0,0), (6,1,0), (7,0,0)], "sdma": [(4,4,2)]
+  "osssys": [(4,4,2), (6,0,0), (6,1,0), (7,0,0)], "sdma": [(4,4,2)],
+  # mi50 fork (Vega 20 / gfx906, Leon 2026-10-11): the headers Linux uses for CHIP_VEGA20 (gfx_v9_0.c, mmhub_v1_0.c, nbio_v7_4.c,
+  # hdp_v4_0.c, vega10_ih.c, sdma_v4_0.c, vega20_thermal.c). import_module picks the newest listed version <= the card's, so
+  # gc_9_0 serves GC 9.4.0, hdp_4_0 serves 4.2.0, osssys_4_0 serves 4.2.0, nbio_7_4 serves 7.4.0 (nbio_7_2_0 would have been
+  # picked silently otherwise); mmhub 9.4.0 -> mmhub_1_0 needs the override in support/amd.py import_module.
+  "thm": [(11,0,2)],
 }
+reg_files["gc"] += [(9,0)]; reg_files["mmhub"] += [(1,0)]; reg_files["nbio"] += [(7,4)]; reg_files["hdp"] += [(4,0)]; reg_files["osssys"] += [(4,0)]
+reg_files["sdma"] += [(4,2)]
+# mi50 fork: Vega 20's SDMA header lives at asic_reg/sdma0/sdma0_4_2 (names mmSDMA0_*); it is generated as module "sdma_4_2" with the
+# names normalized to SDMA_* so the driver's regSDMA_* lookups work and import_module("sdma", (4,2,0)) picks it (and (4,4,2) still gets sdma_4_4_2)
+reg_dirs = {("sdma", (4,2)): "sdma0/sdma0_4_2"}
+reg_renames = {"sdma0_4_2": "sdma_4_2"}
 
 reg_patterns = {
   "gc": ["GCVM", "GCMC_VM", "CP_(HQD|MQD|MEC|ME_CNTL|PERFMON|RB_WPTR_POLL_CNTL|INT_CNTL|STAT|PFP_PRGRM|ME_PRGRM|COHER_START)", "COMPUTE_",
@@ -28,8 +39,19 @@ reg_patterns = {
                   "BIFC_(DOORBELL_ACCESS_EN_PF|GFX_INT_MONITOR_MASK)", "XCC_DOORBELL_FENCE", "DOORBELL0_CTRL_ENTRY", "GDC_S2A0_S2A_DOORBELL_ENTRY",
                   "S2A_DOORBELL_ENTRY", "RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN", "RCC_DEV0_EPF2_STRAP2"]),
   "nbif": nbio,
-  "mp": ["MP([01]|ASP)_SMN_C2PMSG"], "hdp": ["HDP_MEM_POWER_CTRL"], "oss": ["IH_"], "sdma": ["SDMA_GFX", "SDMA_CNTL"]
+  "mp": ["MP([01]|ASP)_SMN_C2PMSG"], "hdp": ["HDP_MEM_POWER_CTRL"], "oss": ["IH_"], "sdma": ["SDMA_"],  # mi50 fork: whole SDMA block (was SDMA_GFX, SDMA_CNTL)
+  # mi50 fork: Vega 20 SDMA registers live in their own sdma0_4_2 header (both instances share the map; SDMA1 = SDMA0 + base
+  # from the ip-offset table), THM is read directly for temperature/fan (vega20_thermal.c) when no SMU is running
+  "thm": ["CG_(MULT_THERMAL_STATUS|THERMAL_(INT|STATUS|RANGE|CTRL)|FDO_CTRL|TACH)", "THM_TMON"]
 }
+# mi50 fork: the nbio/hdp allowlists above are written for the gfx11/MI300 header naming (BIF_BX_PF0_*, HDP_MEM_POWER_CTRL); the
+# Vega 20 headers (nbio_7_4, hdp_4_0) name the same functions differently. Names = what Linux nbio_v7_4.c / hdp_v4_0.c use.
+reg_patterns["nbio"] = reg_patterns["nbio"] + ["BIF_(FB_EN|DOORBELL_INT_CNTL|IH_DOORBELL_RANGE|SDMA[01]_DOORBELL_RANGE|MMSCH[01]_DOORBELL_RANGE|INTR_CNTL)",
+  "DOORBELL_SELFRING_GPA_APER", "GPU_HDP_FLUSH_(REQ|DONE)", "INTERRUPT_CNTL", "PCIE_(INDEX|DATA)2", "RCC_CONFIG_MEMSIZE",
+  "RCC_DEV0_EPF0_(STRAP0|RCC_DOORBELL_APER_EN)", "RCC_DOORBELL_APER_EN", "REMAP_HDP_(MEM|REG)_FLUSH_CNTL", "BIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL",
+  "HDP_MEM_COHERENCY_FLUSH_CNTL", "BACO_CNTL"]
+reg_patterns["nbif"] = reg_patterns["nbio"]
+reg_patterns["hdp"] = reg_patterns["hdp"] + ["HDP_(EDC_CNT|MEM_POWER_LS|NONSURFACE_BASE|READ_CACHE_INVALIDATE|HOST_PATH_CNTL|MISC_CNTL|MMHUB_CNTL|MEM_COHERENCY_FLUSH_CNTL)"]
 
 soc_patterns = ["SQ_TT", "VGT_EVENT_TYPE", "CS", "MTYPE", "SH"]
 
@@ -65,13 +87,17 @@ def __getattr__(nm):
     case "vega_offsets": return load("am/vega_offsets", [f"{AMD}/include/vega20_ip_offset.h"], srcs=am_src)
     case "regs":
       def genreg(_, files, **kwargs):
-        out = ["__all__ = " + repr([file.split('/')[-1] for file in files])]
-        for file, nm in [(file.replace("mp_11_0_0", "mp_11_0"), file.split('/')[-1]) for file in files]:
+        out = ["__all__ = " + repr([reg_renames.get(file.split('/')[-1], file.split('/')[-1]) for file in files])]
+        for file, nm in [(file.replace("mp_11_0_0", "mp_11_0"), reg_renames.get(file.split('/')[-1], file.split('/')[-1])) for file in files]:
           pats = reg_patterns[prefix := {"osssys": "oss"}.get(x:=nm.split("_", 1)[0], x)]
+          vega_sdma = file.endswith("sdma0_4_2")
 
           def split_name(name): return name[:(pos:=next((i for i,c in enumerate(name) if c.isupper()), len(name)))], name[pos:]
           # handle CDNA's different register names
           def normalize(reg):
+            # mi50 fork: Vega 20 SDMA registers come from the sdma0_4_2 header as mmSDMA0_*; the driver names them regSDMA_* and
+            # addresses SDMA1 as instance 1 with the same offsets + its own base (Linux sdma_v4_0.c sdma_v4_0_get_reg_offset)
+            if vega_sdma: return reg.replace("SDMA0_", "SDMA_", 1)
             return s[0] + prefix.upper()[:2] + s[1] if prefix in ("gc", "mmhub") and (s:=split_name(reg))[1].startswith(("VM_", "MC_VM_")) else reg
           def extract(lines, pat): return ((normalize(m.group(1)), int(m.group(2), 0)) for l in lines if (m:=re.match(pat, l)))
 
@@ -81,10 +107,20 @@ def __getattr__(nm):
                     for reg, fs in itertools.groupby(extract(sh_mask, r'#define\s+(\S+)_MASK\s+(0x[\da-fA-F]+|\d+)'), lambda x: x[0].split('__')[0])}
 
           regs = {reg: (off, defs[f"{reg}_BASE_IDX"], fields.get(split_name(reg)[1], {})) for reg,off in defs.items() if f"{reg}_BASE_IDX" in defs}
+          # mi50 fork: the driver (ops_amd.py memory_barrier/signal_doorbell via AMDIP('nbio'), am/ip.py AM_SOC/AM_GMC) addresses the NBIO
+          # registers by their gfx11/MI300 header names; NBIO 7.4 names the same registers without the BIF_BX_PF0_/BIF_BX0_/RCC_DEV0_EPF0_
+          # prefixes (Linux nbio_v7_4.c uses GPU_HDP_FLUSH_REQ/DONE, REMAP_HDP_MEM_FLUSH_CNTL, PCIE_INDEX2/DATA2, RCC_DOORBELL_APER_EN).
+          # Alias entries so both spellings resolve to the one register (same offset/segment/fields).
+          if nm == "nbio_7_4":
+            for new_name, src in [("mmBIF_BX_PF0_GPU_HDP_FLUSH_REQ", "mmGPU_HDP_FLUSH_REQ"), ("mmBIF_BX_PF0_GPU_HDP_FLUSH_DONE", "mmGPU_HDP_FLUSH_DONE"),
+                                  ("mmBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL", "mmREMAP_HDP_MEM_FLUSH_CNTL"), ("mmBIF_BX0_PCIE_INDEX2", "mmPCIE_INDEX2"),
+                                  ("mmBIF_BX0_PCIE_DATA2", "mmPCIE_DATA2"), ("mmRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN", "mmRCC_DOORBELL_APER_EN"),
+                                  ("mmBIF_BX0_BIF_DOORBELL_INT_CNTL", "mmBIF_DOORBELL_INT_CNTL")]:
+              if src in regs: regs[new_name] = regs[src]
           print(f"defined {len(regs)} registers for {nm}")
           out.extend([f"{nm} = {{"] + [f"  {k!r}: {v!r}," for k,v in regs.items()] + ["}"])
         return "\n".join(out)
-      return load("am/regs", [AMDINC + "/asic_reg/" + {"osssys":"oss"}.get(pre, pre) + f"/{pre}_{'_'.join(map(str, ver))}"
+      return load("am/regs", [AMDINC + "/asic_reg/" + reg_dirs.get((pre, ver), {"osssys":"oss"}.get(pre, pre) + f"/{pre}_{'_'.join(map(str, ver))}")
                               for pre in reg_files for ver in sorted(reg_files[pre])], srcs=am_src, gen=genreg)
     case "soc_9" | "soc_11" | "soc_12":
       return load(f"am/{nm}", ["{}/projects/aqlprofile/linux/" + {9: "vega10", 11: "soc21", 12: "soc24"}[int(nm.split('_')[1])] + "_enum.h"],

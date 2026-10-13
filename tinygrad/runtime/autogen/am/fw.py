@@ -104,4 +104,17 @@ hashes = {
   'gc_9_4_3_rlc.bin': '54cbd0de3a0ec35d2e58e992babeee2a237f870ccdf37e734652e4daeeba59d5',
   'gc_9_4_4_rlc.bin': 'e0c3585c72f8136670ca63e607fba32c1ae4948f493f13e33fc4d466bd6318a8',
   'gc_9_5_0_rlc.bin': '9b1268f5751153fe57f527c9acb417bfa53ed42c9bc083c9d3da2ba61fe5fdc4',
+  # mi50 fork: Vega 20 (Instinct MI50) firmware, sha256 of amdgpu/vega20_*.bin at the pinned linux-firmware commit (measured 2026-10-13)
+  'vega20_sos.bin': '0b162ed3731537b410f3bb48fa89a0111752644abcd72e5c8ff6112c83b4a193',
+  'vega20_asd.bin': '80ed634a9cec99e3520a6ac6fcb652b940bf81ca19f6f9aabccd91e1c8710482',
+  'vega20_ta.bin': 'aea10970b0530e2e11f84a5c0444315c78b109106a02a41b4eeaea3ac96d56dc',
+  'vega20_smc.bin': 'ba35e00f1971b63044a0d6c7795f1db82ab4a9925747d73e77b4de9657d51dfc',
+  'vega20_sdma.bin': '1457d02c5c7bc0d69b7aa456867cd99d73789441b34ff2c6c982a87d9d600875',
+  'vega20_sdma1.bin': 'd61b687e9f3bcd930b236f2922ff352de3209c99e026403be6c9a59f2add1b90',
+  'vega20_mec.bin': '7275323c00200905f6c1efaadb7d18d5e9f76f0a3edfa06cc86fc8b2bb2e904e',
+  'vega20_mec2.bin': '7275323c00200905f6c1efaadb7d18d5e9f76f0a3edfa06cc86fc8b2bb2e904e',
+  'vega20_rlc.bin': '786416def28a7a2f2db4abd5cecae5d4694fe1368f011ce2b26e100f9f008a4a',
+  'vega20_pfp.bin': '37bfd1994b757ff3cef7edb81d0ab969831f689d0cfcf3e9f2f63d7bf148f197',
+  'vega20_me.bin': 'a5889a7bb174437d11125565132de58e00a5ddf0b84104df96ed3930e5fd1c3c',
+  'vega20_ce.bin': 'aa168fc7d3d99c323fd445674eb0227bb5fa0072d95e3e95e9e16e3b3ba55c0f',
 }

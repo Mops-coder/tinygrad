@@ -383,7 +383,11 @@ class RemotePCIDevice(PCIDevice):
     return (resp[1], resp[2]) + ((RemotePCIDevice._recvall(sock, readout_size) if readout_size > 0 else None),) + (fd,)
 
   def __init__(self, devpref:str, pcibus:str, sock:socket.socket):
-    self.sock, self.pcibus, self.dev_id = sock, pcibus, int(pcibus.split(':')[-1]) if ':' in pcibus else 0
+    # mi50 fork: dev_id names the card for the TinyGPU server. "vvvv:dddd" (macOS, from pci_scan_bus) -> vendor<<16|device;
+    # "remote:host:port:N" (Linux REMOTE) -> N; anything else -> 0 (= server picks its first device, upstream behaviour)
+    parts = pcibus.split(':')
+    self.sock, self.pcibus = sock, pcibus
+    self.dev_id = (int(parts[0], 16) << 16 | int(parts[1], 16)) if len(parts) == 2 else (int(parts[-1]) if len(parts) > 2 else 0)
     self.peer_group = sock.getpeername()[0]
     for buft in [socket.SO_SNDBUF, socket.SO_RCVBUF]: self.sock.setsockopt(socket.SOL_SOCKET, buft, 64 << 20)
 
@@ -434,7 +438,7 @@ class APLRemotePCIDevice(RemotePCIDevice):
       if i == 0: subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
       time.sleep(0.05)
     else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
-    super().__init__(devpref, "usb4", sock=sock)
+    super().__init__(devpref, pcibus, sock=sock)   # mi50 fork: real "vvvv:dddd" (upstream passed the literal "usb4": dev_id 0, one shared lock for every card)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
