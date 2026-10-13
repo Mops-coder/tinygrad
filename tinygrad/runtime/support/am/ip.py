@@ -28,6 +28,7 @@ class AM_SOC(AM_IP):
     self.ih_srcs_names:dict[int, dict[int, str]] = {**{k: gfx_srcs for k in self.gfx_ih_clients}, **{k: sdma_srcs for k in self.sdma_ih_clients}}
 
   def init_hw(self):
+    if self.adev.ip_ver[am.NBIO_HWIP] == (7,4,0): return self._init_hw_nbio_7_4_0()   # mi50 fork: Vega 20 (design v2 B8)
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
       # fence doorbells for harvested xccs (0xff & ~xcc_mask in the kernel); a fully-unharvested chip keeps the previous 0x0
       live_xccs = sum(1 << i for i in self.adev.regs_offset[am.GC_HWIP] if i not in self.adev.harvested[am.GC_HWIP] and i < 8)
@@ -38,10 +39,48 @@ class AM_SOC(AM_IP):
       self.adev.regBIFC_DOORBELL_ACCESS_EN_PF.write(0xfffff)
     else: self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
     self.adev.regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN.write(0x1)
+
+  def _init_hw_nbio_7_4_0(self):
+    # mi50 fork: Linux soc15_common_hw_init for CHIP_VEGA20 (soc15.c:1248-1275) + soc15_common_late_init (soc15.c:1195-1208), nbio_v7_4.c.
+    # Not ported: amdgpu_nbio_program_aspm (soc15.c:1253; AM clears endpoint ASPM in amdev.py _disable_aspm, design v2 B1/U-H5);
+    # nbio init_registers (soc15.c:1255 -> nbio_v7_4.c:341-357) acts only on NBIO 7.4.4, a no-op for 7.4.0;
+    # remap_hdp_registers (soc15.c:1260-1261 -> nbio_v7_4.c:101-107): the flush uses the un-remapped register, see AM_GMC.flush_hdp.
+    # enable_doorbell_aperture(true): WREG32_FIELD15(RCC_DOORBELL_APER_EN, BIF_DOORBELL_APER_EN, 1) (soc15.c:1264 -> nbio_v7_4.c:208-212)
+    self.adev.regRCC_DOORBELL_APER_EN.update(bif_doorbell_aper_en=1)
+    # soc15_sdma_doorbell_range_init (soc15.c:1234-1245): per instance sdma_doorbell_range(i, true, sdma_engine[i] << 1, sdma_doorbell_range);
+    # nbio_v7_4_sdma_doorbell_range (nbio_v7_4.c:138-177): reg = BIF_SDMA0_DOORBELL_RANGE + instance (instance < 2), read, set OFFSET/SIZE, write.
+    # sdma_engine[0/1] = AMDGPU_VEGA20_DOORBELL_sDMA_ENGINE0/1 (0x100/0x10A), sdma_doorbell_range = 20 (vega20_reg_init.c:72-73, 98;
+    # amdgpu_doorbell.h:137-138); num_instances = 2 for CHIP_VEGA20 (amdgpu_discovery.c:3203).
+    sdma_insts = sorted(self.adev.regs_offset[am.SDMA0_HWIP])
+    if sdma_insts != [0, 1]: raise RuntimeError(f"NBIO 7.4.0 SOC init expects SDMA instances [0, 1] (amdgpu_discovery.c:3203), got {sdma_insts}")
+    for i in sdma_insts:
+      self.adev.reg(f"regBIF_SDMA{i}_DOORBELL_RANGE").update(offset=getattr(am, f"AMDGPU_VEGA20_DOORBELL_sDMA_ENGINE{i}") << 1, size=20)
+    # vega20_ih_irq_init: ih_doorbell_range(use_doorbell=true, doorbell_index) (vega20_ih.c:356-358) with doorbell_index = doorbell_index.ih << 1
+    # (vega20_ih.c:588-589; ih = AMDGPU_VEGA20_DOORBELL_IH 0x178, vega20_reg_init.c:80); nbio_v7_4_ih_doorbell_range: read, OFFSET=index, SIZE=8,
+    # write (nbio_v7_4.c:233-245). Programmed here with the other BIF ranges (design v2 B8); AM_IH leaves IH_DOORBELL_RPTR.enable=0, so inert.
+    self.adev.regBIF_IH_DOORBELL_RANGE.update(offset=am.AMDGPU_VEGA20_DOORBELL_IH << 1, size=8)
+    # soc15_common_late_init: enable_doorbell_selfring_aperture(true) (soc15.c:1205 -> nbio_v7_4.c:214-231): BASE_LOW/HIGH = doorbell.base =
+    # pci_resource_start(pdev, 2) (amdgpu_doorbell_mgr.c:210) = the BAR2 bus address from config space (design v2 B8/U-H7: bar_info()[0] is a
+    # host VA on the TinyGPU path); CNTL = EN=1 | MODE=1 | SIZE=0, written from 0 (nbio_v7_4.c:217-222, 230).
+    from tinygrad.runtime.autogen import pci   # local import: keeps this fork change inside AM_SOC
+    bar2_lo = self.adev.pci_dev.read_config(pci.PCI_BASE_ADDRESS_2, 4)
+    if bar2_lo & pci.PCI_BASE_ADDRESS_SPACE != 0: raise RuntimeError(f"BAR2 is an IO BAR ({bar2_lo:#x}), expected the doorbell memory BAR")
+    is_64bit = bar2_lo & pci.PCI_BASE_ADDRESS_MEM_TYPE_MASK == pci.PCI_BASE_ADDRESS_MEM_TYPE_64
+    bar2_hi = self.adev.pci_dev.read_config(pci.PCI_BASE_ADDRESS_3, 4) if is_64bit else 0
+    if (doorbell_base:=(bar2_hi << 32) | (bar2_lo & pci.PCI_BASE_ADDRESS_MEM_MASK & 0xffffffff)) == 0:
+      raise RuntimeError(f"BAR2 has no assigned bus address (lo={bar2_lo:#x} hi={bar2_hi:#x}); the doorbell self-ring aperture needs one")
+    self.adev.regDOORBELL_SELFRING_GPA_APER_BASE_LOW.write(lo32(doorbell_base))
+    self.adev.regDOORBELL_SELFRING_GPA_APER_BASE_HIGH.write(hi32(doorbell_base))
+    self.adev.regDOORBELL_SELFRING_GPA_APER_CNTL.write(doorbell_selfring_gpa_aper_en=1, doorbell_selfring_gpa_aper_mode=1,
+                                                       doorbell_selfring_gpa_aper_size=0)
+
   def set_clockgating_state(self):
     if self.adev.ip_ver[am.HDP_HWIP] >= (5,2,1): self.adev.regHDP_MEM_POWER_CTRL.update(atomic_mem_power_ctrl_en=1, atomic_mem_power_ds_en=1)
 
   def doorbell_enable(self, port, awid=0, awaddr_31_28_value=0, offset=0, size=0, aid=0):
+    # mi50 fork: no S2A_DOORBELL_ENTRY_* on NBIO 7.4 (nbio_7_4_offset.h; design v2 B8): the SDMA/IH doorbell routing is the BIF_*_DOORBELL_RANGE
+    # programming of _init_hw_nbio_7_4_0 (soc15.c:1266-1272), so this is a no-op there.
+    if self.adev.ip_ver[am.NBIO_HWIP] == (7,4,0): return
     reg = self.adev.reg(f"{'regGDC_S2A0_S2A' if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else 'regS2A'}_DOORBELL_ENTRY_{port}_CTRL")
     val = reg.encode(**{f"s2a_doorbell_port{port}_enable":1, f"s2a_doorbell_port{port}_awid":awid,  f"s2a_doorbell_port{port}_range_size":size,
       f"s2a_doorbell_port{port}_awaddr_31_28_value":awaddr_31_28_value, f"s2a_doorbell_port{port}_range_offset":offset})
@@ -58,6 +97,11 @@ class AM_GMC(AM_IP):
     self.xgmi_seg_sz = self.adev.regGCMC_VM_XGMI_LFB_SIZE.read_bitfields()['pf_lfb_size']<<24 if hasattr(self.adev, 'regGCMC_VM_XGMI_LFB_CNTL') else 0
 
     self.paddr_base = self.xgmi_phys_id * self.xgmi_seg_sz
+    # mi50 fork (design v2 B6): Linux gmc_v9_0_vram_gtt_location: vram_base_offset = gfxhub get_mc_fb_offset() + xgmi node offset
+    # (gmc_v9_0.c:1663-1668); gfxhub_v1_0_get_mc_fb_offset = (u64)RREG32_SOC15(GC, 0, mmMC_VM_FB_OFFSET) << 24 (gfxhub_v1_0.c:34-37); every
+    # page-table PA goes through paddr2xgmi (amdev.py AMPageTableEntry.set_entry), so the fold-in here makes PTEs/PDEs and the TMR address
+    # Linux-correct. Register = gc_9_0 mmMC_VM_FB_OFFSET (table name mmGCMC_VM_FB_OFFSET, GC seg0 + 0x96b = dword 0x296b).
+    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0): self.paddr_base += self.adev.regGCMC_VM_FB_OFFSET.read() << 24
 
     self.fb_base = (self.adev.regMMMC_VM_FB_LOCATION_BASE.read() & 0xFFFFFF) << 24
     self.fb_end = (self.adev.regMMMC_VM_FB_LOCATION_TOP.read() & 0xFFFFFF) << 24
@@ -69,7 +113,9 @@ class AM_GMC(AM_IP):
     self.vm_base = self.adev.mm.va_base
     self.vm_end = min(self.vm_base + (1 << self.adev.mm.va_bits) - 1, 0x7fffffffffff)
 
-    self.trans_futher = self.adev.ip_ver[am.GC_HWIP] < (10, 0, 0)
+    # mi50 fork (design v2 B6): Linux sets gmc.translate_further only for GC 9.4.2 in the shared gfx9 case (gmc_v9_0.c:1906-1923; 9.4.0 at :1908
+    # keeps the default false), so Vega 20 runs the 4-level / block_size-0 layout and get_vm_pde adds no BFS/TF (gmc_v9_0.c:1027-1028).
+    self.trans_futher = self.adev.ip_ver[am.GC_HWIP] < (10, 0, 0) and self.adev.ip_ver[am.GC_HWIP] != (9, 4, 0)
 
     # mi3xx has 48-bit, others have 44-bit address space
     self.address_space_mask = (1 << (48 if self.adev.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else 44)) - 1
@@ -84,9 +130,59 @@ class AM_GMC(AM_IP):
 
     self.pf_status_reg = lambda ip: f"reg{ip}VM_L2_PROTECTION_FAULT_STATUS{'_LO32' if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else ''}"
 
-  def init_hw(self): self.init_hub("MM", insts=self.mm_insts)
+  def init_hw(self):
+    # mi50 fork: golden + HDP init + flush before the hubs (design v2 B9/B10)
+    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0): self._init_hw_vega20_pre_hub()
+    self.init_hub("MM", insts=self.mm_insts)
 
-  def flush_hdp(self): self.adev.wreg(self.adev.reg("regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL").read() // 4, 0x0)
+  def _golden(self, reg, and_mask:int, or_mask:int):
+    # soc15_program_register_sequence (soc15.c:455-485): and_mask != 0xffffffff -> tmp = read; tmp &= ~and_mask; tmp |= or_mask & and_mask; write
+    if and_mask == 0xffffffff: reg.write(or_mask)
+    else: reg.write((reg.read() & ~and_mask) | (or_mask & and_mask))
+
+  def _init_hw_vega20_pre_hub(self):
+    # mi50 fork: the gmc_v9_0_hw_init steps that precede gart_enable (gmc_v9_0.c:2163-2217), in Linux order. Not ported: the VGA lockout
+    # (:2183-2188, keyed on mode_info.num_crtc) and mmhub update_power_gating (:2190-2191, an SMU power-gating message under pg_flags).
+    # 1. gmc_v9_0_init_golden_registers (:2079-2093): MMHUB_HWIP (9,4,0) -> golden_settings_mmhub_1_0_0 + golden_settings_athub_1_0_0 (:333-341)
+    if (mmhub:=self.adev.ip_ver[am.MMHUB_HWIP]) != (9,4,0): raise RuntimeError(f"GC 9.4.0 expects MMHUB 9.4.0 (amdgpu_discovery.c:3207), got {mmhub}")
+    self._golden(self.adev.regDAGB1_WRCLI2, 0x00000007, 0xfe5fe0fa)               # gmc_v9_0.c:334
+    self._golden(self.adev.regMMEA1_DRAM_WR_CLI2GRP_MAP0, 0x00000030, 0x55555565)  # gmc_v9_0.c:335
+    self._golden(self.adev.regRPB_ARB_CNTL, 0x0000ff00, 0x00000800)                # gmc_v9_0.c:339 (athub_1_0 table; design v2 §3 _build_regs row)
+    self._golden(self.adev.regRPB_ARB_CNTL2, 0x00ff00ff, 0x00080008)               # gmc_v9_0.c:340
+    # 2. hdp init_registers (:2193 -> hdp_v4_0_init_registers, hdp_v4_0.c:137-158): HDP 4.2.0 takes no (4,2,1)/(4,4,0) special case;
+    #    FLUSH_INVALIDATE_CACHE=1 via WREG32_FIELD15 (:151), NONSURFACE_BASE = vram_start >> 8, _HI = vram_start >> 40 (:156-157);
+    #    vram_start = fb location base + xgmi node offset (gmc_v9_0.c:1654-1658 -> amdgpu_gmc_vram_location mc->vram_start = base).
+    if (hdp:=self.adev.ip_ver[am.HDP_HWIP]) != (4,2,0): raise RuntimeError(f"GC 9.4.0 expects HDP 4.2.0 (amdgpu_discovery.c:3210), got {hdp}")
+    vram_start = self.fb_base + self.xgmi_phys_id * self.xgmi_seg_sz
+    self.adev.regHDP_MISC_CNTL.update(flush_invalidate_cache=1)
+    self.adev.regHDP_NONSURFACE_BASE.write(vram_start >> 8)
+    self.adev.regHDP_NONSURFACE_BASE_HI.write(vram_start >> 40)
+    # 3. "After HDP is initialized, flush HDP." (:2195-2196)
+    self.flush_hdp()
+    # 4. set_fault_enable_default on both hubs (:2203-2207) is done per hub at the top of init_hub (the GC hub is programmed later by AM_GFX).
+    # 5. the vmid-0 flush before gart_enable (:2208-2212) is not added: AM flushes after every mapping (on_range_mapped) and VM_L2_CNTL2
+    #    invalidates the L1/L2 in init_hub (listed in the report's unknowns).
+
+  def _set_fault_enable_default(self, ip:Literal["MM", "GC"], inst:int):
+    # mi50 fork: gmc_v9_0_hw_init value = true unless amdgpu_vm_fault_stop == AMDGPU_VM_FAULT_STOP_ALWAYS (gmc_v9_0.c:2198-2201; module default 0
+    # amdgpu_drv.c:173, ALWAYS = 2 amdgpu_vm.h:147). gfxhub_v1_0_set_fault_enable_default (gfxhub_v1_0.c:376-411) sets the 11 *_ENABLE_DEFAULT
+    # fields = value and CRASH_ON_NO_RETRY_FAULT / CRASH_ON_RETRY_FAULT = !value; mmhub_v1_0_set_fault_enable_default (mmhub_v1_0.c:425-465) sets
+    # the same 11 fields and touches the CRASH bits only when !value. Both are read-modify-write.
+    en = {f'{x}_protection_fault_enable_default': 1 for x in ['range', 'pde0', 'pde1', 'pde2', 'translate_further', 'nack', 'dummy_page', 'valid',
+                                                               'read', 'write', 'execute']}
+    crash = {'crash_on_no_retry_fault': 0, 'crash_on_retry_fault': 0} if ip == "GC" else {}
+    self.adev.reg(f"reg{ip}VM_L2_PROTECTION_FAULT_CNTL").update(**en, **crash, inst=inst)
+
+  def flush_hdp(self):
+    if self.adev.ip_ver[am.NBIO_HWIP] == (7,4,0):
+      # mi50 fork (design v2 B9): amdgpu_hdp_generic_flush (amdgpu_hdp.c:51-60) writes 0 at rmmio_remap.reg_offset >> 2 then reads memsize;
+      # nbio_v7_4_set_reg_remap's no-remap case makes reg_offset = SOC15_REG_OFFSET(NBIO, 0, mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL)
+      # << 2 (nbio_v7_4.c:792-803), i.e. the register itself (NBIO seg2 0xd20 + 0xf7); memsize = RCC_CONFIG_MEMSIZE (nbio_v7_4.c:133-136,
+      # dword 0xde3).
+      self.adev.regBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL.write(0x0)
+      self.adev.regRCC_CONFIG_MEMSIZE.read()
+      return
+    self.adev.wreg(self.adev.reg("regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL").read() // 4, 0x0)
   def flush_tlb(self, ip:Literal["MM", "GC"], vmid, flush_type=0):
     self.flush_hdp()
 
@@ -119,8 +215,10 @@ class AM_GMC(AM_IP):
       page_table_depth=((2 if self.trans_futher else 3) - page_table.lv), page_table_block_size=9 if self.trans_futher else 0, inst=inst)
 
   def init_hub(self, ip:Literal["MM", "GC"], insts:Iterable[int]):
+    vega20 = self.adev.ip_ver[am.GC_HWIP] == (9,4,0)   # mi50 fork: gfxhub_v1_0 / mmhub_v1_0 deltas (design v2 B10), exact-version gated
     # Init system apertures
     for inst in insts:
+      if vega20: self._set_fault_enable_default(ip, inst)   # gmc_v9_0.c:2203-2207, before this hub's gart_enable (:2217)
       self.adev.reg(f"reg{ip}MC_VM_AGP_BASE").write(0, inst=inst)
       self.adev.reg(f"reg{ip}MC_VM_AGP_BOT").write(0xffffffffffff >> 24, inst=inst) # disable AGP
       self.adev.reg(f"reg{ip}MC_VM_AGP_TOP").write(0, inst=inst)
@@ -133,16 +231,28 @@ class AM_GMC(AM_IP):
       self.adev.reg(f"reg{ip}VM_L2_PROTECTION_FAULT_CNTL2").update(active_page_migration_pte_read_retry=1, inst=inst)
 
       # Init TLB and cache
+      # mi50 fork: gfxhub_v1_0_init_tlb_regs / mmhub_v1_0_init_tlb_regs add ATC_EN=1 (gfxhub_v1_0.c:169, mmhub_v1_0.c:152; mask 0x2000 =
+      # gc_9_0_sh_mask.h:8662 / mmhub_1_0_sh_mask.h:10076)
       self.adev.reg(f"reg{ip}MC_VM_MX_L1_TLB_CNTL").update(enable_l1_tlb=1, system_access_mode=3, enable_advanced_driver_model=1,
-        system_aperture_unmapped_access=0, mtype=self.adev.soc.module.MTYPE_UC, inst=inst)
+        system_aperture_unmapped_access=0, mtype=self.adev.soc.module.MTYPE_UC, **({'atc_en': 1} if vega20 else {}), inst=inst)
 
-      self.adev.reg(f"reg{ip}VM_L2_CNTL").update(enable_l2_cache=1, enable_default_page_out_to_system_memory=1,
+      # mi50 fork: gfxhub_v1_0_init_cache_regs / mmhub_v1_0_init_cache_regs (gfxhub_v1_0.c:179-188, mmhub_v1_0.c:165-174) set ENABLE_L2_CACHE,
+      # ENABLE_L2_FRAGMENT_PROCESSING, L2_PDE0_CACHE_TAG_GENERATION_MODE=0, PDE_FAULT_CLASSIFICATION=0, CONTEXT1_IDENTITY_ACCESS_MODE=1,
+      # IDENTITY_MODE_FRAGMENT_SIZE=0 and never ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY -> dropped on Vega 20 (design v2 B10)
+      self.adev.reg(f"reg{ip}VM_L2_CNTL").update(enable_l2_cache=1, **({} if vega20 else {'enable_default_page_out_to_system_memory': 1}),
         l2_pde0_cache_tag_generation_mode=0, pde_fault_classification=0, context1_identity_access_mode=1, identity_mode_fragment_size=0,
         enable_l2_fragment_processing=int(self.adev.ip_ver[am.GC_HWIP] < (10,0,0)), inst=inst)
       self.adev.reg(f"reg{ip}VM_L2_CNTL2").update(invalidate_all_l1_tlbs=1, invalidate_l2_cache=1, inst=inst)
+      # (Vega 20: mmVM_L2_CNTL3_DEFAULT 0x80100007 with BANK_SELECT=9, L2_CACHE_BIGK_FRAGMENT_SIZE=6 (gfxhub_v1_0.c:195-205, mmhub_v1_0.c:181-191,
+      #  gc_9_0_default.h:595) = 0x80130009 = exactly this write with trans_futher False; checked offline in extra/mi50/ip_soc_gmc_ih_check.py)
       self.adev.reg(f"reg{ip}VM_L2_CNTL3").write(l2_cache_4k_associativity=1, l2_cache_bigk_associativity=1,
         bank_select=12 if self.trans_futher else 9, l2_cache_bigk_fragment_size=9 if self.trans_futher else 6, inst=inst)
-      self.adev.reg(f"reg{ip}VM_L2_CNTL4").write(l2_cache_4k_partition_count=1, inst=inst)
+      if vega20:
+        # mmVM_L2_CNTL4_DEFAULT 0xc1 (gc_9_0_default.h:615, mmhub_1_0_default.h:673) with VMC_TAP_PDE/PTE_REQUEST_PHYSICAL = 0
+        # (gfxhub_v1_0.c:207-215 non-connected_to_cpu branch, mmhub_v1_0.c:193-196), written whole
+        cntl4 = self.adev.reg(f"reg{ip}VM_L2_CNTL4")
+        cntl4.write(0xc1 & ~cntl4.fields_mask('vmc_tap_pde_request_physical', 'vmc_tap_pte_request_physical'), inst=inst)
+      else: self.adev.reg(f"reg{ip}VM_L2_CNTL4").write(l2_cache_4k_partition_count=1, inst=inst)
       if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self.adev.reg(f"reg{ip}VM_L2_CNTL5").write(walker_priority_client_id=0x1ff, inst=inst)
 
       self.enable_vm_addressing(self.adev.mm.root_page_table, ip, vmid=0, inst=inst)
@@ -167,12 +277,18 @@ class AM_GMC(AM_IP):
       extra |= (am.AMDGPU_PDE_PTE if not is_table and pte_lv != am.AMDGPU_VM_PTB else 0)
     else:
       extra |= am.AMDGPU_PTE_MTYPE_VG10(0, self.adev.soc.module.MTYPE_UC if uncached else 0)
-      if is_table and pte_lv == am.AMDGPU_VM_PDB1: extra |= am.AMDGPU_PDE_BFS(0x9)
-      if is_table and pte_lv == am.AMDGPU_VM_PDB0: extra |= am.AMDGPU_PTE_TF
-      if not is_table and pte_lv not in {am.AMDGPU_VM_PTB, am.AMDGPU_VM_PDB0}: extra |= am.AMDGPU_PDE_PTE
+      if self.trans_futher:
+        if is_table and pte_lv == am.AMDGPU_VM_PDB1: extra |= am.AMDGPU_PDE_BFS(0x9)
+        if is_table and pte_lv == am.AMDGPU_VM_PDB0: extra |= am.AMDGPU_PTE_TF
+        if not is_table and pte_lv not in {am.AMDGPU_VM_PTB, am.AMDGPU_VM_PDB0}: extra |= am.AMDGPU_PDE_PTE
+      # mi50 fork (design v2 B10): gmc_v9_0_get_vm_pde returns before any BFS/TF when !translate_further (gmc_v9_0.c:1027-1028), so a huge page
+      # at any PD level keeps its PDE_PTE flag (the gfx10 rule above) and PDB0 is not special
+      elif not is_table and pte_lv != am.AMDGPU_VM_PTB: extra |= am.AMDGPU_PDE_PTE
     return extra
   def is_pte_huge_page(self, pte_lv, pte):
-    if self.adev.ip_ver[am.GC_HWIP] < (10,0,0): return (pte & am.AMDGPU_PDE_PTE) if pte_lv != am.AMDGPU_VM_PDB0 else not (pte & am.AMDGPU_PTE_TF)
+    if self.adev.ip_ver[am.GC_HWIP] < (10,0,0) and self.trans_futher:
+      return (pte & am.AMDGPU_PDE_PTE) if pte_lv != am.AMDGPU_VM_PDB0 else not (pte & am.AMDGPU_PTE_TF)
+    # (gfx9 without translate_further takes this PDE_PTE-only rule too)
     return pte & (am.AMDGPU_PDE_PTE_GFX12 if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else am.AMDGPU_PDE_PTE)
 
 class AM_SMU(AM_IP):
@@ -421,12 +537,33 @@ class AM_IH(AM_IP):
     self.rings = [(*_alloc_ring(self.ring_size), "", 0), (*_alloc_ring(self.ring_size), "_RING1", 1)]
     self.ring_view = self.adev.vram.view(offset=self.rings[0][0], size=self.ring_size, fmt='I')
 
+    # mi50 fork (design v2 B11): nbio_v7_4_ih_control writes INTERRUPT_CNTL2 = adev->dummy_page_addr >> 8 (nbio_v7_4.c:295); Linux's dummy page is a
+    # DMA-mapped HOST page (amdgpu_gart.c:76-86 dma_map_page_attrs), so one host page is taken from the same alloc_sysmem AM_PSP uses (ip.py AM_PSP
+    # init_sw, usb path). The view is kept on self so the mapping stays alive for the GPU's dummy reads.
+    if self.adev.ip_ver[am.OSSSYS_HWIP] == (4,2,0):
+      self.dummy_rd_view, paddrs = self.adev.pci_dev.alloc_sysmem(0x1000)
+      self.dummy_rd_paddr = paddrs[0]
+      # INTERRUPT_CNTL2.IH_DUMMY_RD_ADDR is 32 bits of (addr >> 8) (nbio_7_4 table field (0,31)): the page must be 4 KiB aligned and below 2^40
+      if self.dummy_rd_paddr & 0xfff or (self.dummy_rd_paddr >> 8) >= (1 << 32):
+        raise RuntimeError(f"IH dummy-read page paddr {self.dummy_rd_paddr:#x} does not fit INTERRUPT_CNTL2 (needs 4 KiB alignment and < 2^40)")
+
   def init_hw(self):
+    osssys_4_2_0 = self.adev.ip_ver[am.OSSSYS_HWIP] == (4,2,0)   # mi50 fork: vega20_ih_irq_init is the model (vega20_ih.c:307-388, design v2 B11)
+    if osssys_4_2_0:
+      # vega20_ih_irq_init: rings off (:315, AM's full IH_RB_CNTL writes below carry rb_enable=0), then nbio ih_control (:319 ->
+      # nbio_v7_4.c:290-304): INTERRUPT_CNTL2 = dummy_page_addr >> 8 (:295); INTERRUPT_CNTL read, IH_DUMMY_RD_OVERRIDE=0 ("dummy read disabled
+      # with msi, enabled without msi"), IH_REQ_NONSNOOP_EN=0, write (:296-303). Programmed before any ring is enabled.
+      self.adev.regINTERRUPT_CNTL2.write(self.dummy_rd_paddr >> 8)
+      self.adev.regINTERRUPT_CNTL.update(ih_dummy_rd_override=0, ih_req_nonsnoop_en=0)
+
     for ring_vm, rwptr_vm, suf, ring_id in self.rings:
       self.adev.wreg_pair("regIH_RB_BASE", suf, f"_HI{suf}", self.adev.paddr2mc(ring_vm) >> 8)
 
+      # mi50 fork: vega20_ih_enable_ring sets ring 0's RPTR_REARM = !!adev->irq.msi_enabled (vega20_ih.c:258-259); AM polls the ring with no MSI
+      # (no irq_poller on APLRemotePCIDevice, design v2 B11) -> 0 on OSSSYS 4.2.0; other cards keep AM's 1
+      ring0_flags = {'wptr_overflow_enable': 1, 'rptr_rearm': 0 if osssys_4_2_0 else 1}
       self.adev.reg(f"regIH_RB_CNTL{suf}").write(mc_space=4, wptr_overflow_clear=1, rb_size=((self.ring_size//4)-1).bit_length(),
-        mc_snoop=1, mc_ro=0, mc_vmid=0, **({'wptr_overflow_enable': 1, 'rptr_rearm': 1} if ring_id == 0 else {'rb_full_drain_enable': 1}))
+        mc_snoop=1, mc_ro=0, mc_vmid=0, **(ring0_flags if ring_id == 0 else {'rb_full_drain_enable': 1}))
 
       if ring_id == 0: self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", self.adev.paddr2mc(rwptr_vm))
 
@@ -438,7 +575,9 @@ class AM_IH(AM_IP):
     if self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
       self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
       self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
-      self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
+      # mi50 fork: no IH_MSI_STORM_CTRL in osssys_4_2_0_offset.h (design v2 B11); the BIF_IH_DOORBELL_RANGE write lives in AM_SOC; the retry CAM
+      # (vega20_ih.c:362-377 IH_DOORBELL_RETRY_CAM / IH_RETRY_INT_CAM_CNTL) is skipped: AM runs noretry (SH_MEM_CONFIG.retry_disable=1)
+      if not osssys_4_2_0: self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
 
     # toggle interrupts
     for _, rwptr_vm, suf, ring_id in self.rings:
