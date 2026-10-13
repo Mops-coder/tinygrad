@@ -248,7 +248,7 @@ class Harness:
                       "fork provides AMDev._emergency_quiesce (design §3 amdev.py:160-163 row)")
     if self.adev._ladder_skipped is not None:
       self.report.check(False, f"full-boot init_hw call never happened: partial boot (SCRATCH_REG7 == adev.boot_version = "
-                        f"AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON, amdev.py _boot; NOT a ruling) skipped it; "
+                        f"AMDev.VEGA20_BOOT_VERSION, amdev.py, ruled by Leon 2026-10-13) skipped it; "
                         f"halted before init_hw({', '.join(self.adev._ladder_skipped)}); rerun with AM_RESET=1")
     self.adev.is_booting = False   # amdev.py:239 "Booting done"
     install_smu_lock(self.adev)
@@ -438,7 +438,7 @@ def boot_sw_only(h:"Harness"):
   adev._run_discovery(); adev._build_regs()                                                                              # amdev.py _boot
   # integration 2026-10-13: the amdev branch's _boot (amdev.py:232-233) derives boot_version and, on the Vega 20, runs _vega20_vbios() (required
   # inputs, POST gate, ROM dump: reads only) which sets reserved_vram_size and gc_info; init_sw needs both (amdev report, amdev.py:481-482).
-  adev.boot_version = AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON if adev.is_vega20 else AMDev.Version      # amdev.py:232
+  adev.boot_version = AMDev.VEGA20_BOOT_VERSION if adev.is_vega20 else AMDev.Version      # amdev.py:232
   if adev.is_vega20: adev._vega20_vbios()                                                                                # amdev.py:233
   adev.is_booting = True; adev.init_sw(smi_dev=False)                                                                    # amdev.py:245-246
   install_smu_lock(adev)

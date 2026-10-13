@@ -213,11 +213,12 @@ class AMMemoryManager(MemoryManager):
 
 class AMDev:
   Version = 0xA0000008
-  # mi50 fork: PLACEHOLDER, NOT A RULING - the value is Leon's (design v2 §3 row 1 "value: Leon"). Design B7 only requires it to differ from stock
-  # AM's 0xA0000008 (above) and master's 0xA000000D (tinygrad-master runtime/support/am/amdev.py:145) so a stock-AM SCRATCH_REG7 never passes as a
-  # partial boot on the MI50. Used only when self.is_vega20 (self.boot_version); every other card keeps AMDev.Version byte for byte.
-  VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON = 0x0066A100
-  assert VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON not in (Version, 0xA000000D)
+  # mi50 fork: the MI50's partial-boot marker (SCRATCH_REG7), RULED BY LEON 2026-10-13 ("the placeholder code is good enough"). Design B7 only
+  # requires it to differ from stock AM's 0xA0000008 (above) and master's 0xA000000D (tinygrad-master runtime/support/am/amdev.py:145) so a
+  # stock-AM SCRATCH_REG7 never passes as a partial boot on the MI50. Used only when self.is_vega20 (self.boot_version); every other card keeps
+  # AMDev.Version byte for byte.
+  VEGA20_BOOT_VERSION = 0x0066A100
+  assert VEGA20_BOOT_VERSION not in (Version, 0xA000000D)
 
   def _disable_aspm(self):
     # L1 across retimers makes reads oscillate to 0xffffffff; power on defaults it enabled. Clearing the GPU endpoint
@@ -255,7 +256,7 @@ class AMDev:
     self._run_discovery()
     self._build_regs()
     # mi50 fork: the partial-boot marker is per card; non-Vega cards keep AMDev.Version byte for byte
-    self.boot_version = AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON if self.is_vega20 else AMDev.Version
+    self.boot_version = AMDev.VEGA20_BOOT_VERSION if self.is_vega20 else AMDev.Version
     if self.is_vega20: self._vega20_vbios()   # B4: required inputs, POST gate, ROM dump -> gc_info / reserved_vram_size / powerplay limits
 
     # AM boot Process:
@@ -543,8 +544,9 @@ class AMDev:
         raise RuntimeError(f"MI50: VBIOS firmware VRAM region [{start:#x}, {start+size:#x}) overlaps AM's boot region [0, 32 MiB) or exceeds VRAM "
                            f"{self.vram_size:#x}: moving boot_size is Leon's decision (design v2 §8 U-M1)")
       self.reserved_vram_size = self.vram_size - start
-    else: self.reserved_vram_size = _required_env("AM_MI50_RESERVED_VRAM_MB", "top-of-VRAM reservation in MiB (no vram_usagebyfirmware region)",
-                                                  0, self.vram_size >> 20) << 20   # no table / zero size: explicit value required
+    else: self.reserved_vram_size = 0   # RULED BY LEON 2026-10-13 ("use the optimal one"): no vram_usagebyfirmware region -> reserve nothing, which
+                                       # is exactly what bare-metal Linux does for CHIP_VEGA20 (see the review note above); a declared region is still
+                                       # honoured (superset of Linux, costs only the firmware's own few MiB at the top)
     if DEBUG >= 2: print(f"am {self.devfmt}: MI50 VBIOS ok, gc_info se={self.gc_info.gc_num_se} cu/sh={self.gc_info.gc_num_cu_per_sh} "
                          f"reserved_vram={self.reserved_vram_size >> 20} MiB bootup sclk={fwi.bootup_sclk_in10khz / 100} MHz")
 

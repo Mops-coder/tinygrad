@@ -165,7 +165,7 @@ check(dev.regSDMA_F32_CNTL.addr == {0: 0x1260 + 0x2a, 1: 0x1860 + 0x2a}, "regSDM
 check(dev.regSDMA_F32_CNTL.fields_mask('halt') == 1 and dev.regCP_MEC_CNTL.encode(mec_invalidate_icache=1, mec_me1_pipe0_reset=1, mec_me1_pipe1_reset=1,
       mec_me1_pipe2_reset=1, mec_me1_pipe3_reset=1, mec_me2_pipe0_reset=1, mec_me2_pipe1_reset=1, mec_me1_halt=1, mec_me2_halt=1) == 0x503f0010,
       "SDMA HALT mask 1 (sdma0_4_2_sh_mask.h:586); MEC disable mask 0x503f0010 (gfx_v9_0.c:3467-3476 bits 4,16-21,28,30)")
-dev.boot_version = AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON
+dev.boot_version = AMDev.VEGA20_BOOT_VERSION
 dev._vega20_vbios()
 check(dev.vega20_posted and dev.vbios.img == img and dev.gc_info.gc_num_se == SYN["se"] and dev.powerplay["SoftwareShutdownTemp"] == SYN["shutdown_temp"],
       "_vega20_vbios: POST seen, ROM dumped through the register objects, gc_info and powerplay limits set")
@@ -179,8 +179,7 @@ raises(d3._vega20_vbios, "bios_scratch_reg_startaddr", "VBIOS scratch base != nb
 d4 = fake_dev(FakeMMIO(synthetic_image(fw_start_kb=16 << 10), seed=seed())); d4._run_discovery(); d4._build_regs()
 raises(d4._vega20_vbios, "overlaps AM's boot region", "fw region inside the 32 MiB boot region refused (U-M1)")
 d5 = fake_dev(FakeMMIO(synthetic_image(vru_version=None), seed=seed())); d5._run_discovery(); d5._build_regs()
-raises(d5._vega20_vbios, "AM_MI50_RESERVED_VRAM_MB", "no vram_usagebyfirmware -> AM_MI50_RESERVED_VRAM_MB required")
-os.environ["AM_MI50_RESERVED_VRAM_MB"] = "64"; d5._vega20_vbios(); check(d5.reserved_vram_size == 64 << 20, "explicit AM_MI50_RESERVED_VRAM_MB honoured"); del os.environ["AM_MI50_RESERVED_VRAM_MB"]
+d5._vega20_vbios(); check(d5.reserved_vram_size == 0, "no vram_usagebyfirmware -> reserved_vram_size 0 (Leon 2026-10-13: the optimal one = bare-metal Linux reserves nothing)")
 d6 = fake_dev(FakeMMIO(img, seed=seed(temp=0))); d6._run_discovery(); d6._build_regs(); raises(d6._vega20_vbios, "invalid", "CTF_TEMP 0 is an invalid reading (§7.0 rule 4)")
 d7 = fake_dev(FakeMMIO(img, seed=seed(temp=95))); d7._run_discovery(); d7._build_regs(); raises(d7._vega20_vbios, ">= threshold", "hotspot 95 >= AM_MI50_TEMP_C 90 refused")
 for var in ("AM_MI50_PPT_W", "AM_MI50_TEMP_C"):
@@ -204,8 +203,8 @@ g11.regs_offset = __import__("collections").defaultdict(dict, {h: {0: (0,)*6} fo
 g11._build_regs()
 check(not any(n in g11.__dict__ for n in ("mmROM_INDEX", "mmCG_MULT_THERMAL_STATUS", "mmRPB_ARB_CNTL", "mmSDMA_F32_CNTL")) and "regCP_MEC_RS64_CNTL" in g11.__dict__,
       "gfx11 fake: no thm/smuio/athub/sdma_4_2 tables bound (gate GC == (9,4,0) / SDMA in {4.2.0, 4.4.2, 4.4.4}); gc_11_0_0 bound")
-check((AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON if g11.is_vega20 else AMDev.Version) == 0xA0000008, "non-Vega boot_version == AMDev.Version 0xA0000008")
-check(AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON not in (0xA0000008, 0xA000000D), "Vega placeholder differs from stock 0xA0000008 and master 0xA000000D")
+check((AMDev.VEGA20_BOOT_VERSION if g11.is_vega20 else AMDev.Version) == 0xA0000008, "non-Vega boot_version == AMDev.Version 0xA0000008")
+check(AMDev.VEGA20_BOOT_VERSION not in (0xA0000008, 0xA000000D), "Vega placeholder differs from stock 0xA0000008 and master 0xA000000D")
 q = fake_dev(FakeMMIO(img)); q.is_vega20 = False; q._emergency_quiesce(); check(q.mmio.log == [], "_emergency_quiesce is a no-op when not Vega 20")
 
 # ---------------- (6) emergency quiesce + __init__ wrapper ----------------
