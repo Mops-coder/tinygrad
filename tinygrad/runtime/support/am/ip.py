@@ -249,12 +249,67 @@ class AM_SMU(AM_IP):
     return (self.adev.mmMP1_SMN_C2PMSG_82 if not debug else self.adev.mmMP1_SMN_C2PMSG_53).read() if read_back_arg else None
 
 class AM_GFX(AM_IP):
+  # mi50 fork (Vega20 Port Design v2 B14.4): the three gfx9 golden tables Linux applies for GC 9.4.0, in Linux order
+  # (gfx_v9_0_init_golden_registers: golden_settings_gc_9_0 + golden_settings_gc_9_0_vg20, gfx_v9_0.c:1115-1122, then
+  # golden_settings_gc_9_x_common :1154-1157). Entries are (register, and_mask, or_mask) exactly as SOC15_REG_GOLDEN_VALUE lists them;
+  # applied with the soc15_program_register_sequence semantics (soc15.c:463-475): raw write when and_mask == 0xffffffff,
+  # else (read & ~and_mask) | (or_mask & and_mask). The GB_ADDR_CONFIG entry is the (read & ~0xf3e777ff) | 0x22014042 of :2053-2055.
+  GOLDEN_GC_9_0 = [                                                # gfx_v9_0.c:676-698
+    ("regDB_DEBUG2", 0xf00fffff, 0x00000400),                      # :678
+    ("regDB_DEBUG3", 0x80000000, 0x80000000),                      # :679
+    ("regGB_GPU_ID", 0x0000000f, 0x00000000),                      # :680
+    ("regPA_SC_BINNER_EVENT_CNTL_3", 0x00000003, 0x82400024),      # :681
+    ("regPA_SC_ENHANCE", 0x3fffffff, 0x00000001),                  # :682
+    ("regPA_SC_LINE_STIPPLE_STATE", 0x0000ff0f, 0x00000000),       # :683
+    ("regSH_MEM_CONFIG", 0x00001000, 0x00001000),                  # :684
+    ("regSPI_RESOURCE_RESERVE_CU_0", 0x0007ffff, 0x00000800),      # :685
+    ("regSPI_RESOURCE_RESERVE_CU_1", 0x0007ffff, 0x00000800),      # :686
+    ("regSPI_RESOURCE_RESERVE_EN_CU_0", 0x01ffffff, 0x00ffff87),   # :687
+    ("regSPI_RESOURCE_RESERVE_EN_CU_1", 0x01ffffff, 0x00ffff8f),   # :688
+    ("regSQC_CONFIG", 0x03000000, 0x020a2000),                     # :689
+    ("regTA_CNTL_AUX", 0xfffffeef, 0x010b0000),                    # :690
+    ("regTCP_CHAN_STEER_HI", 0xffffffff, 0x4a2c0e68),              # :691
+    ("regTCP_CHAN_STEER_LO", 0xffffffff, 0xb5d3f197),              # :692
+    ("regVGT_CACHE_INVALIDATION", 0x3fff3af3, 0x19200000),         # :693
+    ("regVGT_GS_MAX_WAVE_ID", 0x00000fff, 0x000003ff),             # :694
+    ("regCP_MEC1_F32_INT_DIS", 0x00000800, 0x00000800),            # :695
+    ("regCP_MEC2_F32_INT_DIS", 0x00000800, 0x00000800),            # :696
+    ("regCP_DEBUG", 0x00008000, 0x00008000)]                       # :697
+  GOLDEN_GC_9_0_VG20 = [                                           # gfx_v9_0.c:722-735
+    ("regCB_DCC_CONFIG", 0x0f000080, 0x04000080),                  # :724
+    ("regCB_HW_CONTROL_2", 0x0f000000, 0x0a000000),                # :725
+    ("regCB_HW_CONTROL_3", 0x30000000, 0x10000000),                # :726
+    ("regGB_ADDR_CONFIG", 0xf3e777ff, 0x22014042),                 # :727
+    ("regGB_ADDR_CONFIG_READ", 0xf3e777ff, 0x22014042),            # :728
+    ("regDB_DEBUG2", 0x00003e00, 0x00000400),                      # :729
+    ("regPA_SC_ENHANCE_1", 0xff840000, 0x04040000),                # :730
+    ("regRMI_UTCL1_CNTL2", 0x00030000, 0x00030000),                # :731
+    ("regSPI_CONFIG_CNTL_1", 0xffff010f, 0x01000107),              # :732
+    ("regTA_CNTL_AUX", 0x000b0000, 0x000b0000),                    # :733
+    ("regTD_CNTL", 0x01000000, 0x01000000)]                        # :734
+  GOLDEN_GC_9_X_COMMON = [                                         # gfx_v9_0.c:815-820
+    ("regCP_SD_CNTL", 0xffffffff, 0x000001ff),                     # :817
+    ("regGRBM_CAM_INDEX", 0xffffffff, 0x00000000),                 # :818
+    ("regGRBM_CAM_DATA", 0xffffffff, 0x2544c382)]                  # :819
+
   def init_sw(self):
     self.xccs = sum(1 for i in self.adev.regs_offset[am.GC_HWIP] if i not in self.adev.harvested[am.GC_HWIP])
     self.mqd_paddr = [self.adev.mm.palloc(0x1000 * self.xccs, zero=False, boot=True) for i in range(2)]
     self.mqd_mc = [self.adev.paddr2mc(mqd_paddr) for mqd_paddr in self.mqd_paddr]
 
+    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0):
+      # mi50 fork (design v2 B14.6): the RLC clear-state buffer Linux builds in amdgpu_gfx_rlc_init_csb (amdgpu_rlc.c:128-148: get_csb_size dwords,
+      # dws*4 bytes, PAGE_SIZE aligned) and fills in gfx_v9_0_init_csb (gfx_v9_0.c:2775). Boot memory like the MQDs; MC address like mqd_mc.
+      self.csb_dws = self._csb_gfx9()
+      self.csb_paddr = self.adev.mm.palloc((len(self.csb_dws) * 4 + 0xfff) & ~0xfff, boot=True)
+      self.csb_mc = self.adev.paddr2mc(self.csb_paddr)
+      # is_rlc_v2_1 = RLC header 2.1 (amdgpu_rlc.c:565-566). AMFirmware keeps no copy of the header, so re-read the cached, hash-checked file.
+      hdr = self.adev.fw.load_fw("vega20_rlc.bin", am.struct_rlc_firmware_header_v2_0)[1].header
+      self.rlc_v2_1 = (hdr.header_version_major, hdr.header_version_minor) == (2, 1)
+
   def init_hw(self):
+    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0): return self._init_hw_gc_9_4_0() # mi50 fork: Vega 20 takes the Linux gfx_v9_0 sequence (design v2 B14)
+
     # Wait for RLC autoload to complete
     wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
               value=True, msg="RLC autoload timeout")
@@ -286,7 +341,7 @@ class AM_GFX(AM_IP):
       for i in range(0, 16):
         self._grbm_select(vmid=i, inst=xcc)
         self.adev.regSH_MEM_CONFIG.write(**({'initial_inst_prefetch':3} if self.adev.ip_ver[am.GC_HWIP][0]>=10 else {'retry_disable':1}),
-          **({'f8_mode':1} if self.adev.ip_ver[am.GC_HWIP][:2]==(9,4) else {}),
+          **({'f8_mode':1} if self.adev.ip_ver[am.GC_HWIP] in {(9,4,3), (9,4,4)} else {}), # mi50 fork B14.5: gc_9_0 has no F8_MODE field
           address_mode=self.adev.soc.module.SH_MEM_ADDRESS_MODE_64, alignment_mode=self.adev.soc.module.SH_MEM_ALIGNMENT_MODE_UNALIGNED, inst=xcc)
 
         # Configure apertures:
@@ -304,6 +359,219 @@ class AM_GFX(AM_IP):
     # Set 1 partition
     if self.xccs > 1: self.adev.psp._spatial_partition_cmd(1)
 
+  # ---- mi50 fork: Vega 20 (GC 9.4.0) bring-up, ported from Linux gfx_v9_0.c (design v2 B14, rule R-LINUX). Every value/order cites its line. ----
+  def _init_hw_gc_9_4_0(self):
+    # B14.1: gfx9 has no RLC autoload and regRLC_RLCS_BOOTLOAD_STATUS is absent from gc_9_0 (T4); RLC/CP firmware is PSP-loaded
+    # (gfx_v9_0.c:3212-3217 and :3954-3965 skip the legacy microcode loads when load_type == PSP). Wait for CP_STAT == 0 alone.
+    wait_cond(lambda: self.adev.regCP_STAT.read() == 0, value=True, msg="CP_STAT busy")
+    self.adev.gmc.init_hub("GC", insts=range(self.xccs)) # B14.2
+    if self.adev.partial_boot: return self.reset_mec()
+
+    # gfx_v9_0_hw_init (gfx_v9_0.c:4027-4048): amdgpu_gfx_cleaner_shader_init :4032-4033 (skipped, B14.3), init_golden_registers :4035-4036,
+    # constants_init :4038, init_tcp_config :4040 (returns unless 9.4.1/9.4.2, :4006-4008), rlc resume :4042, cp_resume :4046.
+    self._golden_gfx9()
+    self._constants_init_gfx9()
+    self._rlc_resume_gfx9()
+    self._cp_resume_gfx9()
+    # ip.py's S2A doorbell_enable calls (nbio_7_9 excluded path) are not issued: nbio_7_4 has no S2A registers (design B14 "no S2A doorbell calls").
+    # ip.py's TCP_CNTL |= 0x20000000 is a gfx11 golden value and is not applied (B14.4).
+
+  def _golden_gfx9(self):
+    for table in (self.GOLDEN_GC_9_0, self.GOLDEN_GC_9_0_VG20, self.GOLDEN_GC_9_X_COMMON):
+      for name, and_mask, or_mask in table:
+        reg = self.adev.reg(name)
+        reg.write(or_mask if and_mask == 0xffffffff else (reg.read() & ~and_mask) | (or_mask & and_mask)) # soc15.c:467-475
+
+  def _select_se_sh_gfx9(self, se:int, sh:int, instance:int=0xffffffff):
+    # gfx_v9_0_select_se_sh (gfx_v9_0.c:2503-2524): 0xffffffff selects broadcast for that field, else the index.
+    kw = {'instance_broadcast_writes':1} if instance == 0xffffffff else {'instance_index':instance}
+    kw |= {'se_broadcast_writes':1} if se == 0xffffffff else {'se_index':se}
+    kw |= {'sh_broadcast_writes':1} if sh == 0xffffffff else {'sh_index':sh}
+    self.adev.regGRBM_GFX_INDEX.write(**kw)
+
+  def _get_cu_info_gfx9(self):
+    # gfx_v9_0_get_cu_info (gfx_v9_0.c:7892-7960). SE/SH/CU counts come from the synthesized gc_info v2 (design v2 B4/B17); no card value is guessed.
+    gi = self.adev.gc_info
+    try: self.gfx9_num_se, self.gfx9_num_sh, self.gfx9_num_cu = gi.gc_num_se, gi.gc_num_sh_per_se, gi.gc_num_cu_per_sh
+    except AttributeError as e:
+      raise RuntimeError("Vega 20 gfx needs gc_info fields gc_num_se/gc_num_sh_per_se/gc_num_cu_per_sh (design v2 B4)") from e
+    if self.gfx9_num_se * self.gfx9_num_sh > 16: raise RuntimeError(f"gfx9 cu_info: {self.gfx9_num_se}*{self.gfx9_num_sh} > 16") # :7905-7907
+    self.gfx9_cu_bitmap:dict[tuple[int,int], int] = {}
+    for se in range(self.gfx9_num_se):
+      for sh in range(self.gfx9_num_sh):
+        self._select_se_sh_gfx9(se, sh)                                                                                 # :7919
+        # :7920-7921 set_user_cu_inactive_bitmap(disable_masks[..]): the mask is 0 unless the amdgpu.disable_cu module parameter is given
+        # (amdgpu_gfx.c:119-122, amdgpu_drv.c:184 default NULL), and :7868-7869 then returns without writing GC_USER_SHADER_ARRAY_CONFIG.
+        data = self.adev.regCC_GC_SHADER_ARRAY_CONFIG.read() | self.adev.regGC_USER_SHADER_ARRAY_CONFIG.read()            # :7881-7882
+        inactive = self.adev.regCC_GC_SHADER_ARRAY_CONFIG.decode(data)['inactive_cus']                                   # :7884-7885
+        # :7887-7889, amdgpu_gfx.h:585-588
+        self.gfx9_cu_bitmap[(se, sh)] = (~inactive) & ((1 << self.gfx9_num_cu) - 1)
+    self._select_se_sh_gfx9(0xffffffff, 0xffffffff)                                                                     # :7952
+
+  def _constants_init_gfx9(self):
+    # gfx_v9_0_constants_init (gfx_v9_0.c:2665-2715)
+    self.adev.regGRBM_CNTL.update(read_timeout=0xff)   # :2672
+    # :2675 tiling_mode_table_init is a TODO no-op (:2498-2501); :2677-2678 setup_rb only with gfx rings (none here)
+    self._get_cu_info_gfx9()                           # :2679
+    self.adev.regDB_DEBUG2.read()                      # :2680 (stored in gfx.config; not used here)
+    unaligned, mode64 = self.adev.soc.module.SH_MEM_ALIGNMENT_MODE_UNALIGNED, self.adev.soc.module.SH_MEM_ADDRESS_MODE_64
+    # :2685-2707 vmid 0 .. num_ids-1; num_ids = first_kfd_vmid for GC < 10 (amdgpu_ids.c:652-655) = 8 for 9.4.0 (gmc_v9_0.c:2033-2039).
+    # RETRY_DISABLE = gmc.noretry, default true for 9.4.0 (amdgpu_gmc.c:1004-1005,1019; amdgpu_noretry -1, amdgpu_drv.c:228).
+    for i in range(8):
+      self._grbm_select(vmid=i)                                                                                      # :2686
+      self.adev.regSH_MEM_CONFIG.write(address_mode=mode64, alignment_mode=unaligned, retry_disable=1)             # :2689-2693, :2696-2700
+      # :2694 writes SH_MEM_BASES 0 for vmid 0, which never runs user shaders in Linux. AM dispatches on vmid 0 (cp_hqd_vmid=0, setup_ring),
+      # so design v2 B14.5 keeps AM's apertures (ip.py shared_base=0x1, private_base=0x2) for vmid 0 and takes Linux's values for 1..15.
+      if i == 0: self.adev.regSH_MEM_BASES.write(shared_base=0x1, private_base=0x2)
+      # :2701-2705; gmc_v9_0.c:1605,1608
+      else: self.adev.regSH_MEM_BASES.write(private_base=0x1000000000000000 >> 48, shared_base=0x2000000000000000 >> 48)
+    self._grbm_select()                                                                                              # :2708
+    # init_compute_vmid (:2590-2626): vmid first_kfd_vmid(8)..15, DEFAULT_SH_MEM_BASES 0x6000 (:2589, :2602); SH_MEM_CONFIG without RETRY_DISABLE
+    # (:2604-2606)
+    for i in range(8, 16):
+      self._grbm_select(vmid=i)                                                                                      # :2610
+      self.adev.regSH_MEM_CONFIG.write(address_mode=mode64, alignment_mode=unaligned)                                # :2612
+      self.adev.regSH_MEM_BASES.write(0x6000 | (0x6000 << 16))                                                       # :2613
+    self._grbm_select()                                                                                              # :2615
+    for i in range(8, 16): self._gds_zero_gfx9(i)                                                                    # :2620-2625
+    for i in range(1, 16): self._gds_zero_gfx9(i)                                                                    # init_gds_vmid :2628-2644
+    # :2714 init_sq_config: default branch for 9.4.0 (:2650-2662), nothing
+
+  def _gds_zero_gfx9(self, vmid:int):
+    # WREG32_SOC15_OFFSET(GDS_VMID0_BASE, 2*vmid) etc. (gfx_v9_0.c:2621-2624): the per-vmid registers exist by name in gc_9_0
+    # (GDS_VMID{n}_BASE/SIZE at +2n, GWS/OA at +n).
+    for name in (f"regGDS_VMID{vmid}_BASE", f"regGDS_VMID{vmid}_SIZE", f"regGDS_GWS_VMID{vmid}", f"regGDS_OA_VMID{vmid}"):
+      self.adev.reg(name).write(0)
+
+  def _gui_idle_int_gfx9(self, enable:bool):
+    # gfx_v9_0_enable_gui_idle_interrupt (gfx_v9_0.c:2755-2771) on CP_INT_CNTL_RING0; GFX_IDLE_INT_ENABLE only with gfx rings (:2767-2768), none here.
+    self.adev.regCP_INT_CNTL_RING0.update(cntx_busy_int_enable=int(enable), cntx_empty_int_enable=int(enable), cmp_busy_int_enable=int(enable))
+
+  def _wait_rlc_serdes_gfx9(self):
+    # gfx_v9_0_wait_for_rlc_serdes (gfx_v9_0.c:2717-2753); usec_timeout = 100000 us (amdgpu.h:274, amdgpu_device.c:3783)
+    for se in range(self.gfx9_num_se):
+      for sh in range(self.gfx9_num_sh):
+        self._select_se_sh_gfx9(se, sh)                                                                                 # :2725
+        try: wait_cond(lambda: self.adev.regRLC_SERDES_CU_MASTER_BUSY.read(), value=0, timeout_ms=100, msg="RLC serdes CU busy")  # :2726-2730
+        except TimeoutError:
+          self._select_se_sh_gfx9(0xffffffff, 0xffffffff)                                                               # :2732-2733
+          if DEBUG >= 2: print(f"am {self.adev.devfmt}: Timeout wait for RLC serdes {se},{sh}")                        # :2735-2736
+          return                                                                                                        # :2737
+    self._select_se_sh_gfx9(0xffffffff, 0xffffffff)                                                                     # :2741
+    # :2744-2747
+    mask = self.adev.regRLC_SERDES_NONCU_MASTER_BUSY.fields_mask('se_master_busy', 'gc_master_busy', 'tc0_master_busy', 'tc1_master_busy')
+    # :2748-2752
+    try: wait_cond(lambda: self.adev.regRLC_SERDES_NONCU_MASTER_BUSY.read() & mask, value=0, timeout_ms=100, msg="RLC serdes non-CU busy")
+    except TimeoutError:
+      if DEBUG >= 2: print(f"am {self.adev.devfmt}: Timeout wait for RLC non-CU serdes")                               # Linux falls through silently
+
+  def _csb_gfx9(self) -> list[int]:
+    # gfx_v9_0_get_csb_buffer (gfx_v9_0.c:1652-1664) = amdgpu_gfx_csb_preamble_start + csb_data_parser + preamble_end (amdgpu_gfx.c:2847-2905)
+    # over gfx9_cs_data (clearstate_gfx9.h via the generated clearstate_gfx9 module). get_csb_size (:1624-1650) returns 0 for a non-SECT_CONTEXT
+    # section.
+    from tinygrad.runtime.autogen.am import pm4_soc15 as pm4, clearstate_gfx9 as cs
+    buf = [pm4.PACKET3(pm4.PACKET3_PREAMBLE_CNTL, 0), pm4.PACKET3_PREAMBLE_BEGIN_CLEAR_STATE,                          # amdgpu_gfx.c:2851-2852
+           pm4.PACKET3(pm4.PACKET3_CONTEXT_CONTROL, 1), 0x80000000, 0x80000000]                                        # :2854-2856
+    for sect_id, extents in cs.gfx9_cs_data:                                                                           # :2877-2887
+      if sect_id != cs.SECT_CONTEXT: raise RuntimeError(f"clearstate_gfx9 section {sect_id} is not SECT_CONTEXT (gfx_v9_0.c:1637-1640)")
+      for reg_count, reg_index, values in extents:
+        buf += [pm4.PACKET3(pm4.PACKET3_SET_CONTEXT_REG, reg_count), reg_index - pm4.PACKET3_SET_CONTEXT_REG_START, *values] # :2880-2884
+    buf += [pm4.PACKET3(pm4.PACKET3_PREAMBLE_CNTL, 0), pm4.PACKET3_PREAMBLE_END_CLEAR_STATE, pm4.PACKET3(pm4.PACKET3_CLEAR_STATE, 0), 0] # :2900-2904
+    return buf
+
+  def _init_lbpw_gfx9_4(self):
+    # gfx_v9_4_init_lbpw (gfx_v9_0.c:1759-1806), run for IP_VERSION(9,4,0) at :3228-3229
+    self.adev.regRLC_LB_THR_CONFIG_1.write(0x0000007F)                                                                 # :1764
+    self.adev.regRLC_LB_THR_CONFIG_2.write(0x033388F8)                                                                 # :1765
+    self.adev.regRLC_LB_THR_CONFIG_3.write(0x00000077)                                                                 # :1766
+    self.adev.regRLC_LB_THR_CONFIG_4.write(0x10 | 0x27 << 8 | 0x02FA << 16)                                            # :1767
+    self.adev.regRLC_LB_CNTR_INIT.write(0x00000000)                                                                    # :1770
+    # :1773 (the comment says 0x500, the code writes 0x800)
+    self.adev.regRLC_LB_CNTR_MAX.write(0x00000800)
+    self._select_se_sh_gfx9(0xffffffff, 0xffffffff)                                                                    # :1777
+    self.adev.regRLC_LB_INIT_CU_MASK.write(0xffffffff)                                                                 # :1778
+    self.adev.regRLC_LB_PARAMS.write(fifo_samples=0x0003, pg_idle_samples=0x0010, pg_idle_sample_interval=0x033F)      # :1781-1784
+    self.adev.regRLC_GPM_GENERAL_7.write((self.adev.regRLC_GPM_GENERAL_7.read() & 0x0000FFFF) | 0x00C00000)            # :1787-1790
+    self.adev.regRLC_LB_CNTL.write(lb_cnt_spim_active=1, cu_mask_used_off_hyst=0x09, reserved=0x80000)                 # :1799-1802
+    # gfx_v9_0_init_always_on_cu_mask (:1666-1708) at :1805: dGPU, not 9.2.1 -> always_on_cu_num 12 (:1679), pg_always_on_cu_num 2 (:1669)
+    for se in range(self.gfx9_num_se):
+      for sh in range(self.gfx9_num_sh):
+        mask, cu_bitmap, counter = 1, 0, 0
+        self._select_se_sh_gfx9(se, sh)                                                                                # :1687
+        for _ in range(self.gfx9_num_cu):                                                                              # :1689
+          if self.gfx9_cu_bitmap[(se, sh)] & mask:                                                                     # :1690
+            if counter == 2: self.adev.regRLC_PG_ALWAYS_ON_CU_MASK.write(cu_bitmap)                                    # :1691-1692
+            if counter < 12: cu_bitmap |= mask                                                                         # :1693-1694
+            else: break                                                                                                # :1696
+            counter += 1
+          mask <<= 1
+        self.adev.regRLC_LB_ALWAYS_ACTIVE_CU_MASK.write(cu_bitmap)                                                     # :1702
+    self._select_se_sh_gfx9(0xffffffff, 0xffffffff)                                                                    # :1706
+
+  def _rlc_resume_gfx9(self):
+    import array
+    # gfx_v9_0_rlc_resume (gfx_v9_0.c:3196-3244), non-SR-IOV path. rlc_stop (:3205 -> :3124-3129):
+    self.adev.regRLC_CNTL.update(rlc_enable_f32=0)                                                                     # :3126
+    self._gui_idle_int_gfx9(False)                                                                                     # :3127
+    self._wait_rlc_serdes_gfx9()                                                                                       # :3128
+    self.adev.regRLC_CGCG_CGLS_CTRL.write(0)                                                                           # :3208 disable CG
+    # init_pg (:3210 -> :3096-3122): init_csb (:3098 -> :2773-2783)
+    # :2775 get_csb_buffer into cs_ptr
+    self.adev.vram.view(self.csb_paddr, len(self.csb_dws) * 4, fmt='I')[:] = array.array('I', self.csb_dws)
+    self.adev.regRLC_CSIB_ADDR_HI.write(self.csb_mc >> 32)                                                             # :2777-2778
+    self.adev.regRLC_CSIB_ADDR_LO.write(self.csb_mc & 0xfffffffc)                                                      # :2779-2780
+    # :2781-2782, clear_state_size in dwords (amdgpu_rlc.c:134)
+    self.adev.regRLC_CSIB_LENGTH.write(len(self.csb_dws))
+    # :3104-3110: with a v2.1 RLC header enable_save_restore_machine (:2925-2928); the save/restore list init at :3105-3108 is 9.2.1/Raven2 only
+    if self.rlc_v2_1: self.adev.regRLC_SRM_CNTL.update(srm_enable=1)                                                   # :2927
+    # :3112-3121 skipped: pg_flags == 0 for 9.4.0 (soc15.c:1019). :3212-3217 skipped: RLC firmware is PSP-loaded.
+    # :3228-3233 IP_VERSION(9,4,0): gfx_v9_4_init_lbpw, then enable_lbpw(amdgpu_lbpw > 0) with the default amdgpu_lbpw = -1 (amdgpu_drv.c:204) ->
+    # false
+    self._init_lbpw_gfx9_4()                                                                                           # :3229
+    self.adev.regRLC_LB_CNTL.update(load_balance_enable=0)                                                             # :3233 -> :1808-1811
+    # :3239 -> update_spm_vmid_internal :5208-5226
+    self.adev.regRLC_SPM_MC_CNTL.update(rlc_spm_vmid=0xf)
+    # rlc_start (:3241 -> :3139-3152)
+    self.adev.regRLC_CNTL.update(rlc_enable_f32=1)                                                                     # :3145
+    time.sleep(50e-6)                                                                                                  # :3146 udelay(50)
+    self._gui_idle_int_gfx9(True)                                                                                      # :3149-3150 (not an APU)
+    time.sleep(50e-6)                                                                                                  # :3151 udelay(50)
+
+  def _cp_gfx_enable_gfx9(self, enable:bool):
+    # gfx_v9_0_cp_gfx_enable (gfx_v9_0.c:3246-3264): all twelve CP_ME_CNTL fields set to !enable, then udelay(50)
+    v = 0 if enable else 1
+    self.adev.regCP_ME_CNTL.update(ce_invalidate_icache=v, pfp_invalidate_icache=v, me_invalidate_icache=v, ce_pipe0_reset=v, ce_pipe1_reset=v,
+      pfp_pipe0_reset=v, pfp_pipe1_reset=v, me_pipe0_reset=v, me_pipe1_reset=v, me_halt=v, pfp_halt=v, ce_halt=v)      # :3250-3262
+    time.sleep(50e-6)                                                                                                  # :3263
+
+  def _cp_compute_enable_gfx9(self, enable:bool):
+    # gfx_v9_0_cp_compute_enable (gfx_v9_0.c:3462-3480): CP_MEC_CNTL = 0, or the full disable mask (all ME1 pipes 0..3, ME2 pipes 0..1), then
+    # udelay(50)
+    if enable: self.adev.regCP_MEC_CNTL.write(0)                                                                       # :3465
+    else: self.adev.regCP_MEC_CNTL.write(mec_invalidate_icache=1, mec_me1_pipe0_reset=1, mec_me1_pipe1_reset=1, mec_me1_pipe2_reset=1,
+      mec_me1_pipe3_reset=1, mec_me2_pipe0_reset=1, mec_me2_pipe1_reset=1, mec_me1_halt=1, mec_me2_halt=1)              # :3467-3476
+    time.sleep(50e-6)                                                                                                  # :3479
+
+  def _cp_resume_gfx9(self):
+    # gfx_v9_0_cp_resume (gfx_v9_0.c:3946-4000)
+    self._gui_idle_int_gfx9(False)                                                                                     # :3951-3952
+    # :3954-3965 skipped: CP firmware is PSP-loaded
+    # :3967-3968 (Linux has a gfx ring on Vega 20; AM never brings it up, B14.7)
+    self._cp_gfx_enable_gfx9(False)
+    self._cp_compute_enable_gfx9(False)                                                                                # :3969
+    # :3971 kiq_resume and :3975-3979 cp_gfx_resume are not used (no KIQ, no gfx ring: B14.7). kcq_resume (:3981 -> :3931-3944) =
+    # cp_compute_enable(true)
+    # then the MQDs, which the compute side programs through setup_ring; amdgpu_gfx_enable_kcq (:3943) is a KIQ MAP_QUEUES, AM loads HQDs directly
+    # (B14.9).
+    # B14.8: MEC doorbell range = the kiq_init_register values (:3759-3772): LOWER (kiq 0 * 2) << 2, UPPER (userqueue_end 0x8A * 2) << 2 = 0x450
+    # (vega20_reg_init.c:60,70; amdgpu_doorbell.h:122,134); check_if_enlarge_doorbell_range is 9.3.0-only (:1409-1417). Doorbell 3 (MEC_RING0) lies
+    # inside.
+    self.adev.regCP_MEC_DOORBELL_RANGE_LOWER.write((am.AMDGPU_VEGA20_DOORBELL_KIQ * 2) << 2)                            # :3760-3761
+    self.adev.regCP_MEC_DOORBELL_RANGE_UPPER.write((am.AMDGPU_VEGA20_DOORBELL_USERQUEUE_END * 2) << 2)                  # :3771-3772
+    # :3935 -> :3465 CP_MEC_CNTL = 0 (+ AM's 50 ms, ip.py)
+    self._enable_mec()
+    self._gui_idle_int_gfx9(True)                                                                                      # :3997
+
   def fini_hw(self): self._dequeue_hqds()
 
   def reset_mec(self):
@@ -319,6 +587,7 @@ class AM_GFX(AM_IP):
 
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, eop_addr:int, eop_size:int, idx:int, aql:bool) -> int:
     pipe, queue, doorbell = idx // 4, idx % 4, am.AMDGPU_NAVI10_DOORBELL_MEC_RING0
+    vega20 = self.adev.ip_ver[am.GC_HWIP] == (9,4,0) # mi50 fork, design v2 B14.9: Linux gfx_v9_0_mqd_init / kiq_init_register deltas
 
     for xcc in range(self.xccs if aql else 1):
       self._grbm_select(me=1, pipe=pipe, queue=queue, inst=xcc)
@@ -326,14 +595,17 @@ class AM_GFX(AM_IP):
       struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}{'_compute' if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else ''}_mqd")
       mqd_struct = struct_t(header=0xC0310800, cp_mqd_base_addr_lo=lo32(self.mqd_mc[queue] + 0x1000*xcc),
         cp_mqd_base_addr_hi=hi32(self.mqd_mc[queue] + 0x1000*xcc), cp_hqd_pipe_priority=0x2, cp_hqd_queue_priority=0xf, cp_hqd_quantum=0x111,
-        cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
+        # gfx_v9_0.c:3660-3662: PRELOAD_SIZE 0x53, no PRELOAD_REQ
+        cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x53) if vega20 else
+                                self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
         cp_hqd_pq_base_lo=lo32(ring_addr>>8), cp_hqd_pq_base_hi=hi32(ring_addr>>8),
         cp_hqd_pq_rptr_report_addr_lo=lo32(rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(rptr_addr),
         cp_hqd_pq_wptr_poll_addr_lo=lo32(wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(wptr_addr),
         cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell*2, doorbell_en=1),
         cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=0, queue_size=(ring_size//4).bit_length()-2,
           **({'queue_full_en':1, 'slot_based_wptr':2, 'no_update_rptr':xcc!=0 or self.xccs==1} if aql else {})),
-        cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3), cp_hqd_hq_status0=0x20004000,
+        cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3),
+        **({} if vega20 else {'cp_hqd_hq_status0':0x20004000}), # not in gfx_v9_0_mqd_init (:3550-3684)
         cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(priv_state=1), cp_hqd_vmid=0, cp_hqd_aql_control=int(aql),
         cp_hqd_eop_base_addr_lo=lo32(eop_addr>>8), cp_hqd_eop_base_addr_hi=hi32(eop_addr>>8),
         cp_hqd_eop_control=self.adev.regCP_HQD_EOP_CONTROL.encode(eop_size=(eop_size//4).bit_length()-2),
@@ -342,16 +614,20 @@ class AM_GFX(AM_IP):
 
       self.adev.vram.view(self.mqd_paddr[queue] + 0x1000*xcc, ctypes.sizeof(mqd_struct))[:] = memoryview(mqd_struct).cast('B')
 
+      if vega20: self.adev.regCP_PQ_WPTR_POLL_CNTL.update(en=0, inst=xcc) # gfx_v9_0.c:3693 disable wptr polling before the HQD load
       mqd_st_mv = to_mv(ctypes.addressof(mqd_struct), ctypes.sizeof(mqd_struct)).cast('I')
       for i, reg in enumerate(range(self.adev.regCP_MQD_BASE_ADDR.addr[xcc], self.adev.regCP_HQD_PQ_WPTR_HI.addr[xcc] + 1)):
         self.adev.wreg(reg, mqd_st_mv[0x80 + i])
       self.adev.regCP_HQD_ACTIVE.write(0x1, inst=xcc)
+      if vega20 and hasattr(self.adev, 'regCP_PQ_STATUS'): self.adev.regCP_PQ_STATUS.update(doorbell_enable=1, inst=xcc) # gfx_v9_0.c:3794-3795
 
       self.adev.gmc.flush_hdp()
       self._grbm_select(inst=xcc)
     return doorbell
 
   def set_clockgating_state(self):
+    # mi50 fork, design v2 B16: no-op on 9.4.0 (gc_9_0 lacks the fgcg fields written below; the Linux clock-gating port is U-G4, after T12)
+    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0): return
     if hasattr(self.adev, 'regMM_ATC_L2_MISC_CG'): self.adev.regMM_ATC_L2_MISC_CG.write(enable=1, mem_ls_enable=1)
 
     for xcc in range(self.xccs):
@@ -392,7 +668,9 @@ class AM_GFX(AM_IP):
       self.adev.reg(f"regCP_{cntl_reg}_CNTL").update(**{f"{eng_name.lower()}_pipe{pipe}_reset": 0 for pipe in range(pipe_cnt)}, inst=xcc)
 
     for xcc in range(self.adev.gfx.xccs):
-      if self.adev.ip_ver[am.GC_HWIP] < (10,0,0):
+      # mi50 fork (design v2 B14.7): Vega 20 uses the full Linux cp_compute_enable(false) mask (gfx_v9_0.c:3467-3476)
+      if self.adev.ip_ver[am.GC_HWIP] == (9,4,0): self._cp_compute_enable_gfx9(False)
+      elif self.adev.ip_ver[am.GC_HWIP] < (10,0,0):
         self.adev.regCP_MEC_CNTL.update(mec_invalidate_icache=1, mec_me1_pipe0_reset=1, mec_me2_pipe0_reset=1, mec_me1_halt=1,mec_me2_halt=1,inst=xcc)
       if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0):
         _config_helper(eng_name="PFP", cntl_reg="ME", eng_reg="PFP", pipe_cnt=1, xcc=xcc)
@@ -504,8 +782,94 @@ class AM_IH(AM_IP):
       self.adev.is_err_state = True
 
 class AM_SDMA(AM_IP):
-  def init_sw(self): self.sdma_reginst, self.sdma_name = [], "F32" if self.adev.ip_ver[am.SDMA0_HWIP] < (7,0,0) else "MCU"
+  # mi50 fork (Vega20 Port Design v2 B15): Linux sdma_v4_0.c golden tables for SDMA 4.2.0, in Linux order (sdma_v4_0_init_golden_registers
+  # IP_VERSION(4,2,0): golden_settings_sdma0_4_2_init, golden_settings_sdma0_4_2, golden_settings_sdma1_4_2, sdma_v4_0.c:535-545), applied with the
+  # soc15_program_register_sequence semantics (soc15.c:463-475). The fork's sdma_4_2 table normalizes SDMA0_*/SDMA1_* to SDMA_* with the instance
+  # selecting the base, as sdma_v4_0_get_reg_offset does (:440-460); entries are (register, and_mask, or_mask) exactly as SOC15_REG_GOLDEN_VALUE
+  # lists them.
+  GOLDEN_SDMA0_4_2_INIT = [                                                # sdma_v4_0.c:197-199, instance 0
+    ("regSDMA_RLC0_RB_WPTR_POLL_CNTL", 0xfffffff0, 0x00403000)]            # :198
+  GOLDEN_SDMA0_4_2 = [                                                     # sdma_v4_0.c:201-230, instance 0
+    ("regSDMA_CHICKEN_BITS", 0xfe931f07, 0x02831f07),                      # :203
+    ("regSDMA_CLK_CTRL", 0xffffffff, 0x3f000100),                          # :204
+    ("regSDMA_GB_ADDR_CONFIG", 0x0000773f, 0x00004002),                    # :205
+    ("regSDMA_GB_ADDR_CONFIG_READ", 0x0000773f, 0x00004002),               # :206
+    ("regSDMA_GFX_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),               # :207
+    ("regSDMA_GFX_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),             # :208
+    ("regSDMA_PAGE_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :209
+    ("regSDMA_PAGE_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :210
+    ("regSDMA_RD_BURST_CNTL", 0x0000000f, 0x00000003),                     # :211
+    ("regSDMA_RLC0_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :212
+    ("regSDMA_RLC0_RB_WPTR_POLL_CNTL", 0xfffffff0, 0x00403000),            # :213
+    ("regSDMA_RLC1_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :214
+    ("regSDMA_RLC1_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :215
+    ("regSDMA_RLC2_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :216
+    ("regSDMA_RLC2_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :217
+    ("regSDMA_RLC3_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :218
+    ("regSDMA_RLC3_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :219
+    ("regSDMA_RLC4_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :220
+    ("regSDMA_RLC4_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :221
+    ("regSDMA_RLC5_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :222
+    ("regSDMA_RLC5_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :223
+    ("regSDMA_RLC6_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :224
+    ("regSDMA_RLC6_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :225
+    ("regSDMA_RLC7_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :226
+    ("regSDMA_RLC7_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :227
+    ("regSDMA_UTCL1_PAGE", 0x000003ff, 0x000003c0),                        # :228
+    ("regSDMA_UTCL1_TIMEOUT", 0xffffffff, 0x00010001)]                     # :229
+  GOLDEN_SDMA1_4_2 = [                                                     # sdma_v4_0.c:232-260, instance 1 (mmSDMA1_* in Linux)
+    ("regSDMA_CHICKEN_BITS", 0xfe931f07, 0x02831f07),                      # :233
+    ("regSDMA_CLK_CTRL", 0xffffffff, 0x3f000100),                          # :234
+    ("regSDMA_GB_ADDR_CONFIG", 0x0000773f, 0x00004002),                    # :235
+    ("regSDMA_GB_ADDR_CONFIG_READ", 0x0000773f, 0x00004002),               # :236
+    ("regSDMA_GFX_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),               # :237
+    ("regSDMA_GFX_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),             # :238
+    ("regSDMA_PAGE_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :239
+    ("regSDMA_PAGE_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :240
+    ("regSDMA_RD_BURST_CNTL", 0x0000000f, 0x00000003),                     # :241
+    ("regSDMA_RLC0_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :242
+    ("regSDMA_RLC0_RB_WPTR_POLL_CNTL", 0xfffffff0, 0x00403000),            # :243
+    ("regSDMA_RLC1_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :244
+    ("regSDMA_RLC1_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :245
+    ("regSDMA_RLC2_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :246
+    ("regSDMA_RLC2_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :247
+    ("regSDMA_RLC3_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :248
+    ("regSDMA_RLC3_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :249
+    ("regSDMA_RLC4_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :250
+    ("regSDMA_RLC4_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :251
+    ("regSDMA_RLC5_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :252
+    ("regSDMA_RLC5_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :253
+    ("regSDMA_RLC6_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :254
+    ("regSDMA_RLC6_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :255
+    ("regSDMA_RLC7_RB_RPTR_ADDR_LO", 0xfffffffd, 0x00000001),              # :256
+    ("regSDMA_RLC7_RB_WPTR_POLL_CNTL", 0xfffffff7, 0x00403000),            # :257
+    ("regSDMA_UTCL1_PAGE", 0x000003ff, 0x000003c0),                        # :258
+    ("regSDMA_UTCL1_TIMEOUT", 0xffffffff, 0x00010001)]                     # :259
+
+  def init_sw(self):
+    self.sdma_reginst, self.sdma_name = [], "F32" if self.adev.ip_ver[am.SDMA0_HWIP] < (7,0,0) else "MCU"
+    if self.adev.ip_ver[am.SDMA0_HWIP] == (4,2,0): self._init_sw_sdma_4_2_0() # mi50 fork, design v2 B15
+
+  def _init_sw_sdma_4_2_0(self):
+    # Vega 20 has two SDMA instances (amdgpu_discovery.c:3203); every per-instance loop below is bounded by the discovered count.
+    self.sdma_insts = len(self.adev.regs_offset[am.SDMA0_HWIP])
+    if self.sdma_insts != 2: raise RuntimeError(f"SDMA 4.2.0: expected 2 instances (amdgpu_discovery.c:3203), discovery gave {self.sdma_insts}")
+    # has_page_queue on 4.2.0 = instance 0 fw_version >= 123 (sdma_v4_0.c:1736-1750, :1774-1775); fw_version is the SDMA header's ucode_version
+    # (amdgpu_sdma.c:165). AMFirmware keeps no copy, so re-read the cached, hash-checked vega20_sdma.bin (= instance 0, amdev.py _init_vega20).
+    self.sdma_fw_version = self.adev.fw.load_fw("vega20_sdma.bin", am.struct_sdma_firmware_header_v1_0)[1].header.ucode_version
+    self.has_page_queue = self.sdma_fw_version >= 123
+    if self.has_page_queue:
+      # Linux page rings: amdgpu_ring_init(page, 1024 dw) (sdma_v4_0.c:1914); ring_size = roundup_pow_of_two(1024 * 4 * sched_hw_submission)
+      # (amdgpu_ring.c:338) with sched_hw_submission 256 for instance[0].page (:247-248) and amdgpu_sched_hw_submission = 2 otherwise
+      # (amdgpu_drv.c:178): 1 MiB and 8 KiB. rptr/wptr write-back: amdgpu_wb_get hands out 8-dword slots (amdgpu_wb.c:104); one boot page
+      # per instance here, rptr at +0 and wptr at +0x20. Boot memory + MC addresses like AM_GFX's MQDs (system aperture = FB, ip.py init_hub).
+      self.page_ring_size = {0: 0x100000, 1: 0x2000}
+      self.page_ring_mc = [self.adev.paddr2mc(self.adev.mm.palloc(self.page_ring_size[i], boot=True)) for i in range(self.sdma_insts)]
+      self.page_wb_mc = [self.adev.paddr2mc(self.adev.mm.palloc(0x1000, boot=True)) for i in range(self.sdma_insts)]
+
   def init_hw(self):
+    if self.adev.ip_ver[am.SDMA0_HWIP] == (4,2,0): return self._init_hw_sdma_4_2_0() # mi50 fork, design v2 B15: the Linux sdma_v4_0 sequence
+
     for pipe_id in range(16 if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else 1):
       pipe, inst = ("", pipe_id) if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else (str(pipe_id), 0)
 
@@ -530,6 +894,79 @@ class AM_SDMA(AM_IP):
           self.adev.soc.doorbell_enable(port=port, awid=awid, awaddr_31_28_value=awaddr, offset=offset, size=4, aid=aid_id)
     else: self.adev.soc.doorbell_enable(port=2, awid=0xe, awaddr_31_28_value=0x3, offset=am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0*2, size=4)
 
+  # ---- mi50 fork: Vega 20 (SDMA 4.2.0 x2) bring-up, ported from Linux sdma_v4_0.c (design v2 B15, rule R-LINUX). Every value/order cites its
+  # line. ----
+  def _init_hw_sdma_4_2_0(self):
+    from tinygrad.runtime.autogen import pci
+    # sdma_v4_0_hw_init (sdma_v4_0.c:1960-1977): init_golden_registers (:1968-1969), then sdma_v4_0_start (:1971 -> :1381-1451), non-SR-IOV,
+    # PSP-loaded (:1391-1395 skipped)
+    for inst, table in ((0, self.GOLDEN_SDMA0_4_2_INIT), (0, self.GOLDEN_SDMA0_4_2), (1, self.GOLDEN_SDMA1_4_2)):   # :535-545
+      for name, and_mask, or_mask in table:
+        reg = self.adev.reg(name)
+        reg.write(or_mask if and_mask == 0xffffffff else (reg.read(inst=inst) & ~and_mask) | (or_mask & and_mask), inst=inst) # soc15.c:467-475
+    # sdma_v4_0_enable(true) (:1398 -> :1043-1060): F32_CNTL.HALT = 0 per instance (:1055-1059)
+    for i in range(self.sdma_insts): self.adev.regSDMA_F32_CNTL.update(halt=0, inst=i)
+    # sdma_v4_0_ctx_switch_enable(true) (:1400 -> :980-1033). amdgpu_sdma_phase_quantum defaults to 32 (amdgpu_drv.c:183): 32 fits
+    # PHASE0_QUANTUM.VALUE,
+    # so value 32, unit 0 (:985-1007). Per instance: read CNTL, set AUTO_CTXSW_ENABLE (:1010-1012), write PHASE0/1/2_QUANTUM (:1013-1017), write
+    # CNTL (:1018),
+    # UTCL1_TIMEOUT = 0x00800080 (:1030). :1025-1028 (PUB_DUMMY_REG2) is 4.2.2-only.
+    phase_quantum = self.adev.regSDMA_PHASE0_QUANTUM.encode(value=32, unit=0)
+    for i in range(self.sdma_insts):
+      sdma_cntl = self.adev.regSDMA_CNTL
+      cntl = (sdma_cntl.read(inst=i) & ~sdma_cntl.fields_mask('auto_ctxsw_enable')) | sdma_cntl.encode(auto_ctxsw_enable=1)
+      for name in ("regSDMA_PHASE0_QUANTUM", "regSDMA_PHASE1_QUANTUM", "regSDMA_PHASE2_QUANTUM"): self.adev.reg(name).write(phase_quantum, inst=i)
+      self.adev.regSDMA_CNTL.write(cntl, inst=i)
+      self.adev.regSDMA_UTCL1_TIMEOUT.write(0x00800080, inst=i)
+    # :1404-1423 per instance
+    for i in range(self.sdma_insts):
+      self.adev.regSDMA_SEM_WAIT_FAIL_TIMER_CNTL.write(0, inst=i)                                                   # :1407
+      # :1408 gfx_resume: AM programs the gfx ring in setup_ring when the compute side hands it a ring (design B15); :1409-1410 page_resume when
+      # has_page_queue:
+      # Linux page ring doorbell = (sdma_engine[i] + 1) << 1 dwords on 4.2.0 (:1898-1903; AMDGPU_VEGA20_DOORBELL_sDMA_ENGINE0/1 = 0x100/0x10A,
+      # amdgpu_doorbell.h:137-138)
+      if self.has_page_queue:
+        self._resume_ring_sdma_4_2_0("regSDMA_PAGE", i, self.page_ring_mc[i], self.page_ring_size[i], self.page_wb_mc[i], self.page_wb_mc[i] + 0x20,
+                                     (am.AMDGPU_VEGA20_DOORBELL_sDMA_ENGINE0 + i * 0xA + 1) << 1)
+      # :1413-1415 UTC_L1_ENABLE (+ trap_enable as ip.py does)
+      self.adev.regSDMA_CNTL.update(utc_l1_enable=1, trap_enable=1, inst=i)
+      self.adev.regSDMA_F32_CNTL.update(halt=0, inst=i)                                                            # :1419-1421 unhalt engine
+    # :1429 rlc_resume -> init_pg (:1298-1313): pg_flags == 0 on Vega 20 (soc15.c:1019), nothing. :1434-1448 ring tests are T10.
+    # late_init (:1789-1799) -> setup_ulv (:580-608): IP 4.2.0 and PCI device 0x66a1 (:593-595) -> ULV_CNTL.HYSTERESIS = 0 per instance (:601-607)
+    if self.adev.pci_dev.read_config(pci.PCI_DEVICE_ID, 2) == 0x66a1:
+      for i in range(self.sdma_insts): self.adev.regSDMA_ULV_CNTL.update(hysteresis=0, inst=i)
+    # ip.py's S2A doorbell_enable is not issued: nbio_7_4 has no S2A registers; BIF_SDMA0/1_DOORBELL_RANGE is AM_SOC's (design B8).
+
+  def _resume_ring_sdma_4_2_0(self, reg:str, inst:int, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, doorbell_dw:int):
+    # sdma_v4_0_gfx_resume (sdma_v4_0.c:1088-1162) and sdma_v4_0_page_resume (:1173-1248): the same register sequence on the GFX_* / PAGE_* set.
+    def r(s): return self.adev.reg(f"{reg}_{s}")
+    rb = r("RB_CNTL")
+    # :1096-1097 sdma_v4_0_rb_cntl (:1065-1077), order_base_2(ring_size/4)
+    rb_cntl = (rb.read(inst=inst) & ~rb.fields_mask('rb_size')) | rb.encode(rb_size=(ring_size//4).bit_length()-1)
+    rb.write(rb_cntl, inst=inst)                                                                                   # :1098
+    for s in ("RB_RPTR", "RB_RPTR_HI", "RB_WPTR", "RB_WPTR_HI"): r(s).write(0, inst=inst)                          # :1101-1104
+    r("RB_RPTR_ADDR_HI").write(hi32(rptr_addr), inst=inst)                                                         # :1107-1108
+    r("RB_RPTR_ADDR_LO").write(lo32(rptr_addr) & 0xFFFFFFFC, inst=inst)                                            # :1109-1110
+    rb_cntl |= rb.encode(rptr_writeback_enable=1)                                                                  # :1112-1113
+    r("RB_BASE").write(lo32(ring_addr >> 8), inst=inst)                                                            # :1115
+    r("RB_BASE_HI").write(ring_addr >> 40, inst=inst)                                                              # :1116
+    r("MINOR_PTR_UPDATE").write(1, inst=inst)                                                                      # :1121
+    # :1123, :1126-1127, :1131 (use_doorbell, :1857/:1886)
+    r("DOORBELL").update(enable=1, inst=inst)
+    r("DOORBELL_OFFSET").update(offset=doorbell_dw, inst=inst)                                                     # :1124, :1128-1130, :1132
+    # :1134 ring_set_wptr with use_doorbell (:702-717 / :767-772): *wptr_cpu_addr = wptr << 2 and WDOORBELL64(doorbell_index, wptr << 2), wptr == 0.
+    # WDOORBELL64 writes at a dword index into the doorbell aperture (amdgpu_doorbell_mgr.c:103-110); AM's doorbell64 view is 64-bit wide -> index
+    # // 2.
+    self.adev.doorbell64[doorbell_dw // 2] = 0
+    r("MINOR_PTR_UPDATE").write(0, inst=inst)                                                                      # :1137
+    r("RB_WPTR_POLL_ADDR_LO").write(lo32(wptr_addr), inst=inst)                                                    # :1141-1142
+    r("RB_WPTR_POLL_ADDR_HI").write(hi32(wptr_addr), inst=inst)                                                    # :1143-1144
+    r("RB_WPTR_POLL_CNTL").update(f32_poll_enable=0, inst=inst)                                                    # :1145-1149 (1 only under SR-IOV)
+    rb.write(rb_cntl | rb.encode(rb_enable=1), inst=inst)                                                          # :1152-1153
+    r("IB_CNTL").update(ib_enable=1, inst=inst)                                                                    # :1155-1161
+    # fini_hw stops it (Linux gfx/page_stop :955-970)
+    self.sdma_reginst.append((reg, inst))
+
   def fini_hw(self):
     for reg, inst in self.sdma_reginst:
       self.adev.reg(f"{reg}_RB_CNTL").update(rb_enable=0, inst=inst)
@@ -544,6 +981,15 @@ class AM_SDMA(AM_IP):
 
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, idx:int) -> int:
     if self.adev.ip_ver[am.SDMA0_HWIP] >= (5,0,0) and idx > 0: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available")
+
+    if self.adev.ip_ver[am.SDMA0_HWIP] == (4,2,0):
+      # mi50 fork, design v2 B15: one gfx ring per engine (sdma_v4_0.c:1854-1863), instance = engine; doorbell 0x100 + 0xA*engine ==
+      # AMDGPU_VEGA20_DOORBELL_sDMA_ENGINE0/1 (amdgpu_doorbell.h:137-138); Linux ring->doorbell_index = sdma_engine[i] << 1 dwords (:1863).
+      if idx >= self.sdma_insts: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available ({self.sdma_insts} engines)")
+      doorbell = am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + idx * 0xA
+      self._resume_ring_sdma_4_2_0("regSDMA_GFX", idx, ring_addr, ring_size, rptr_addr, wptr_addr, doorbell * 2)
+      self.adev.regSDMA_F32_CNTL.update(halt=0, inst=idx) # :1419-1421 (design B15: F32 HALT=0 after the ring programming)
+      return doorbell
 
     pipe, queue = idx // 4, idx % 4
     reg, inst = ("regSDMA_GFX", pipe+queue*4) if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4) else (f"regSDMA{pipe}_QUEUE{queue}", 0)
