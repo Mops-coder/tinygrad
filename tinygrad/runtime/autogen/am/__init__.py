@@ -2,7 +2,8 @@ import pathlib, hashlib, re, itertools
 from tinygrad.runtime.autogen import load, root
 
 __all__ = ["am", "pm4_soc15", "pm4_nv", "sdma_4_0_0", "sdma_5_0_0", "sdma_6_0_0", "smu_13_0_0", "smu_13_0_6", "smu_13_0_12", "smu_14_0_2",
-           "fw", "navi_offsets", "vega_offsets", "regs", "soc_9", "soc_11", "soc_12", "pmc"]
+           "fw", "navi_offsets", "vega_offsets", "regs", "soc_9", "soc_11", "soc_12", "pmc",
+           "smu_11_0_2", "clearstate_gfx9"]  # mi50 fork: Vega 20 SMU (powerplay vega20_ppsmc.h + smu11_driver_if.h), RLC clear-state (clearstate_gfx9.h)
 
 am_src="https://github.com/ROCm/ROCK-Kernel-Driver/archive/33970e1351f5e511029602454979f3de7e22260f.tar.gz"
 rocm_src="https://github.com/ROCm/rocm-systems/archive/cccc350dc620e61ae2554978b62ab3532dc10bd9.tar.gz"
@@ -18,12 +19,15 @@ reg_files = {
   "mp": [(11,0,0), (13,0,0), (14,0,2)], "hdp": [(4,4,2), (6,0,0), (7,0,0)],
   "osssys": [(4,4,2), (6,0,0), (6,1,0), (7,0,0)], "sdma": [(4,4,2)],
   # mi50 fork (Vega 20 / gfx906, Leon 2026-10-11): the headers Linux uses for CHIP_VEGA20 (gfx_v9_0.c, mmhub_v1_0.c, nbio_v7_4.c,
-  # hdp_v4_0.c, vega10_ih.c, sdma_v4_0.c, vega20_thermal.c). import_module picks the newest listed version <= the card's, so
-  # gc_9_0 serves GC 9.4.0, hdp_4_0 serves 4.2.0, osssys_4_0 serves 4.2.0, nbio_7_4 serves 7.4.0 (nbio_7_2_0 would have been
-  # picked silently otherwise); mmhub 9.4.0 -> mmhub_1_0 needs the override in support/amd.py import_module.
+  # hdp_v4_0.c, vega20_ih.c, sdma_v4_0.c, vega20_thermal.c, athub_v1_0.c, smuio_v11_0.c). import_module picks the newest listed
+  # version <= the card's, so gc_9_0 serves GC 9.4.0, hdp_4_0 serves 4.2.0, osssys_4_2_0 serves 4.2.0 (the header vega20_ih.c:30-31
+  # includes; design v2 §5.2), nbio_7_4 serves 7.4.0 (nbio_7_2_0 would have been picked silently otherwise), smuio_11_0_0 serves 11.0.2
+  # (smuio_v11_0.c:25-26); mmhub 9.4.0 -> mmhub_1_0 and athub 9.4.0 -> athub_1_0 (athub_v1_0.c:26-27) need the overrides in
+  # support/amd.py import_module.
   "thm": [(11,0,2)],
+  "athub": [(1,0)], "smuio": [(11,0,0)],
 }
-reg_files["gc"] += [(9,0)]; reg_files["mmhub"] += [(1,0)]; reg_files["nbio"] += [(7,4)]; reg_files["hdp"] += [(4,0)]; reg_files["osssys"] += [(4,0)]
+reg_files["gc"] += [(9,0)]; reg_files["mmhub"] += [(1,0)]; reg_files["nbio"] += [(7,4)]; reg_files["hdp"] += [(4,0)]; reg_files["osssys"] += [(4,2,0)]
 reg_files["sdma"] += [(4,2)]
 # mi50 fork: Vega 20's SDMA header lives at asic_reg/sdma0/sdma0_4_2 (names mmSDMA0_*); it is generated as module "sdma_4_2" with the
 # names normalized to SDMA_* so the driver's regSDMA_* lookups work and import_module("sdma", (4,2,0)) picks it (and (4,4,2) still gets sdma_4_4_2)
@@ -42,7 +46,27 @@ reg_patterns = {
   "mp": ["MP([01]|ASP)_SMN_C2PMSG"], "hdp": ["HDP_MEM_POWER_CTRL"], "oss": ["IH_"], "sdma": ["SDMA_"],  # mi50 fork: whole SDMA block (was SDMA_GFX, SDMA_CNTL)
   # mi50 fork: Vega 20 SDMA registers live in their own sdma0_4_2 header (both instances share the map; SDMA1 = SDMA0 + base
   # from the ip-offset table), THM is read directly for temperature/fan (vega20_thermal.c) when no SMU is running
-  "thm": ["CG_(MULT_THERMAL_STATUS|THERMAL_(INT|STATUS|RANGE|CTRL)|FDO_CTRL|TACH)", "THM_TMON"]
+  "thm": ["CG_(MULT_THERMAL_STATUS|THERMAL_(INT|STATUS|RANGE|CTRL)|FDO_CTRL|TACH)", "THM_TMON", "THM_THERMAL_INT"],  # thm_11_0_2_offset.h:44-47
+  # mi50 fork: gmc_v9_0.c:338-341 golden_settings_athub_1_0_0 (RPB_ARB_CNTL, RPB_ARB_CNTL2; athub_1_0_offset.h:398-401)
+  "athub": ["RPB_ARB_CNTL"],
+  # mi50 fork: smuio_v11_0.c:28-36 ROM_INDEX/ROM_DATA (VBIOS dump, smuio_11_0_0_offset.h:230-233); SMUSVI0_TEL_PLANE0 = VDDGFX telemetry
+  # (smuio_11_0_0_offset.h:28-29, sh_mask :30 VDDCOR_MASK; read by vega20_hwmgr.c:2281-2283, vid -> mV in smu_helper.c:43)
+  "smuio": ["ROM_(INDEX|DATA)", "SMUSVI0_TEL_PLANE0"],
+}
+# mi50 fork: Vega-20-only allowlist additions, keyed by TABLE name so that no other card's table changes (the shared patterns above
+# apply to every version of a family). Every name = a register Linux writes on CHIP_VEGA20 (design v2 §3 row autogen, §5.2):
+reg_patterns_extra = {
+  "gc_9_0": [
+    # gfx_v9_0.c:676-697 golden_settings_gc_9_0, :722-734 golden_settings_gc_9_0_vg20, :815-819 golden_settings_gc_9_x_common
+    # (TCP_CHAN_STEER_*, GRBM_CAM_*, CP_MEC[12]_F32_INT_DIS, SH_MEM_CONFIG, GB_ADDR_CONFIG*, SPI_CONFIG_CNTL_1 already match "TCP"/"GRBM"/
+    # "CP_(…MEC…)"/"SH_MEM"/"GB_ADDR_CONFIG"/"SPI_(CONFIG_CNTL…)" above)
+    "DB_DEBUG", "GB_GPU_ID", "PA_SC_", "SPI_", "SQC_CONFIG", "TA_CNTL_AUX", "VGT_", "CP_DEBUG", "CB_", "RMI_UTCL1_CNTL2", "TD_CNTL", "CP_SD_CNTL",
+    "GDS_",                               # gfx_v9_0.c:2621-2624 init_compute_vmid: GDS_VMID0_BASE/SIZE, GDS_GWS_VMID0, GDS_OA_VMID0
+    "CP_PQ_(STATUS|WPTR_POLL_CNTL)",      # gfx_v9_0.c:3693 CP_PQ_WPTR_POLL_CNTL.EN=0, :3795 CP_PQ_STATUS.DOORBELL_ENABLE=1 (kiq_init_register)
+    "CC_GC_SHADER_ARRAY_CONFIG", "GC_USER_SHADER_ARRAY_CONFIG",  # gfx_v9_0.c:7881-7882 get_cu_active_bitmap
+  ],
+  "mmhub_1_0": ["DAGB1_WRCLI2", "MMEA1_DRAM_WR_CLI2GRP_MAP0"],  # gmc_v9_0.c:333-336 golden_settings_mmhub_1_0_0 (mmhub_1_0_offset.h:376-377, 838-839)
+  "nbio_7_4": ["BIOS_SCRATCH_[0-7]"],  # amdgpu_atombios.c:1634-1642 POST bit = BIOS_SCRATCH_7 bit 9 (nbio_7_4_offset.h:2480-2495); T2 reads 0x4c..0x53
 }
 # mi50 fork: the nbio/hdp allowlists above are written for the gfx11/MI300 header naming (BIF_BX_PF0_*, HDP_MEM_POWER_CTRL); the
 # Vega 20 headers (nbio_7_4, hdp_4_0) name the same functions differently. Names = what Linux nbio_v7_4.c / hdp_v4_0.c use.
@@ -77,6 +101,33 @@ def __getattr__(nm):
       "smu13_driver_if_v13_0_6"]] +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
     case "smu_14_0_2": return load("am/smu_14_0_2", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v14_0_0_pmfw", "smu_v14_0_2_ppsmc",
                                     "smu14_driver_if_v14_0"]]+[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
+    # mi50 fork: Vega 20 (MP1 11.0.2) is driven by the legacy powerplay stack, not swsmu: messages = vega20_ppsmc.h (vega20_smumgr.c),
+    # tables/structs = smu11_driver_if.h (vega20_hwmgr.c); same amdgpu_smu.h prolog as the swsmu modules (it defines bool).
+    case "smu_11_0_2": return load("am/smu_11_0_2", [f"{AMD}/pm/powerplay/inc/{s}.h" for s in ["vega20_ppsmc", "smu11_driver_if"]]
+                                    +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
+    # mi50 fork: RLC clear-state buffer data for gfx9 (gfx_v9_0.c:1652 get_csb_buffer -> amdgpu_gfx.c amdgpu_gfx_csb_data_parser walks
+    # cs_data[].section[] = {extent, reg_index, reg_count}; clearstate_defs.h:33-42). Header-only: no clang, the arrays are parsed as text.
+    case "clearstate_gfx9":
+      def gencs(_, files, **kwargs):
+        defs, cs = [pathlib.Path(f).read_text() for f in files]
+        enum_body = re.search(r'enum section_id\s*\{([^}]*)\}', defs).group(1)
+        assert '=' not in enum_body, "section_id enum has explicit values; parser assumes declaration order"  # clearstate_defs.h:26-31 has none
+        ids = {nm: i for i, nm in enumerate(n for n in (x.strip().rstrip(',').strip() for x in enum_body.split('\n')) if n)}  # SECT_NONE=0, SECT_CONTEXT=1, ...
+        arrays = {m.group(1): [int(v, 0) for v in re.sub(r'//[^\n]*', '', m.group(2)).replace('\n', ' ').split(',') if v.strip()]
+                  for m in re.finditer(r'static const unsigned int (\w+)\[\] = \{(.*?)\};', cs, re.S)}
+        exts = {m.group(1): [(int(c), int(i, 0), tuple(arrays[a])) for a, i, c in re.findall(r'\{\s*(\w+),\s*(0x[0-9a-fA-F]+),\s*(\d+)\s*\}', m.group(2))]
+                for m in re.finditer(r'static const struct cs_extent_def (\w+)\[\] = \{(.*?)\};', cs, re.S)}
+        for e in exts.values():
+          for cnt, _, vals in e: assert len(vals) == cnt, (cnt, len(vals))
+        data = [(ids[sid], exts[sec]) for sec, sid in re.findall(r'\{\s*(\w+),\s*(SECT_\w+)\s*\}', re.search(r'gfx9_cs_data\[\] = \{(.*?)\};', cs, re.S).group(1))
+                if sec != '0']
+        out = ["# sections of (reg_count, reg_index, reg_values) per clearstate_defs.h cs_extent_def {extent, reg_index, reg_count}; the terminating",
+               "# {0,0,0} / {0, SECT_NONE} entries are dropped (Linux loops until extent/section == NULL)"]
+        out += [f"{k} = {v}" for k, v in ids.items()]
+        out += ["gfx9_cs_data = ["] + [f"  ({sid}, [" + ", ".join(f"({c}, {i:#x}, {v!r})" for c, i, v in e) + "]),"
+                                       for sid, e in data] + ["]"]
+        return "\n".join(out)
+      return load("am/clearstate_gfx9", [f"{AMD}/amdgpu/clearstate_defs.h", f"{AMD}/amdgpu/clearstate_gfx9.h"], srcs=am_src, gen=gencs)
     # firmware hashes
     case "fw":
       def genfw(name, files, **kwargs): return "\n".join(["hashes = {"] + [f"  {p.name!r}: {hashlib.sha256(p.read_bytes()).hexdigest()!r},"
@@ -89,7 +140,7 @@ def __getattr__(nm):
       def genreg(_, files, **kwargs):
         out = ["__all__ = " + repr([reg_renames.get(file.split('/')[-1], file.split('/')[-1]) for file in files])]
         for file, nm in [(file.replace("mp_11_0_0", "mp_11_0"), reg_renames.get(file.split('/')[-1], file.split('/')[-1])) for file in files]:
-          pats = reg_patterns[prefix := {"osssys": "oss"}.get(x:=nm.split("_", 1)[0], x)]
+          pats = reg_patterns[prefix := {"osssys": "oss"}.get(x:=nm.split("_", 1)[0], x)] + reg_patterns_extra.get(nm, [])
           vega_sdma = file.endswith("sdma0_4_2")
 
           def split_name(name): return name[:(pos:=next((i for i,c in enumerate(name) if c.isupper()), len(name)))], name[pos:]
