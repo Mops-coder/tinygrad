@@ -6,7 +6,7 @@
     powerplayinfo + OverDrive8 limits; (2) read_rom through fake ROM_INDEX/ROM_DATA registers at the design dwords 0x168e4/0x168e5 (auto-increment);
 (3) gc_info v2.0 shaping (every field lands in the slot Linux pairs it with); (4) AMDev._static_vega20 + _build_regs on a fake PCI device:
     ip_ver / regs_offset == egpu/mi50/port/vega20_ip_table.py (+ the NBIF alias), register dwords == the design's numbers, aids, harvested,
-    non-Vega gating (gfx11 fake binds no thm/smuio/athub/sdma tables, boot_version == AMDev.Version); (5) _vega20_vbios: POST gate, scratch-base
+    non-Vega gating (gfx11 fake binds no thm/smuio/athub/sdma tables, boot_version == AMDev.Version); (5) _vega20_vbios: POST via ATOM ASIC_Init, scratch-base
     check, reserved_vram_size from the table / required env / overlap refusal, required inputs, invalid thermal reading, threshold;
 (6) _emergency_quiesce: MEC mask + SDMA halts + SMU SetSoftMaxByFreq/SetPptLimit through a fake mailbox, and the __init__ wrapper (injected error);
 (7) clang sizeof/offsetof of every ported struct against the Linux headers.
@@ -30,10 +30,12 @@ def raises(fn, needle:str, msg:str):
   else: check(False, f"{msg}: did not raise")
 
 # ---------------- (1) synthetic image ----------------
-HDR, MDT, FWI, GFX, VRU, PPT = 0x100, 0x200, 0x300, 0x400, 0x500, 0x600
+HDR, MDT, FWI, GFX, VRU, PPT, CMT, ASIC = 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0xD00, 0xE00   # CMT/ASIC: command table master + ASIC_Init
+MARK = 0x1000   # synthetic ASIC_Init copies PS[0] (default sclk) here so the test sees the parameter space atom_asic_init built
 SYN = dict(se=4, cu_per_sh=16, sh_per_se=1, rb=4, tccs=16, gprs=256, gs_thds=32, gs_depth=32, gsprim=1792, dbl_lds=1, wave=64, waves_simd=10,
            scratch_slots=32, lds=64, sclk10k=85200, mclk10k=100000, fw_start_kb=(32768 << 10) - (8 << 10), fw_kb=8192, shutdown_temp=118)
-def synthetic_image(scratch_base=0x4c, posted_fw_region=True, vru_version=(2, 1), gfx_crev=4, pptable_version=3, fw_start_kb=None) -> bytes:
+def synthetic_image(scratch_base=0x4c, posted_fw_region=True, vru_version=(2, 1), gfx_crev=4, pptable_version=3, fw_start_kb=None,
+                    asic_init="set_post") -> bytes:
   img = bytearray(4096)
   img[0:2] = b"\x55\xaa"; img[2] = len(img) >> 9                                               # amdgpu_bios.c:45-46
   img[0x30:0x3a] = v.AMD_VBIOS_SIGNATURE                                                       # :41-42
@@ -69,6 +71,13 @@ def synthetic_image(scratch_base=0x4c, posted_fw_region=True, vru_version=(2, 1)
   for i in range(10): od.ODFeatureCapabilities[i] = i & 1
   pp.smcPPTable.Version = pptable_version
   img[PPT:PPT+ctypes.sizeof(pp)] = bytes(pp)
+  if asic_init is not None:   # SYNTHETIC ATOM bytecode (atom.c opcode table :1098-1227), not MI50 code
+    img[HDR + 0x1E:HDR + 0x20] = CMT.to_bytes(2, "little")            # rom header masterhwfunction_offset = ATOM_ROM_CMD_PTR (atom.h:41)
+    img[CMT + 4:CMT + 6] = ASIC.to_bytes(2, "little")                 # command table 0 = ATOM_CMD_INIT (atom.h:44)
+    code = bytes([1, 0x01]) + MARK.to_bytes(2, "little") + bytes([0])   # MOVE_REG REG[MARK] <- PS[0] dword
+    if asic_init == "set_post": code += bytes([13, 0x05]) + (0x53).to_bytes(2, "little") + (0x200).to_bytes(4, "little")   # OR_REG BIOS_SCRATCH_7 |= 0x200
+    code += bytes([91])                                               # EOT
+    img[ASIC:ASIC + 6 + len(code)] = (6 + len(code)).to_bytes(2, "little") + bytes([1, 1, 0, 0]) + code   # size, frev, crev, WS 0, PS 0
   return bytes(img)
 
 img = synthetic_image()
@@ -173,7 +182,35 @@ check(dev.reserved_vram_size == (32768 << 20) - (SYN["fw_start_kb"] << 10) == 8 
 check(dev.mi50_ppt_w == 150.0 and dev.mi50_temp_c == 90 and dev.vega20_hotspot_c() == 60, "required inputs read; hotspot 60 °C from CTF_TEMP bits 9..17")
 # failure paths
 d2 = fake_dev(FakeMMIO(img, seed=seed(posted=False))); d2._run_discovery(); d2._build_regs()
-raises(d2._vega20_vbios, "not POSTed", "POST bit clear -> boot stops before the ROM read"); check(not getattr(d2, 'vega20_posted', False), "unposted card never marked posted")
+d2._vega20_vbios()
+w = d2.mmio.log
+rom_i = next(i for i, (k, _) in enumerate(w) if k == FakeMMIO.ROM_INDEX); mark_i = next((i for i, (k, _) in enumerate(w) if k == MARK), None)
+check(d2.vega20_posted and mark_i is not None and rom_i < mark_i, "unposted card: ROM read first, then ASIC_Init ran (amdgpu_device.c:4067-4080 order), card marked posted")
+check((MARK, SYN["sclk10k"]) in w and d2.mmio.regs[0x53] & 0x200, "ASIC_Init got PS[0] = firmwareinfo bootup sclk (atom.c:1660) and set BIOS_SCRATCH_7 bit 9")
+check(not any(k == MARK for k, _ in dev.mmio.log), "POSTed card: ASIC_Init never runs (amdgpu_device_need_post false)")
+d2b = fake_dev(FakeMMIO(synthetic_image(asic_init="noop"), seed=seed(posted=False))); d2b._run_discovery(); d2b._build_regs()
+raises(d2b._vega20_vbios, "still clear", "ASIC_Init returning 0 without setting the POST bit is refused (fork's fail-closed re-read)")
+check(not getattr(d2b, 'vega20_posted', False), "that card is never marked posted")
+d2c = fake_dev(FakeMMIO(synthetic_image(asic_init=None), seed=seed(posted=False))); d2c._run_discovery(); d2c._build_regs()
+raises(d2c._vega20_vbios, "gpu post error! amdgpu_atom_asic_init returned 1", "no ASIC_Init table -> atom_asic_init 1 -> post error (atom.c:1665-1666)")
+# B7 reset path: engine-hung flag around the PSP mode1 reset, then the unconditional re-POST (amdgpu_device.c:4941-4991, :5142-5146)
+check(d2.regBIOS_SCRATCH_3.addr[0] == 0x4f, "regBIOS_SCRATCH_3 -> dword 0x4f (scratch base 0x4c + 3, amdgpu_atombios.c:1613)")
+ev = []
+class _G:
+  def fini_hw(self): ev.append("gfx.fini_hw")
+class _S:
+  def set_clocks(self, level): ev.append(("clocks", level))
+class _P:
+  def mode1_reset(self):
+    ev.append(("psp.mode1_reset", d2.mmio.regs.get(0x4f, 0) & 0x20000000)); d2.mmio.regs[0x53] = 0   # the reset clears the POST bit
+d2.gfx, d2.smu, d2.psp = _G(), _S(), _P()
+d2.mmio.log.clear()
+d2._vega20_reset()
+lg = d2.mmio.log
+mark_after = [i for i, (k, _) in enumerate(lg) if k == MARK]
+check(("psp.mode1_reset", 0x20000000) in ev, "BIOS_SCRATCH_3 ATOM_S3_ASIC_GUI_ENGINE_HUNG set while the PSP mode1 reset runs (amdgpu_device.c:4941-4942)")
+check(not d2.mmio.regs[0x4f] & 0x20000000, "engine-hung flag cleared after the reset (amdgpu_device.c:4990-4991)")
+check(len(mark_after) == 1 and d2.mmio.regs[0x53] & 0x200, "card re-POSTed by ATOM ASIC_Init after the reset (full reset posts unconditionally, amdgpu_device.c:5142-5146)")
 d3 = fake_dev(FakeMMIO(synthetic_image(scratch_base=0x4d), seed=seed())); d3._run_discovery(); d3._build_regs()
 raises(d3._vega20_vbios, "bios_scratch_reg_startaddr", "VBIOS scratch base != nbio_7_4 BIOS_SCRATCH_0 refused")
 d4 = fake_dev(FakeMMIO(synthetic_image(fw_start_kb=16 << 10), seed=seed())); d4._run_discovery(); d4._build_regs()

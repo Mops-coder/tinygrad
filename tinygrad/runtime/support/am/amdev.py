@@ -7,7 +7,7 @@ from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
-from tinygrad.runtime.support.am import vbios
+from tinygrad.runtime.support.am import vbios, atom
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
 
@@ -520,15 +520,17 @@ class AMDev:
     """Design v2 B4: POST gate, ROM dump, data tables (the required inputs are read in __init__, before any config write). Runs right after
     _build_regs, before init_sw (no allocations needed)."""
     self.vega20_check_thermal()   # first thing read: the card's current hotspot vs the ruled threshold
-    if not self.vega20_is_posted():
-      raise RuntimeError("MI50: card not POSTed (BIOS_SCRATCH_7 bit 9 clear, amdgpu_atombios.c:1634-1642). Linux would run the ATOM interpreter "
-                         "(amdgpu_device.c:4068-4080); the fork does not port it (design v2 B4, §8 U-V1) - nothing boots before")
-    self.vega20_posted = True
+    # Linux order (amdgpu_device_init): amdgpu_get_bios -> amdgpu_atombios_init = amdgpu_atom_parse + amdgpu_atomfirmware_scratch_regs_init +
+    # amdgpu_atomfirmware_allocate_fb_scratch (amdgpu_atombios.c:1909-1946) -> "Post card if necessary" (amdgpu_device.c:4067-4080).
+    # The ROM is read through SMUIO ROM_INDEX/ROM_DATA before POST, as Linux does (amdgpu_bios.c, read_rom docstring).
     self.vbios = vbios.VBIOS(vbios.read_rom(self.rreg, self.wreg, self.regROM_INDEX.addr[0], self.regROM_DATA.addr[0]))
     fwi = self.vbios.firmwareinfo()
     if fwi.bios_scratch_reg_startaddr != self.regBIOS_SCRATCH_0.addr[0]:   # amdgpu_atomfirmware.c:100-101 vs nbio_7_4_offset.h:2480-2481 (dword 0x4c)
       raise RuntimeError(f"MI50: VBIOS bios_scratch_reg_startaddr {fwi.bios_scratch_reg_startaddr:#x} != nbio_7_4 mmBIOS_SCRATCH_0 "
                          f"{self.regBIOS_SCRATCH_0.addr[0]:#x}")
+    self.atom = atom.AtomContext(atom.CardInfo(self.rreg, self.wreg), self.vbios.img, self._vega20_atom_scratch_bytes())
+    if not self.vega20_is_posted(): self._vega20_asic_init("init: BIOS_SCRATCH_7 bit 9 clear")   # amdgpu_device_need_post -> asic_init
+    self.vega20_posted = True
     self.gc_info = self.vbios.gc_info_v2_0()
     self.powerplay = self.vbios.powerplay_limits()   # §6 limits + the pptable blob; Linux vega20 hwmgr refuses to init without a valid table
     # reserved_vram_size (design B3/B4, §8 U-M1 "the fork asserts no overlap and moves boot_size/reserved_vram_size accordingly"): AM reserves the
@@ -550,11 +552,37 @@ class AMDev:
     if DEBUG >= 2: print(f"am {self.devfmt}: MI50 VBIOS ok, gc_info se={self.gc_info.gc_num_se} cu/sh={self.gc_info.gc_num_cu_per_sh} "
                          f"reserved_vram={self.reserved_vram_size >> 20} MiB bootup sclk={fwi.bootup_sclk_in10khz / 100} MHz")
 
+  def _vega20_atom_scratch_bytes(self) -> int:
+    """amdgpu_atomfirmware_allocate_fb_scratch (L/amdgpu/amdgpu_atomfirmware.c:173-200): v2_1 asks for used_by_driver_in_kb unless start_address
+    carries ATOM_VRAM_BLOCK_SRIOV_MSG_SHARE_RESERVATION (0x2 << ATOM_VRAM_OPERATION_FLAGS_SHIFT 30, atombios.h:4298-4302; :105-131), v2_2 always 0
+    on bare metal (:134-171); 0 -> 20 KiB (AtomContext). Host memory, never VRAM."""
+    vu = self.vbios.vram_usagebyfirmware()
+    if isinstance(vu, vbios.vram_usagebyfirmware_v2_1):
+      return 0 if (vu.start_address_in_kb & vbios.ATOM_VRAM_OPERATION_FLAGS_MASK) == (0x2 << 30) else vu.used_by_driver_in_kb << 10
+    return 0
+
+  def _vega20_asic_init(self, why:str):
+    """amdgpu_device_asic_init (L/amdgpu/amdgpu_device.c:958-990) for GC 9.4.0: pre_asic_init = soc15_pre_asic_init (soc15.c:860-863) ->
+    gmc_v9_0_restore_registers, which touches only DCE 1.0.0/1.0.1 (gmc_v9_0.c:2113-2121; Vega 20 is not one) -> nothing; vbios flags 0 (not an APU,
+    no aid mask, :~945); GC 9.4.0 is not 9.4.3/9.4.4/9.5.0/>=11 -> amdgpu_atom_asic_init (:982) = the ported interpreter running ASIC_Init.
+    A non-zero result is Linux's "gpu post error!" (:4076-4079). The fork then also requires the POST bit (fail closed; Linux does not re-read it)."""
+    if DEBUG >= 1: print(f"am {self.devfmt}: MI50 GPU posting now ({why})")
+    t0 = time.monotonic()
+    if (r:=self.atom.asic_init()) != 0: raise RuntimeError(f"MI50: gpu post error! amdgpu_atom_asic_init returned {r} ({why})")
+    if not self.vega20_is_posted(): raise RuntimeError(f"MI50: ASIC_Init returned 0 but BIOS_SCRATCH_7 bit 9 is still clear ({why})")
+    if DEBUG >= 1: print(f"am {self.devfmt}: MI50 POSTed in {time.monotonic() - t0:.2f} s ({why})")
+
+  def _vega20_scratch_engine_hung(self, hung:bool):
+    """amdgpu_atombios_scratch_regs_engine_hung (L/amdgpu/amdgpu_atombios.c:1609-1618): BIOS_SCRATCH_3 bit ATOM_S3_ASIC_GUI_ENGINE_HUNG
+    (0x20000000, atombios.h:6885) set before a mode1 reset and cleared after it (amdgpu_device.c:4941-4942, :4990-4991)."""
+    v = self.regBIOS_SCRATCH_3.read()
+    self.regBIOS_SCRATCH_3.write((v | 0x20000000) if hung else (v & ~0x20000000 & 0xFFFFFFFF))
+
   def vega20_is_posted(self) -> bool:
     """POST state = amdgpu_atombios_scratch_need_asic_init (L/amdgpu/amdgpu_atombios.c:1634-1642): RREG32(bios_scratch_reg_offset + 7) &
     ATOM_S7_ASIC_INIT_COMPLETE_MASK (0x200, L/include/atombios.h:7075); scratch 7 = mmBIOS_SCRATCH_7 0x3f BASE_IDX 1 (nbio_7_4_offset.h:2494-2495) ->
-    dword 0x53. Rule (design v2 B4): bit clear -> the boot stops (no ATOM interpreter in the fork); re-read after every reset (B7), because Linux
-    re-POSTs after a full reset (amdgpu_device.c:5142-5146)."""
+    dword 0x53. Bit clear -> _vega20_asic_init (the ported ATOM interpreter, amdgpu_device.c:4067-4080); after a mode1 reset the fork re-POSTs
+    unconditionally like Linux's full-reset path (amdgpu_device.c:5142-5146)."""
     return bool(self.regBIOS_SCRATCH_7.read() & vbios.ATOM_S7_ASIC_INIT_COMPLETE_MASK)
 
   def vega20_hotspot_c(self) -> int:
@@ -589,12 +617,14 @@ class AMDev:
     the bootloader wait (:4973) and the memsize poll (:4978-4985). drivers/pci is not in the Linux tree checked out here, so the exact dword set and
     write order of pci_save/restore_state are UNVERIFIED (listed): the type-0 header dwords named by the review are snapshotted and only the ones
     the reset changed are written back, descending offsets. :4942-4943/:4991-4992 amdgpu_atombios_scratch_regs_engine_hung (BIOS_SCRATCH_3 bit
-    ATOM_S3_ASIC_GUI_ENGINE_HUNG, amdgpu_atombios.c:1609-1618) is a flag for the ATOM interpreter the fork does not port (§8 U-V1): skipped, listed."""
+    ATOM_S3_ASIC_GUI_ENGINE_HUNG, amdgpu_atombios.c:1609-1618) is set before and cleared after the reset (_vega20_scratch_engine_hung), and the card
+    is re-POSTed by the ported ATOM interpreter as in Linux's full-reset path (amdgpu_device.c:5142-5146, unconditional there)."""
     self.gfx.fini_hw()
     self.smu.set_clocks(level=0)
     self._vega20_halt_mec()
     self._vega20_halt_sdma()
     time.sleep(0.1)
+    self._vega20_scratch_engine_hung(True)   # amdgpu_device_mode1_reset first statement (amdgpu_device.c:4941-4942)
     cfg_offs = [0x04, 0x0c, *range(0x10, 0x28, 4), 0x30, 0x3c]   # command/status, cacheline/latency/header/BIST, BAR0..5, expansion ROM, int line/pin
     cfg_saved = {off: self.pci_dev.read_config(off, 4) for off in cfg_offs}
     self.psp.mode1_reset()
@@ -606,9 +636,8 @@ class AMDev:
         self.pci_dev.write_config(off, cfg_saved[off], 4)
     wait_cond(lambda: self.regRCC_CONFIG_MEMSIZE.read() != 0xffffffff, value=True, timeout_ms=100,
               msg=f"am {self.devfmt}: MI50 RCC_CONFIG_MEMSIZE stuck at 0xffffffff after mode1 reset")
-    if not self.vega20_is_posted():
-      raise RuntimeError("MI50: POST bit clear after PSP mode1 reset; Linux re-POSTs here (amdgpu_device.c:5142-5146), the fork cannot "
-                         "(design v2 §8 U-V1)")
+    self._vega20_scratch_engine_hung(False)   # amdgpu_device_mode1_reset after the memsize wait (amdgpu_device.c:4990-4991)
+    self._vega20_asic_init("after PSP mode1 reset")   # full reset -> "post card" unconditionally (amdgpu_device.c:5142-5146)
 
   def _emergency_quiesce(self):
     """Design v2 §3 (critic gap 27) / §7.0 rule 6: runs when __init__ raises (and from the ladder's abort path), Vega 20 only. Nothing here raises.
