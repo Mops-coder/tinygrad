@@ -704,7 +704,18 @@ class AM_SDMA(AM_IP):
     return doorbell
 
 class AM_PSP(AM_IP):
+  # mi50 fork: Vega 20 = MP0 (11,0,2) = Linux psp_v11_0. Every Vega 20 difference below is gated on `self.vega20` (exact tuple, design v2
+  # R-LINUX / B12), so MP0 13.x (gfx11, MI300) and 14.x (gfx12) execute the same statements with the same values as before this fork.
+  # Linux sources: L/amdgpu/psp_v11_0.c (bootloader, ring, mode1 reset), L/amdgpu/amdgpu_psp.c (psp_hw_start / psp_load_fw order),
+  # L/amdgpu/psp_gfx_if.h (command ids, masks, structs), L/amdgpu/amdgpu_psp.h (mailbox masks, PSP_TMR_SIZE, bootloader cmds).
+  PSP_TMR_SIZE_VEGA20 = 0x400000 # amdgpu_psp.h:40 `PSP_TMR_SIZE(adev)`: 0x400000 for every asic but CHIP_ALDEBARAN; not in autogen am.py
+  # amdgpu_psp.h:57-58 MBOX_TOS_READY_FLAG = GFX_FLAG_RESPONSE, MBOX_TOS_READY_MASK = GFX_CMD_RESPONSE_MASK | GFX_CMD_STATUS_MASK
+  # (psp_gfx_if.h:29 STATUS 0x0000FFFF, :32 RESPONSE 0x80000000, :84 FLAG_RESPONSE 0x80000000) -> mask 0x8000FFFF, flag 0x80000000
+  MBOX_TOS_READY_MASK, MBOX_TOS_READY_FLAG = am.GFX_CMD_RESPONSE_MASK | am.GFX_CMD_STATUS_MASK, am.GFX_FLAG_RESPONSE
+
   def init_sw(self):
+    self.vega20 = self.adev.ip_ver[am.MP0_HWIP] == (11,0,2)
+    # vega20: the mp_11_0_0 table spells these mmMP0_SMN_C2PMSG_* (mp_11_0_offset.h:34-126); AMDev.__getattr__ maps reg* -> mm* (amdev.py)
     self.reg_pref = "regMP0_SMN_C2PMSG" if self.adev.ip_ver[am.MP0_HWIP] < (14,0,0) else "regMPASP_SMN_C2PMSG"
 
     if self.adev.devfmt.startswith("usb:"):
@@ -722,11 +733,15 @@ class AM_PSP(AM_IP):
     self.ring_paddr = self.adev.mm.palloc(self.ring_size, zero=False, boot=True)
 
     self.max_tmr_size, self.tmr_size = 0x1300000, 0
+    # vega20: psp_tmr_init starts from tmr_size = PSP_TMR_SIZE and only LOAD_TOC overrides it (amdgpu_psp.c:887-910); a v1.0 sos header
+    # has no TOC (amdev.py AMFirmware._init_vega20), so AM's "0 until LOAD_TOC" would send SETUP_TMR with buf_size 0 (_tmr_load_cmd).
+    if self.vega20: self.tmr_size = self.PSP_TMR_SIZE_VEGA20
     self.boot_time_tmr = self.adev.ip_ver[am.MP0_HWIP] in {(13,0,6), (13,0,14), (14,0,2), (14,0,3)}
     self.autoload_tmr = self.adev.ip_ver[am.MP0_HWIP] not in {(13,0,6), (13,0,14)}
     self.tmr_paddr = self.adev.mm.palloc(self.max_tmr_size, align=am.PSP_TMR_ALIGNMENT, zero=False, boot=True) if not self.boot_time_tmr else 0
 
   def init_hw(self):
+    if self.vega20: return self._init_hw_vega20()
     spl_key = am.PSP_FW_TYPE_PSP_SPL if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) else am.PSP_FW_TYPE_PSP_KDB
     sos_components = [(am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE), (spl_key, am.PSP_BL__LOAD_TOS_SPL_TABLE),
       (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),
@@ -749,9 +764,50 @@ class AM_PSP(AM_IP):
     if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self._rlc_autoload_cmd()
     else: self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
 
+  def _init_hw_vega20(self):
+    # Linux psp_load_fw (amdgpu_psp.c:3595-3631): psp_hw_start -> psp_load_non_psp_fw -> psp_asd_initialize -> psp_rl_load (design v2 §4.4).
+    # psp_hw_start (amdgpu_psp.c:2952-3051) runs the bootloader stages kdb/spl/sysdrv/soc/intf/dbg/ras/ipkeymgr/spdm/sos, each only when
+    # the descriptor is valid AND the psp_funcs entry exists; psp_v11_0 has kdb/spl/sysdrv/sos only (psp_v11_0.c:673-689) and a v1.0 sos
+    # header carries neither kdb nor spl (amdev.py AMFirmware._init_vega20) -> SYS_DRV (PSP_BL__LOAD_SYSDRV 0x10000) then SOS
+    # (PSP_BL__LOAD_SOSDRV 0x20000) (amdgpu_psp.h:96-97). Both are mandatory: psp_v11_0_init_microcode fails without the sos file
+    # (psp_v11_0.c:99-103) and is_psp_fw_valid = size_bytes != 0 (amdgpu_psp.c:4711-4714; checked at :2961, :2979, :3042).
+    for fw, compid in [(am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOS, am.PSP_BL__LOAD_SOSDRV)]:
+      # each psp_v11_0 stage returns early once the sOS sign-of-life register C2PMSG_81 is non-zero (psp_v11_0.c:214-215, 262-263)
+      if self.is_sos_alive(): break
+      assert len(self.adev.fw.sos_fw.get(fw, b'')) > 0, f"vega20_sos.bin: no {am.enum_psp_fw_type[fw]} image"
+      self._bootloader_load_component(fw, compid) # C2PMSG_36 = msg1 >> 20, C2PMSG_35 = cmd, wait bootloader (psp_v11_0.c:217-234)
+      # psp_v11_0_bootloader_load_sos: "there might be handshake issue with hardware which needs delay" mdelay(20) (psp_v11_0.c:279-280)
+      if compid == am.PSP_BL__LOAD_SOSDRV: time.sleep(0.02)
+    # psp_v11_0.c:281-285: wait for C2PMSG_81 to change from its post-delay value (PSP_WAITREG_CHANGED, amdgpu_psp.c:609-625); the stage
+    # only runs while C2PMSG_81 == 0, so "changed" is "!= 0" = is_sos_alive (psp_v11_0.c:193-200). (If the loop broke on alive, one read.)
+    wait_cond(self.is_sos_alive, value=True, msg="sOS failed to start")
+
+    self._ring_create() # psp_ring_create(KM) right after the bootloader, before the TMR (amdgpu_psp.c:3052-3056)
+    # psp_update_fw_reservation: `default: return 0` for MP0 other than 14.0.2/14.0.3 (amdgpu_psp.c:1065-1089) -> no step here.
+    # psp_tmr_init (amdgpu_psp.c:887-929, gated by !boot_time_tmr || autoload at :3069-3071): LOAD_TOC only with a TOC; none in v1.0.
+    if am.PSP_FW_TYPE_PSP_TOC in self.adev.fw.sos_fw: self._tmr_init()
+    # psp_hw_start loads the SMU before the TMR only when pmfw_centralized_cstate_management (amdgpu_psp.c:3078-3087), which is set for
+    # MP0 11.0.0/4/5/7/9/11/12/13 and 13.0.0/2/7 only (amdgpu_psp.c:117-128) - not 11.0.2. The SMC image is instead the last fw.descs
+    # entry (ucode enum order, amdgpu_psp.c:3515-3593; amdev.py _init_vega20), so smu_psp_desc must not exist for this card.
+    assert not hasattr(self.adev.fw, 'smu_psp_desc'), "vega20: SMC goes through fw.descs after RLC_G, never through smu_psp_desc"
+    # psp_tmr_load -> SETUP_TMR with virt_phy_addr=1, buf_size = tmr size, system addr = vram pa (amdgpu_psp.c:3089-3093, 826-849, 941-961)
+    self._tmr_load_cmd()
+    # psp_load_non_psp_fw (amdgpu_psp.c:3515-3593): every valid ucode in enum order (SDMA0, SDMA1, MEC1, MEC1_JT, RLC lists, RLC_G, SMC),
+    # one GFX_CMD_ID_LOAD_IP_FW each (psp_prep_load_ip_fw_cmd_buf amdgpu_psp.c:3374-3390); fw.descs holds exactly that order.
+    for psp_desc in self.adev.fw.descs: self._load_ip_fw_cmd(*psp_desc)
+    # psp_asd_initialize (amdgpu_psp.c:3621-3625 call; :1681-1706): mandatory for 11.0.2 (psp_init_asd_microcode error is fatal,
+    # psp_v11_0.c:99-106); "PSP load asd failed!" aborts psp_load_fw. Design v2 U-P2 asks whether compute-only needs it; R-LINUX keeps it.
+    assert hasattr(self.adev.fw, 'asd_fw') and len(self.adev.fw.asd_fw) > 0, "vega20: vega20_asd.bin image missing (psp_v11_0.c:99-106)"
+    self._load_asd_cmd(self.adev.fw.asd_fw)
+    # psp_rl_load (amdgpu_psp.c:3627-3631 call; :1177-1184): `if (!is_psp_fw_valid(psp->rl)) return 0` - only a v1.3 header has one.
+    if am.PSP_FW_TYPE_PSP_RL in self.adev.fw.sos_fw: self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
+
   def is_sos_alive(self): return self.adev.reg(f"{self.reg_pref}_81").read() != 0x0
 
-  def _wait_for_bootloader(self): wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_35").read() & 0x80000000, value=0x80000000, msg="BL not ready")
+  def _wait_for_bootloader(self):
+    # vega20: psp_v11_0_wait_for_bootloader = (C2PMSG_35 & 0x8000FFFF) == 0x80000000 (psp_v11_0.c:179-188); others keep AM's bit-31 test
+    mask = 0x8000FFFF if self.vega20 else 0x80000000
+    wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_35").read() & mask, value=0x80000000, msg="BL not ready")
 
   def _prep_msg1(self, data:memoryview):
     assert len(data) <= self.msg1_view.nbytes, f"msg1 buffer is too small {len(data):#x} > {self.msg1_view.nbytes:#x}"
@@ -787,7 +843,9 @@ class AM_PSP(AM_IP):
       time.sleep(0.02)
 
     # Wait until the sOS is ready
-    wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_64").read() & 0x80000000, value=0x80000000, msg="sOS not ready")
+    # vega20: psp_v11_0_ring_create waits C2PMSG_64 & MBOX_TOS_READY_MASK == MBOX_TOS_READY_FLAG (psp_v11_0.c:356-363); others keep bit 31
+    mask = self.MBOX_TOS_READY_MASK if self.vega20 else 0x80000000
+    wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_64").read() & mask, value=0x80000000, msg="sOS not ready")
 
     self.adev.wreg_pair(self.reg_pref, "_69", "_70", self.adev.paddr2mc(self.ring_paddr))
     self.adev.reg(f"{self.reg_pref}_71").write(self.ring_size)
@@ -799,7 +857,10 @@ class AM_PSP(AM_IP):
     wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_64").read() & 0x8000FFFF, value=0x80000000, msg="sOS ring not created")
 
   def _ring_submit(self, cmd:am.struct_psp_gfx_cmd_resp) -> am.struct_psp_gfx_cmd_resp:
-    msg = am.struct_psp_gfx_rb_frame(fence_value=(prev_wptr:=self.adev.reg(f"{self.reg_pref}_67").read()) + 1,
+    prev_wptr = self.adev.reg(f"{self.reg_pref}_67").read() # psp_v11_0_ring_get_wptr (psp_v11_0.c:590-601)
+    # vega20: psp_ring_cmd_submit places the frame at wptr % ring_size_dw and advances wptr modulo ring_size_dw (amdgpu_psp.c:3917-3967)
+    if self.vega20: prev_wptr %= self.ring_size // 4
+    msg = am.struct_psp_gfx_rb_frame(fence_value=prev_wptr + 1,
       cmd_buf_addr_lo=lo32(self.adev.paddr2mc(self.cmd_paddr)), cmd_buf_addr_hi=hi32(self.adev.paddr2mc(self.cmd_paddr)),
       fence_addr_lo=lo32(self.adev.paddr2mc(self.fence_paddr)), fence_addr_hi=hi32(self.adev.paddr2mc(self.fence_paddr)))
 
@@ -807,11 +868,17 @@ class AM_PSP(AM_IP):
     self.adev.vram.view(self.ring_paddr + prev_wptr * 4, ctypes.sizeof(msg))[:] = memoryview(msg).cast('B')
 
     # Move the wptr
-    self.adev.reg(f"{self.reg_pref}_67").write(prev_wptr + ctypes.sizeof(am.struct_psp_gfx_rb_frame) // 4)
+    new_wptr = prev_wptr + ctypes.sizeof(am.struct_psp_gfx_rb_frame) // 4
+    self.adev.reg(f"{self.reg_pref}_67").write(new_wptr % (self.ring_size // 4) if self.vega20 else new_wptr) # amdgpu_psp.c:3963-3964
 
     wait_cond(lambda: self.adev.vram.view(self.fence_paddr, 4, 'I')[0], value=msg.fence_value, msg="sOS ring not responding")
 
     resp = type(cmd).from_buffer(bytearray(self.adev.vram.view(self.cmd_paddr, ctypes.sizeof(cmd))[:]))
+    # vega20 / design v2 U-P3: Linux only warns on a non-zero status ("Some version of PSP FW doesn't write 0 to that field",
+    # amdgpu_psp.c:772-790) - log every status with the command (and fw type for LOAD_IP_FW) so T6b records it; AM's raise stays.
+    if self.vega20 and DEBUG >= 2:
+      fwt = f" {am.enum_psp_gfx_fw_type.get(resp.cmd.cmd_load_ip_fw.fw_type)}" if resp.cmd_id == am.GFX_CMD_ID_LOAD_IP_FW else ""
+      print(f"am {self.adev.devfmt}: psp {am.enum_psp_gfx_cmd_id.get(resp.cmd_id, resp.cmd_id)}{fwt} resp.status={resp.resp.status:#x}")
     if resp.resp.status != 0: raise RuntimeError(f"PSP command failed {resp.cmd_id} {resp.resp.status}")
 
     return resp
@@ -848,3 +915,29 @@ class AM_PSP(AM_IP):
     return self._ring_submit(cmd)
 
   def _rlc_autoload_cmd(self): return self._ring_submit(am.struct_psp_gfx_cmd_resp(cmd_id=am.GFX_CMD_ID_AUTOLOAD_RLC))
+
+  def _load_asd_cmd(self, asd_bytes:memoryview) -> am.struct_psp_gfx_cmd_resp:
+    # psp_asd_initialize (amdgpu_psp.c:1681-1706): shared_mc_addr = 0, shared_mem_size = PSP_ASD_SHARED_MEM_SIZE = 0 (amdgpu_psp.h:69-70),
+    # ta_load_type = GFX_CMD_ID_LOAD_ASD (psp_gfx_if.h:92). psp_ta_load (amdgpu_psp.c:1836-1858) copies the image to fw_pri (= msg1 here)
+    # and psp_prep_ta_load_cmd_buf (amdgpu_psp.c:1777-1791) fills struct psp_gfx_cmd_load_ta (psp_gfx_if.h:131-144): app_phy_addr =
+    # fw_pri_mc_addr (4 KB aligned; msg1 is 1 MiB aligned), app_len = size_bytes, cmd_buf_phy_addr = 0, cmd_buf_len = 0.
+    self._prep_msg1(asd_bytes)
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: loading asd: {len(asd_bytes):#x} bytes")
+    cmd = am.struct_psp_gfx_cmd_resp(cmd_id=am.GFX_CMD_ID_LOAD_ASD)
+    cmd.cmd.cmd_load_ta.app_phy_addr_hi, cmd.cmd.cmd_load_ta.app_phy_addr_lo = data64(self.msg1_addr)
+    cmd.cmd.cmd_load_ta.app_len = len(asd_bytes)
+    cmd.cmd.cmd_load_ta.cmd_buf_phy_addr_hi, cmd.cmd.cmd_load_ta.cmd_buf_phy_addr_lo = data64(0)
+    cmd.cmd.cmd_load_ta.cmd_buf_len = am.PSP_ASD_SHARED_MEM_SIZE
+    return self._ring_submit(cmd)
+
+  def mode1_reset(self):
+    # psp_v11_0_mode1_reset (psp_v11_0.c:410-432): wait C2PMSG_64 & MBOX_TOS_READY_MASK == MBOX_TOS_READY_FLAG, else -EINVAL
+    # "psp is not working correctly before mode1 reset!"; write GFX_CTRL_CMD_ID_MODE1_RST (0x70000, psp_gfx_if.h:48) to C2PMSG_64;
+    # msleep(500). Linux's post-reset gate (PCI state restore, bootloader wait, RCC_CONFIG_MEMSIZE != 0xffffffff, re-POST) lives in
+    # amdgpu_device_mode1_reset and is the caller's (design v2 B7, amdev.py reset branch), not this method's.
+    assert self.vega20, "AM_PSP.mode1_reset is the psp_v11_0 mailbox reset, ported for MP0 (11,0,2) only; other MP0 use AM_SMU.mode1_reset"
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: psp mode1 reset")
+    wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_64").read() & self.MBOX_TOS_READY_MASK, value=self.MBOX_TOS_READY_FLAG,
+              msg="psp is not working correctly before mode1 reset")
+    self.adev.reg(f"{self.reg_pref}_64").write(am.GFX_CTRL_CMD_ID_MODE1_RST)
+    time.sleep(0.5)
