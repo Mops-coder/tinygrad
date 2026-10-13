@@ -208,6 +208,12 @@ class Harness:
     return self.attach(connect_mi50())
   def attach(self, dev):
     """Start the watchdog on an existing device (T12: the device AMDDevice created; hook_apl_device wires it)."""
+    # Identity gate (2026-10-13, T-1 on the mini): the fork server resolves the card on a connection's FIRST request and maps an unattached
+    # dev_id to the first tinygpu service (server.c open_tinygpu), so with the MI50 off the bus the watchdog sampled the RX 7600 XT.
+    # This read is that first request (dev_id 0x100266a1); nothing else touches the device unless config dword 0 is the MI50.
+    if (got := dev.read_config(0, 4)) != VENDOR_DEVICE:
+      raise SystemExit(f"WRONG CARD: config dword 0 = {got:#010x}, want {VENDOR_DEVICE:#010x} (MI50) - the server opened another card; "
+                       "refusing before any watchdog or MMIO access")
     self.dev = dev; install_rpc_lock(dev)
     self.wd = Watchdog(dev, self.threshold, self.abort); self.wd.start()
     return dev

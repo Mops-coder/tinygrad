@@ -8,6 +8,7 @@ subprocess because the dead-man and the abort paths end with os._exit.
   invalid_forever - every reading 0x3ffff            -> no valid sample for 10 s reaches the dead-man: THERMAL UNKNOWN, exit 3 (review S6, rules 3/4)
   raise      - the thermal read raises after 2 samples -> THERMAL UNKNOWN at once, quiesce, exit 3 (review S10, rule 3)
   contention - a thread hammers the rpc lock for 12 s  -> no dead-man, >= 10 watchdog samples, exit 0 (the unfair-RLock ceiling, measured)
+  wrongcard  - config dword 0 is the RX 7600 XT       -> attach refuses with WRONG CARD before any watchdog read, exit 1 (identity gate)
 Run: PYTHONPATH=<fork> python3 extra/mi50/ladder_selfcheck.py
 """
 import os, sys, time, threading, subprocess
@@ -23,6 +24,7 @@ class FakeDev:
   reads = 0
   mode = "normal"
   threshold = 0
+  cfg0 = 0x66a11002   # config dword 0 the fake card answers (the identity gate reads it first)
   def __init__(self): self.dev_id, self.pcibus, self.sock = 0x100266a1, "fake:1002:66a1", None
   @staticmethod
   def _rpc(sock, dev_id, cmd, *args, bar=0, readout_size=0, payload=b'', has_fd=False):
@@ -36,12 +38,14 @@ class FakeDev:
     if FakeDev.mode == "raise" and n > 2: raise RuntimeError("selfcheck: RPC failed (server status != 0)")
     return encode(45, 40)
   def _bulk_write(self, cmd, idx, offset, data): pass
+  def read_config(self, offset, size): return FakeDev.cfg0 if offset == 0 else 0
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'): return FakeMMIO(self)
 
 def scenario(mode:str):
   os.environ["AM_MI50_TEMP_C"] = "60"
   from extra.mi50 import ladder
   FakeDev.mode = mode
+  if mode == "wrongcard": FakeDev.cfg0 = 0x74801002   # the RX 7600 XT (PCI 1002:7480)
   h = ladder.Harness(f"selfcheck-{mode}", needs_cap=False, needs_dev=False)   # a fake device is attached below
   calls = []
   h.quiesce_fn = lambda: calls.append(1) or print("FAKE QUIESCE ran")
@@ -80,7 +84,8 @@ def main():
           "invalid": (0, ["INVALID(0/511", "INVALID samples logged (raw 0 / 0x3ffff)", "PASS  INVALID samples decode"]),
           "contention": (0, ["PASS  dead-man did not fire", "PASS  watchdog completed"]),
           "invalid_forever": (3, ["INVALID(0/511", "THERMAL UNKNOWN - POWER OFF (no valid (1..510) thermal read", "FAKE QUIESCE ran", "POWER OFF: Leon"]),
-          "raise": (3, ["THERMAL UNKNOWN - POWER OFF (thermal read raised", "FAKE QUIESCE ran", "POWER OFF: Leon"])}
+          "raise": (3, ["THERMAL UNKNOWN - POWER OFF (thermal read raised", "FAKE QUIESCE ran", "POWER OFF: Leon"]),
+          "wrongcard": (1, ["WRONG CARD: config dword 0 = 0x74801002"])}
   ok = True
   for mode, (rc, needles) in want.items():
     t0 = time.monotonic()
@@ -94,6 +99,7 @@ def main():
     if mode == "hang": good = good and 10 <= dt <= 40          # dead-man at ~10 s after the last good read, quiesce bounded
     if mode == "invalid_forever": good = good and 10 <= dt <= 14 and wd >= 9   # reads complete (and are logged) but none is valid: dead-man at ~10 s
     if mode == "raise": good = good and dt <= 5                 # the raising read aborts immediately, not after the 10 s dead-man
+    if mode == "wrongcard": good = good and wd == 0   # refused before the watchdog sampled anything (no WD line in the subprocess output)
     ok &= good
     print(f"{'ok  ' if good else 'FAIL'} {mode:10s} exit={p.returncode} (want {rc}) {dt:5.1f}s WD-samples={wd} missing={missing}")
     if not good: print(out)
