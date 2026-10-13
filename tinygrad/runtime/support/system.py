@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, itertools, struct, socket
-import subprocess, time, enum, atexit
+import subprocess, time, enum, atexit, threading
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, unwrap, fetch, system, _ensure_downloads_dir, DEBUG, flatten, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface, HCQBuffer, hcq_filter_visible_devices
@@ -359,7 +359,7 @@ class RemotePCIDevice(PCIDevice):
     payload = array.array('I', itertools.chain.from_iterable((m, d) for m, ds in devices for d in ds)).tobytes()
     def q(r:str) -> list[tuple[socket.socket, str]]:
       sock = RemotePCIDevice.remote_sock((host:=r.strip().split(":")[0]), (port:=int(r.strip().split(":")[1]) if ":" in r else 6667))
-      data_len, _, _, _ = RemotePCIDevice._rpc(sock, 0, RemoteCmd.PROBE, base_class or 0, len(payload), vendor, payload=payload)
+      data_len, _, _, _ = RemotePCIDevice._rpc_nolock(sock, 0, RemoteCmd.PROBE, base_class or 0, len(payload), vendor, payload=payload)
       return [(sock, f"remote:{host}:{port}:{d}") for d in RemotePCIDevice._recvall(sock, data_len).decode().split('\n')]
     return flatten([q(r) for r in getenv("REMOTE", "").split(",") if r.strip()])
 
@@ -370,8 +370,19 @@ class RemotePCIDevice(PCIDevice):
     if len(data) < n: raise RuntimeError("Connection closed")
     return data
 
+  # mi50 fork (design v2 §3 "_rpc lock", §7.0 rule 2): the TinyGPU server accepts ONE client and serves it from a blocking recv loop
+  # (server.c:268 listen(server_fd, 1), :274 "client already connected", :185 handle_client), so the thermal watchdog must be a thread sharing
+  # this socket. One RLock per device
+  # serialises each request+response (both the 17-byte plain reply and the recvmsg has_fd reply, plus any readout) as a single unit;
+  # RLock (not Lock) because RemotePCIDevice.alloc_sysmem does _rpc + _recvall as one exchange under the same lock. A watchdog that must
+  # detect a stalled transport (rule 3) uses dev._sock_lock.acquire(timeout=...) instead of blocking forever behind a hung read.
+  def _rpc(self, sock:socket.socket, dev_id:int, cmd:int, *args:int, bar:int=0, readout_size:int=0, payload:bytes=b'', has_fd=False):
+    with self._sock_lock:
+      return RemotePCIDevice._rpc_nolock(sock, dev_id, cmd, *args, bar=bar, readout_size=readout_size, payload=payload, has_fd=has_fd)
+
   @staticmethod
-  def _rpc(sock:socket.socket, dev_id:int, cmd:int, *args:int, bar:int=0, readout_size:int=0, payload:bytes=b'', has_fd=False):
+  def _rpc_nolock(sock:socket.socket, dev_id:int, cmd:int, *args:int, bar:int=0, readout_size:int=0, payload:bytes=b'', has_fd=False):
+    # unlocked raw exchange: only for remote_list (a probe socket with no device yet) and for _rpc above
     sock.sendall(struct.pack('<BIIQQQ', cmd, dev_id, bar, *(*args, 0, 0, 0)[:3]) + payload)
     if has_fd:
       msg, anc, _, _ = sock.recvmsg(17, socket.CMSG_LEN(4))
@@ -386,7 +397,7 @@ class RemotePCIDevice(PCIDevice):
     # mi50 fork: dev_id names the card for the TinyGPU server. "vvvv:dddd" (macOS, from pci_scan_bus) -> vendor<<16|device;
     # "remote:host:port:N" (Linux REMOTE) -> N; anything else -> 0 (= server picks its first device, upstream behaviour)
     parts = pcibus.split(':')
-    self.sock, self.pcibus = sock, pcibus
+    self.sock, self.pcibus, self._sock_lock = sock, pcibus, threading.RLock()
     self.dev_id = (int(parts[0], 16) << 16 | int(parts[1], 16)) if len(parts) == 2 else (int(parts[-1]) if len(parts) > 2 else 0)
     self.peer_group = sock.getpeername()[0]
     for buft in [socket.SO_SNDBUF, socket.SO_RCVBUF]: self.sock.setsockopt(socket.SOL_SOCKET, buft, 64 << 20)
@@ -394,15 +405,18 @@ class RemotePCIDevice(PCIDevice):
     self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
 
   def _bulk_read(self, cmd:int, idx:int, offset:int, size:int) -> bytes:
-    RemotePCIDevice._bulk_recv += size
-    return unwrap(self._rpc(self.sock, self.dev_id, cmd, offset, size, bar=idx, readout_size=size)[2])
+    with self._sock_lock:
+      RemotePCIDevice._bulk_recv += size
+      return unwrap(self._rpc(self.sock, self.dev_id, cmd, offset, size, bar=idx, readout_size=size)[2])
   def _bulk_write(self, cmd:int, idx:int, offset:int, data:bytes):
-    RemotePCIDevice._bulk_sent += len(data)
-    self.sock.sendall(struct.pack('<BIIQQQ', cmd, self.dev_id, idx, offset, len(data), 0) + data)
+    with self._sock_lock:  # no reply, but the header+data bytes must not interleave with another thread's request
+      RemotePCIDevice._bulk_sent += len(data)
+      self.sock.sendall(struct.pack('<BIIQQQ', cmd, self.dev_id, idx, offset, len(data), 0) + data)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
-    paddrs_len, handle, _, _ = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM, size, int(contiguous))
-    paddrs = list(struct.unpack(f'<{paddrs_len // 8}Q', self._recvall(self.sock, paddrs_len)))
+    with self._sock_lock:  # the paddr list is a second read of the same exchange (Linux REMOTE path; APLRemotePCIDevice overrides this)
+      paddrs_len, handle, _, _ = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM, size, int(contiguous))
+      paddrs = list(struct.unpack(f'<{paddrs_len // 8}Q', self._recvall(self.sock, paddrs_len)))
     return RemoteMMIOInterface(self, handle, size, fmt='B', rd_cmd=RemoteCmd.SYSMEM_READ, wr_cmd=RemoteCmd.SYSMEM_WRITE), paddrs
 
   def reset(self): self._rpc(self.sock, self.dev_id, RemoteCmd.RESET)
@@ -420,6 +434,12 @@ class APLRemotePCIDevice(RemotePCIDevice):
 
   @classmethod
   def ensure_app(cls):
+    # mi50 fork (design v2 §1.3/§3): TINYGPU_FORK=1 means APP_PATH is the forked, ad-hoc-signed TinyGPU.app (widened IOPCIClassMatch) and
+    # must never be pkill'ed / overwritten by the pinned upstream zip below. With the flag set and no app installed we stop instead of
+    # silently installing the upstream build (whose class match is the unwidened one, design §1.4 / U-H1).
+    if getenv("TINYGPU_FORK", 0) == 1:
+      if not os.path.exists(cls.APP_PATH): raise RuntimeError(f"TINYGPU_FORK=1 but {cls.APP_PATH} is not installed: install the forked TinyGPU.app")
+      return
     commit = "c0d024f9ff0e1dc8fdf217f255da7101d91e8323"
     app_name = f"TinyGPU_{commit}.zip"
     if (_ensure_downloads_dir() / app_name).is_file() and os.path.exists(cls.APP_PATH): return

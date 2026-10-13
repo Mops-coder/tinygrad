@@ -345,7 +345,9 @@ class AMDComputeQueue(HWQueue):
 
     self.wreg(self.gc.regCOMPUTE_PGM_LO, *data64_le(prg.prog_addr >> 8))
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, prg.rsrc1, prg.rsrc2)
-    self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3)
+    # mi50 fork (design v2 B17): gfx906 has no COMPUTE_PGM_RSRC3 - gc_9_0 has only RSRC1/RSRC2 (gc_9_0_offset.h:2214-2217; regs.py gc_9_0
+    # table mmCOMPUTE_PGM_RSRC1/2 only), the register first appears in gc_9_4_3 (gc_9_4_3_offset.h:2678). Exact-target gate, other cards unchanged.
+    if prg.dev.target != (9,0,6): self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3)
     self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, prg.dev.tmpring_size)
 
     # this is what llvm refers to as "architected flat scratch"
@@ -895,7 +897,12 @@ class KFDIface:
 
 class PCIIface(PCIIfaceBase):
   def __init__(self, dev, dev_id):
-    super().__init__(dev, dev_id, vendor=0x1002, devices=((0xffff, (0x74a1,0x744c,0x7480,0x7550,0x7551,0x7590,0x75a0,0x75a8)),), vram_bar=0,
+    # mi50 fork (design v2 B17): 0x66a1 = AMD Instinct MI50 / Vega 20 (amdgpu_drv.c:2087 `PCI_DEVICE(0x1002, 0x66A1), .driver_data = CHIP_VEGA20`).
+    # Ordering consequence: System.pci_scan_bus returns sorted() "vendor:device" strings (system.py:78, macOS builds f"{v:x}:{d:x}" at :69),
+    # and every other id in this tuple starts with 0x7, so "1002:66a1" sorts first: with the MI50 and another card present the MI50 is AMD:0
+    # and the other card moves to AMD:1 (AMD:<n> = position n in that list, system.py pci_probe_device; the TinyGPU fork server opens the card
+    # by the dev_id = vendor<<16|device that RemotePCIDevice.__init__ derives from the string, so the index only changes tinygrad's naming).
+    super().__init__(dev, dev_id, vendor=0x1002, devices=((0xffff, (0x74a1,0x744c,0x7480,0x7550,0x7551,0x7590,0x75a0,0x75a8,0x66a1)),), vram_bar=0,
       va_start=AMMemoryManager.va_allocator.base, va_size=AMMemoryManager.va_allocator.size, dev_impl_t=AMDev)
     self._compute_props()
 
@@ -909,6 +916,11 @@ class PCIIface(PCIIfaceBase):
     self.ip_versions = self.dev_impl.ip_ver
 
     gfxver = int(f"{self.dev_impl.ip_ver[am.GC_HWIP][0]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][1]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][2]:02d}")
+    # mi50 fork (design v2 B17/§3): Vega 20's gc_info is the v2_0 struct the amdev side synthesizes from the VBIOS gfx_info (fields gc_num_se,
+    # gc_num_sh_per_se, gc_num_cu_per_sh, gc_max_scratch_slots_per_cu, gc_max_waves_per_simd, gc_lds_size: am.py struct_gc_info_v2_0, the
+    # branch below). A v1-shaped gc_info would silently take the wgp branch, so it is refused for GC (9,4,0); the values are VBIOS inputs (T2b).
+    if self.dev_impl.ip_ver[am.GC_HWIP] == (9,4,0) and self.dev_impl.gc_info.header.version_major != 2:
+      raise RuntimeError(f"Vega 20 needs a gc_info v2 (struct_gc_info_v2_0), got version_major={self.dev_impl.gc_info.header.version_major}")
     if self.dev_impl.gc_info.header.version_major == 2:
       cu_per_sa = self.dev_impl.gc_info.gc_num_cu_per_sh
       max_sh_per_se = self.dev_impl.gc_info.gc_num_sh_per_se
@@ -920,7 +932,8 @@ class PCIIface(PCIIfaceBase):
     self.props = {'cu_per_simd_array': cu_per_sa, 'simd_count': 2 * cu_per_sa * array_count, 'simd_per_cu': 2, 'array_count': array_count,
       'max_slots_scratch_cu': self.dev_impl.gc_info.gc_max_scratch_slots_per_cu, 'max_waves_per_simd': self.dev_impl.gc_info.gc_max_waves_per_simd,
       'simd_arrays_per_engine': max_sh_per_se, 'lds_size_in_kb': self.dev_impl.gc_info.gc_lds_size, 'num_xcc': self.dev_impl.gfx.xccs,
-      'gfx_target_version': {90403: 90402}.get(gfxver, gfxver)}
+      # mi50 fork: GC 9.4.0 -> 90006 (gfx906) exactly as KFD (kfd_device.c:330-332 `case IP_VERSION(9, 4, 0): gfx_target_version = 90006`)
+      'gfx_target_version': {90403: 90402, 90400: 90006}.get(gfxver, gfxver)}
 
   def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
                    xcc_id=0, idx=0):
@@ -1000,7 +1013,8 @@ class AMDDevice(HCQCompiled):
 
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
-    assert (self.target in ((9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
+    # mi50 fork (design v2 B17): (9,0,6) = gfx906 (Vega 20, from the 90006 map in PCIIface._compute_props); other targets exactly as before
+    assert (self.target in ((9,0,6),(9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 
     self.xccs = self.iface.props.get('num_xcc', 1)
