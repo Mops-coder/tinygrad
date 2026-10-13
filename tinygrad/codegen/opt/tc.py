@@ -134,7 +134,10 @@ amd_cdna3 = amd_cdna_161632[:2] + amd_cdna_161616
 
 amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632 + amd_cdna_161616
 
-def get_amd(arch): return {"gfx942": amd_cdna3, "gfx950": amd_cdna4, "gfx1200": amd_rdna4, "gfx1201": amd_rdna4}.get(arch, amd_rdna3)
+# mi50 fork (design v2 B17, U-C3): gfx906 gets no tensor cores. The default for an unlisted arch is amd_rdna3 (the RDNA3 wave32 WMMA table,
+# for which cstyle.py HIPRenderer.render_kernel emits __builtin_amdgcn_wmma_*_w32); the design states gfx906 has no WMMA/MFMA table usable by
+# tinygrad (no cdna entry either: HIPRenderer.is_cdna lists only gfx942/gfx950), so [] until a verified table exists.
+def get_amd(arch): return {"gfx906": [], "gfx942": amd_cdna3, "gfx950": amd_cdna4, "gfx1200": amd_rdna4, "gfx1201": amd_rdna4}.get(arch, amd_rdna3)
 
 pm_validate_wmma_rdna3 = PatternMatcher([
   (UPat(Ops.WMMA, name="x", dtype=dtypes.int32), lambda x: x.replace(
