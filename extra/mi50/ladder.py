@@ -84,6 +84,9 @@ def install_rpc_lock(dev) -> threading.RLock:
   (system.py:374-383, 398, 404-416); _bulk_write sends without _rpc (system.py:400-401). Both get an instance-level locked wrapper. If the fork
   already ships dev._rpc_lock (design §3 row), it is reused and nothing is wrapped."""
   if (lock:=getattr(dev, "_rpc_lock", None)) is not None: return lock
+  # integration 2026-10-13: the fork now ships the lock as RemotePCIDevice._sock_lock (compute-host report: instance-method _rpc, _bulk_read,
+  # _bulk_write and alloc_sysmem already run under it, system.py:379-419), so nothing is wrapped; the alias keeps `dev._rpc_lock` for the rungs.
+  if (lock:=getattr(dev, "_sock_lock", None)) is not None: dev._rpc_lock = lock; return lock
   lock = dev._rpc_lock = threading.RLock()
   orig_rpc, orig_bulk_write = type(dev)._rpc, dev._bulk_write
   def rpc(*a, **k):
@@ -398,16 +401,20 @@ def psp_observer(adev, log:list):
   adev.psp._ring_submit, adev.psp._bootloader_load_component = ring_submit, bl_load
 
 def boot_sw_only(h:"Harness"):
-  """T6a only: the AMDev with its software state built and NO init_hw and NO reset decision - amdev.py:199-204 + 216-217 run verbatim
-  (pci_dev, _disable_aspm, map BAR0/2/5, _run_discovery -> the amdev implementer's _static_vega20, _build_regs, init_sw). The reset branch
-  (amdev.py:228-235) is deliberately not reached: T6a issues AM_PSP.mode1_reset itself ("alone")."""
+  """T6a only: the AMDev with its software state built and NO init_hw and NO reset decision - amdev.py:216-218 + 229-233 + 245-246 run verbatim
+  (pci_dev, _disable_aspm, map BAR0/2/5, _run_discovery -> the amdev implementer's _static_vega20, _build_regs, _vega20_vbios, init_sw). The reset
+  branch (amdev.py:257-265) is deliberately not reached: T6a issues AM_PSP.mode1_reset itself ("alone")."""
   from tinygrad.runtime.support.am.amdev import AMDev
   adev = AMDev.__new__(AMDev)
   adev.pci_dev, adev.devfmt = h.dev, h.dev.pcibus                                                                       # amdev.py:199
   adev._disable_aspm()                                                                                                   # amdev.py:200
   adev.vram, adev.doorbell64, adev.mmio = h.dev.map_bar(0), h.dev.map_bar(2, fmt='Q'), h.dev.map_bar(5, fmt='I')         # amdev.py:201
-  adev._run_discovery(); adev._build_regs()                                                                              # amdev.py:203-204
-  adev.is_booting = True; adev.init_sw(smi_dev=False)                                                                    # amdev.py:216-217
+  adev.is_vega20 = False; adev._run_discovery(); adev._build_regs()                                                      # amdev.py:222, 229-230
+  # integration 2026-10-13: the amdev branch's _boot (amdev.py:232-233) derives boot_version and, on the Vega 20, runs _vega20_vbios() (required
+  # inputs, POST gate, ROM dump: reads only) which sets reserved_vram_size and gc_info; init_sw needs both (amdev report, amdev.py:481-482).
+  adev.boot_version = AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON if adev.is_vega20 else AMDev.Version      # amdev.py:232
+  if adev.is_vega20: adev._vega20_vbios()                                                                                # amdev.py:233
+  adev.is_booting = True; adev.init_sw(smi_dev=False)                                                                    # amdev.py:245-246
   h.adev = adev; install_smu_lock(adev)
   return adev
 

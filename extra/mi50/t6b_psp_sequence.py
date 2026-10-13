@@ -205,7 +205,9 @@ except AssertionError as e: check(True, f"mode1_reset refuses MP0 (13,0,6): {str
 
 # (6) other cards: this tree vs the unmodified mi50 branch, full MMIO trace + command bytes
 print("--- (6) MP0 13.0.6 / 13.0.7 / 14.0.2 unchanged vs mi50")
-old_src = subprocess.run(["git", "-C", str(TREE), "show", "mi50:tinygrad/runtime/support/am/ip.py"], capture_output=True, text=True,
+# integration 2026-10-13: the "unmodified" baseline is the pre-integration mi50 commit d4697a019 (every implementer branched from it); after the
+# merge `mi50` itself carries the Vega 20 branches, so comparing against it would prove nothing. Override with env MI50_BASELINE_REF.
+old_src = subprocess.run(["git", "-C", str(TREE), "show", os.environ.get("MI50_BASELINE_REF", "d4697a019") + ":tinygrad/runtime/support/am/ip.py"], capture_output=True, text=True,
                          check=True).stdout
 with tempfile.TemporaryDirectory() as td:
   pathlib.Path(td, "ip_mi50.py").write_text(old_src)

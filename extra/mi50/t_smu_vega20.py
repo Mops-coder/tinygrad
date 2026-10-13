@@ -262,7 +262,9 @@ check(all(f"mmMP1_SMN_C2PMSG_{n}" in mp_t for n in (66, 82, 90)), "mp (11,0,0) t
 check(import_module("smu", (11,0,2)) is smu, "import_module('smu', (11,0,2)) -> smu_11_0_2")
 
 # (13) existing cards: old AM_SMU (git mi50) vs new, identical register traces
-old_src = subprocess.run(["git", "-C", str(FORK), "show", "mi50:tinygrad/runtime/support/am/ip.py"], capture_output=True, text=True, check=True).stdout
+# integration 2026-10-13: the "unmodified" baseline is the pre-integration mi50 commit d4697a019 (every implementer branched from it); after the
+# merge `mi50` itself carries the Vega 20 branches, so comparing against it would prove nothing. Override with env MI50_BASELINE_REF.
+old_src = subprocess.run(["git", "-C", str(FORK), "show", os.environ.get("MI50_BASELINE_REF", "d4697a019") + ":tinygrad/runtime/support/am/ip.py"], capture_output=True, text=True, check=True).stdout
 old = types.ModuleType("ip_old"); old.__file__ = "ip_old"; exec(compile(old_src, "ip_old", "exec"), old.__dict__)
 import time as _time
 _sleep = _time.sleep; _time.sleep = lambda s: None

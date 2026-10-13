@@ -20,9 +20,9 @@ if __name__ == "__main__":
   # ping (minimal server round-trip, no device I/O)
   from tinygrad.runtime.support.system import RemoteCmd
   sock = pci.sock
-  for _ in range(10): RemotePCIDevice._rpc(sock, 0, RemoteCmd.PING)
+  for _ in range(10): RemotePCIDevice._rpc_nolock(sock, 0, RemoteCmd.PING)
   st = time.perf_counter()
-  for _ in range(LAT_N_RUNS): RemotePCIDevice._rpc(sock, 0, RemoteCmd.PING)
+  for _ in range(LAT_N_RUNS): RemotePCIDevice._rpc_nolock(sock, 0, RemoteCmd.PING)
   ping_lat = (time.perf_counter() - st) / LAT_N_RUNS
   print(f"PING latency: {ping_lat*1e6:.1f} us ({1/ping_lat:,.0f} ops/sec)\n")
 

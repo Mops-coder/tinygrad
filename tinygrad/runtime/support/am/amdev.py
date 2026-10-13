@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, collections, dataclasses, functools, hashlib, array, os, time, contextlib
+import ctypes, collections, dataclasses, functools, hashlib, array, os, time
 from tinygrad.helpers import mv_address, getenv, DEBUG, lo32, hi32, fetch_fw, to_mv, wait_cond
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.autogen.am import am, fw
@@ -545,8 +545,9 @@ class AMDev:
           if DEBUG >= 1: print(f"am {self.devfmt}: quiesce {step.__name__} failed: {e!r}")
     try:
       smu_mod, smu = import_module("smu", self.ip_ver[am.MP1_HWIP]), getattr(self, 'smu', None) or AM_SMU(self)
-      with contextlib.suppress(TimeoutError): smu._send_msg(smu_mod.PPSMC_MSG_GetSmuVersion, 0, timeout=100)
-      if self.mmMP1_SMN_C2PMSG_90.read() == 0: return
+      if not hasattr(smu, 'smu_mod'):  # integration 2026-10-13: AM_SMU.init_sw never ran; ip.py AM_SMU._vega20_send_msg needs both fields
+        smu.smu_mod, smu._vega20_results = smu_mod, {v: k for k, v in vars(smu_mod).items() if k.startswith("PPSMC_Result_")}
+      if not smu.is_smu_alive(): return  # GetSmuVersion (100 ms) then C2PMSG_90 != 0; ip.py is_smu_alive also suppresses the Vega ResponseError
       # SetSoftMaxByFreq to each clock's lowest GetDpmFreqByIndex level (design v2 §3 "SetSoftMaxByFreq level 0"; encoding = AM read_clocks
       # ip.py:208-209, PPCLK order smu11_driver_if.h PPCLK_e: GFXCLK 0, SOCCLK 4, UCLK 5, FCLK 10), then the ruled cap (SetPptLimit 0xF)
       for clk in (smu_mod.PPCLK_GFXCLK, smu_mod.PPCLK_SOCCLK, smu_mod.PPCLK_UCLK, smu_mod.PPCLK_FCLK):

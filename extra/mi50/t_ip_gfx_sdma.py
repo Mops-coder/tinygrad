@@ -253,7 +253,9 @@ check(w6[0][0].startswith("mmGRBM_GFX_CNTL") and any(n.startswith("mmGRBM_SOFT_R
 
 # ---------------------------------------------------------------- regression: gfx11 and MI300 vs the unmodified mi50 ip.py ----------------------------------------------------------------
 fork = pathlib.Path(os.getenv("MI50_FORK_GIT", pathlib.Path(__file__).resolve().parents[2]))
-src = subprocess.run(["git", "-C", str(fork), "show", "mi50:tinygrad/runtime/support/am/ip.py"], capture_output=True, text=True, check=True).stdout
+# integration 2026-10-13: the "unmodified" baseline is the pre-integration mi50 commit d4697a019 (every implementer branched from it); after the
+# merge `mi50` itself carries the Vega 20 branches, so comparing against it would prove nothing. Override with env MI50_BASELINE_REF.
+src = subprocess.run(["git", "-C", str(fork), "show", os.environ.get("MI50_BASELINE_REF", "d4697a019") + ":tinygrad/runtime/support/am/ip.py"], capture_output=True, text=True, check=True).stdout
 ip_old = types.ModuleType("ip_mi50_baseline"); ip_old.__file__ = "mi50:ip.py"; exec(compile(src, "mi50:ip.py", "exec"), ip_old.__dict__)
 def seg(n, base): return tuple(base + 0x100000 * i for i in range(n))
 def selfclear_safe_mode(d):

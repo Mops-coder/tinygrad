@@ -63,6 +63,12 @@ def scenario(mode:str):
   sys.exit(h.run(rung))
 
 def main():
+  # integration 2026-10-13: the fork's RemotePCIDevice ships the lock as _sock_lock with an instance-method _rpc (system.py:379-400, compute-host);
+  # install_rpc_lock must reuse it, alias _rpc_lock for the rungs and wrap nothing (wrapping type(dev)._rpc would drop `self`)
+  from extra.mi50 import ladder
+  d = FakeDev(); d._sock_lock = threading.RLock(); orig = d._rpc
+  assert ladder.install_rpc_lock(d) is d._sock_lock and d._rpc_lock is d._sock_lock and d._rpc is orig, "install_rpc_lock must reuse _sock_lock"
+  print("ok   install_rpc_lock reuses the fork's _sock_lock (aliased as _rpc_lock) and leaves _rpc unwrapped")
   env = dict(os.environ, PYTHONPATH=os.environ.get("PYTHONPATH", "."))
   want = {"hang": (3, ["THERMAL UNKNOWN - POWER OFF", "QUIESCE: running rung quiesce", "FAKE QUIESCE ran", "POWER OFF: Leon"]),
           "exception": (1, ["EXCEPTION in rung", "FAKE QUIESCE ran", "POWER OFF: Leon", "RUNG selfcheck-exception: "]),

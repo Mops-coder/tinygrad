@@ -183,7 +183,9 @@ print()
 
 # --- (2) non-Vega paths byte-identical to the mi50 branch ---------------------------------------------------------------------------------
 fork = pathlib.Path(os.getenv("MI50_FORK_GIT", pathlib.Path(__file__).resolve().parents[2]))
-base_src = subprocess.run(["git", "-C", str(fork), "show", "mi50:tinygrad/runtime/support/am/ip.py"], check=True, capture_output=True, text=True).stdout
+# integration 2026-10-13: the "unmodified" baseline is the pre-integration mi50 commit d4697a019 (every implementer branched from it); after the
+# merge `mi50` itself carries the Vega 20 branches, so comparing against it would prove nothing. Override with env MI50_BASELINE_REF.
+base_src = subprocess.run(["git", "-C", str(fork), "show", os.environ.get("MI50_BASELINE_REF", "d4697a019") + ":tinygrad/runtime/support/am/ip.py"], check=True, capture_output=True, text=True).stdout
 with tempfile.TemporaryDirectory() as td:
   p = pathlib.Path(td) / "ip_mi50.py"; p.write_text(base_src)
   spec = importlib.util.spec_from_file_location("ip_mi50", p); ip_old = importlib.util.module_from_spec(spec); spec.loader.exec_module(ip_old)
