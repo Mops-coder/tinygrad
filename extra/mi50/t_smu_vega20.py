@@ -6,7 +6,7 @@ A fake AMDev with a scripted SMU mailbox logs every (msg, param) pair. Checks:
 (2) set_clocks(0/None/-1) sends SetSoftMinByFreq AND SetSoftMaxByFreq for GFXCLK/UCLK/SOCCLK whose DPM feature is enabled, min block then max block;
 (3) set_power_limit -> SetPptLimit, refused when FEATURE_PPT is off; get_power_limit -> GetPptLimit(POWER_SOURCE_AC << 16);
 (4) read_table(6)/read_metrics: SetDriverDramAddrHigh/Low re-sent, TransferTableSmu2Dram, HDP_READ_CACHE_INVALIDATE write 1 + readback, struct decoded;
-(5) read_od / write_od / od_defaults (GetAVFSVoltageByDpm with (AVFS_CURVE<<24)|(85<<16)|freq, /4*4), write_table = memcpy, flush_hdp, RCC_CONFIG_MEMSIZE read,
+(5) read_od / write_od / od_defaults (GetAVFSVoltageByDpm with (AVFS_CURVE<<24)|(85<<16)|freq, /4*4), write_table = memcpy, flush_hdp (incl. the memsize read),
     addr, TransferTableDram2Smu, and NO message after the OD write; (6) get_features = 0xC/0xD -> low | high << 32; (7) mode1_reset raises without
     AM_PSP.mode1_reset and delegates with it, never an SMU message; (8) 0xFC/0xFD/0xFE/0xFF -> ResponseError naming the vega20_ppsmc.h code;
 (9) enable_dpm_full replays vega20_enable_dpm_tasks' messages in order and validates its required inputs; (10) every message number the class
@@ -167,7 +167,9 @@ adev.msgs.clear(); adev.trace.clear(); od.GfxclkVolt3 = 4 * 1000; s.write_od(od)
 check(names(adev.msgs) == [("SetDriverDramAddrHigh", hi32(drv_mc)), ("SetDriverDramAddrLow", lo32(drv_mc)), ("TransferTableDram2Smu", 9)],
       f"write_od: addr re-sent then TransferTableDram2Smu 9 and NO message after it (vega20_smumgr.c:228-243; vega20_hwmgr.c:3131-3156): {names(adev.msgs)}")
 ops = [x[0] if x[0] == "flush_hdp" else x[1] for x in adev.trace]
-check(ops.index("flush_hdp") < ops.index("regRCC_CONFIG_MEMSIZE") < ops.index("mmMP1_SMN_C2PMSG_66"), f"write_table: flush_hdp, RCC_CONFIG_MEMSIZE read, then the mailbox (amdgpu_hdp.c:55-60): {ops[:4]}")
+# review 2026-10-13 L11: gmc.flush_hdp IS amdgpu_hdp_generic_flush incl. its one get_memsize read (ip.py AM_GMC.flush_hdp, NBIO 7.4.0 branch); write_table
+# adds no second RCC_CONFIG_MEMSIZE read (the stub here records "flush_hdp" only)
+check(ops.index("flush_hdp") < ops.index("mmMP1_SMN_C2PMSG_66") and "regRCC_CONFIG_MEMSIZE" not in ops, f"write_table: flush_hdp (= write + one memsize read), then the mailbox, no second memsize read (amdgpu_hdp.c:55-60): {ops[:4]}")
 check(adev.smu_tables[9][:32] == bytes(od) and smu.OverDriveTable_t.from_buffer_copy(adev.smu_tables[9]).GfxclkVolt3 == 4000, "the SMU received the edited OD table bytes")
 check(raises(TypeError, lambda: s.write_od(smu.SmuMetrics_t())), "write_od rejects a non-OverDriveTable_t")
 adev, s = mk(); d = s.od_defaults()

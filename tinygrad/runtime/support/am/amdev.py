@@ -14,13 +14,17 @@ AM_DEBUG = getenv("AM_DEBUG", 0)
 # mi50 fork: config dword 0 of the MI50 = device 0x66a1 << 16 | vendor 0x1002 (design v2 §1.1, §3 "_run_discovery" row)
 VEGA20_PCI_ID = 0x66a11002
 
-def _required_env(name:str, typ) -> int|float:
+def _required_env(name:str, what:str, lo:int, hi:int) -> int:
   """Values that are Leon's to rule (design v2 §8 U-S6: 'none exist in the trees'): no default, a clear error when absent. Environment is the
-  one mechanism because AMDev is constructed by PCIIfaceBase/system.py (not editable here); constructor arguments would be unreachable."""
-  if (v:=os.environ.get(name)) is None:
-    raise RuntimeError(f"MI50 (Vega 20): environment variable {name} is REQUIRED and has no default - the value is Leon's to rule "
+  one mechanism because AMDev is constructed by PCIIfaceBase/system.py (not editable here); constructor arguments would be unreachable.
+  Parse rule = extra/mi50/ladder.py _env_int (review 2026-10-13 TI4/S13: one rule for the ladder and the driver): int(v, 0), bounded lo..hi."""
+  if (v:=os.environ.get(name)) is None or v.strip() == "":
+    raise RuntimeError(f"MI50 (Vega 20): environment variable {name} = {what} is REQUIRED and has no default - the value is Leon's to rule "
                        "(design v2 §3/§8 U-S6)")
-  return typ(v)
+  try: n = int(v, 0)
+  except ValueError: raise RuntimeError(f"MI50 (Vega 20): {name}={v!r} is not an integer ({what})") from None
+  if not lo <= n <= hi: raise RuntimeError(f"MI50 (Vega 20): {name}={n} outside {lo}..{hi} ({what})")
+  return n
 
 @dataclasses.dataclass
 class AMRegister(AMDReg):
@@ -128,8 +132,13 @@ class AMFirmware:
     sos = ucode[sos.offset_bytes:+sos.size_bytes]); no KDB/TOC/SPL/RL. The PSP hands the non-PSP firmware over in Linux's ucode enum
     order (amdgpu_psp.c psp_load_non_psp_fw): SDMA0, SDMA1, MEC1 code, MEC1 JT, RLC restore lists (v2.1, when sized), RLC_G, then
     SMC (amdgpu_cgs.c registers vega20_smc.bin as AMDGPU_UCODE_ID_SMC -> GFX_FW_TYPE_SMU) - so SMC goes LAST in descs here and
-    smu_psp_desc (which AM_PSP loads before the TMR) is deliberately not set. CE/PFP/ME (gfx ring) and MEC2 are not loaded:
-    compute uses MEC1 pipe 0 only; add them if bring-up shows the sOS needs them. ASD is kept for a LOAD_ASD command."""
+    smu_psp_desc (which AM_PSP loads before the TMR) is deliberately not set. ASD is kept for a LOAD_ASD command.
+    Review 2026-10-13 (L2): CE/PFP/ME and MEC2 are loaded like Linux does for CHIP_VEGA20 - gfx_v9_0_early_init gives GC 9.4.0 num_gfx_rings =
+    GFX9_NUM_GFX_RINGS (gfx_v9_0.c:4862-4866, only 9.4.1/9.4.2 get 0) so gfx_v9_0_init_microcode requests pfp/me/ce (:1607-1611 -> :1455-1480,
+    whole ucode_size_bytes each, amdgpu_gfx.c:1489-1552), and gfx_v9_0_load_mec2_fw_bin_support is true for 9.4.0 (:1539-1547) so mec2 is
+    requested and registered as CP_MEC2 + CP_MEC2_JT (:1568-1579) = GFX_FW_TYPE_CP_MEC + GFX_FW_TYPE_CP_MEC_ME2 (amdgpu_psp.c:3157-3160).
+    Enum order amdgpu_ucode.h:480-531: SDMA0, SDMA1, CP_CE, CP_PFP, CP_ME, CP_MEC1, CP_MEC1_JT, CP_MEC2, CP_MEC2_JT, RLC lists, RLC_G, SMC
+    (= design v2 §4 "PSP load order emitted by the fork"). vega20_mec2.bin is byte-identical to vega20_mec.bin (fw.py hashes; Firmware Facts)."""
     self.sos_fw, self.ucode_start, self.descs = {}, {}, []
     blob, hdr = self.load_fw("vega20_sos.bin", am.struct_psp_firmware_header_v1_0)
     assert (hdr.header.header_version_major, hdr.header.header_version_minor) == (1, 0), "vega20_sos.bin: expected a v1.0 psp header"
@@ -141,10 +150,17 @@ class AMFirmware:
       blob, hdr = self.load_fw(fname, am.struct_sdma_firmware_header_v1_0)
       self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, fw_type)]
 
-    blob, hdr = self.load_fw("vega20_mec.bin", am.struct_gfx_firmware_header_v1_0)
-    ucode_off = hdr.header.ucode_array_offset_bytes
-    self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes - hdr.jt_size * 4, am.GFX_FW_TYPE_CP_MEC)]
-    self.descs += [self.desc(blob, ucode_off + hdr.jt_offset * 4, hdr.jt_size * 4, am.GFX_FW_TYPE_CP_MEC_ME1)]
+    # CP_CE 3, CP_PFP 2, CP_ME 1: whole ucode_size_bytes at ucode_array_offset_bytes (amdgpu_gfx.c:1489-1498, :1516-1525, :1543-1552)
+    for fname, fw_type in [("vega20_ce.bin", am.GFX_FW_TYPE_CP_CE), ("vega20_pfp.bin", am.GFX_FW_TYPE_CP_PFP), ("vega20_me.bin", am.GFX_FW_TYPE_CP_ME)]:
+      blob, hdr = self.load_fw(fname, am.struct_gfx_firmware_header_v1_0)
+      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, fw_type)]
+
+    # MEC1 then MEC2, each = code (ucode_size - jt_size*4) + JT (jt_size*4 at jt_offset*4), amdgpu_ucode.c (CP_MEC1/MEC1_JT and CP_MEC2/MEC2_JT)
+    for fname, jt_type in [("vega20_mec.bin", am.GFX_FW_TYPE_CP_MEC_ME1), ("vega20_mec2.bin", am.GFX_FW_TYPE_CP_MEC_ME2)]:
+      blob, hdr = self.load_fw(fname, am.struct_gfx_firmware_header_v1_0)
+      ucode_off = hdr.header.ucode_array_offset_bytes
+      self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes - hdr.jt_size * 4, am.GFX_FW_TYPE_CP_MEC)]
+      self.descs += [self.desc(blob, ucode_off + hdr.jt_offset * 4, hdr.jt_size * 4, jt_type)]
 
     blob, hdr0, hdr1 = self.load_fw("vega20_rlc.bin", am.struct_rlc_firmware_header_v2_0, am.struct_rlc_firmware_header_v2_1)
     if hdr0.header.header_version_minor >= 1:
@@ -214,16 +230,26 @@ class AMDev:
 
   def __init__(self, pci_dev:PCIDevice, reset_mode=False):
     self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
+    # mi50 fork (design v2 §3 "_run_discovery" row; review 2026-10-13 TI4/S13): config dword 0 is the only gate that exists before discovery. This
+    # is the ONE CFG_READ _run_discovery made before (moved here, not added: other cards see the same single inert read), so the two REQUIRED
+    # inputs are refused before the first config write (_disable_aspm) and before any MMIO - a missing input must never end in
+    # _emergency_quiesce's SMU messages.
+    self.is_vega20 = self.pci_dev.read_config(0, 4) == VEGA20_PCI_ID
+    if self.is_vega20: self._vega20_required_inputs()
     self._disable_aspm()
     self.vram, self.doorbell64, self.mmio = self.pci_dev.map_bar(0), self.pci_dev.map_bar(2, fmt='Q'), self.pci_dev.map_bar(5, fmt='I')
 
     # mi50 fork (design v2 §3 "__init__" row, critic gap 27): fini() is unreachable when __init__ raises and PCIIfaceBase only holds the object
     # after dev_impl_t returns (system.py:261), so the Vega 20 quiesces itself before the exception propagates. Other cards: no-op (gated inside).
-    self.is_vega20 = False
     try: self._boot(reset_mode)
     except BaseException:
       self._emergency_quiesce()
       raise
+
+  def _vega20_required_inputs(self):
+    # the two values that are Leon's to rule (design v2 §3 rows / §8 U-S6); same parse + bounds as extra/mi50/ladder.py env_cap / env_threshold
+    self.mi50_ppt_w = _required_env("AM_MI50_PPT_W", "SetPptLimit cap in W (design v2 B16/T3; PPSMC_MSG_SetPptLimit 0xF)", 1, 0xffff)
+    self.mi50_temp_c = _required_env("AM_MI50_TEMP_C", "hotspot abort threshold in C (design v2 §7.0 rule 4: 9-bit CTF_TEMP, 0/511 invalid)", 1, 510)
 
   def _boot(self, reset_mode:bool):
     self._run_discovery()
@@ -269,17 +295,16 @@ class AMDev:
     # Booting done
     self.is_booting = False
 
+    # mi50 fork (review 2026-10-13 S4; design v2 §7.0 rule 7, §7.1 T7 -> T8): on GC (9,4,0) the thermal re-check, the cap and the lowest DPM level
+    # come BEFORE gfx/sdma are brought up - full boot: right after smu.init_hw; partial boot: before the gfx/sdma re-init - so the post-reset
+    # "firmware defaults" window never contains an engine init. Design §3 row "amdev.py:203-206 clock policy" keeps the stock (after-gfx)
+    # position and contradicts §7.1's T7 -> T8 order; the safety rule is followed here, the row is Leon's to reconcile.
+    if self.ip_ver[am.GC_HWIP] == (9,4,0): self._vega20_clock_policy()
+
     # Re-initialize main blocks
     self.init_hw(self.gfx, self.sdma)
 
-    if self.ip_ver[am.GC_HWIP] == (9,4,0):
-      # mi50 fork (design v2 B16, critic gaps 14/15/30): level=-1 "max perf" is refused for the MI50; the card always gets the ruled cap and the
-      # lowest DPM level, re-sent on every boot including partial ones (§8 U-S2). AM_MI50_PPT_W is the only cap mechanism for this card.
-      if (p:=getenv("AM_POWER_LIMIT", 0.0)) > 0 and p != self.mi50_ppt_w:
-        raise RuntimeError(f"MI50: AM_POWER_LIMIT={p} conflicts with AM_MI50_PPT_W={self.mi50_ppt_w}; the MI50 cap is AM_MI50_PPT_W only")
-      self.vega20_check_thermal()
-      self.smu.set_power_limit(self.mi50_ppt_w)
-      self.smu.set_clocks(level=0)
+    if self.ip_ver[am.GC_HWIP] == (9,4,0): pass   # done above (before gfx/sdma)
     elif (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
       self.smu.set_power_limit(max_power)
       self.smu.set_clocks(level=None)
@@ -289,6 +314,25 @@ class AMDev:
     self.reg("regSCRATCH_REG7").write(self.boot_version)
     self.reg("regSCRATCH_REG6").write(1) # set initialized state.
     if DEBUG >= 2: print(f"am {self.devfmt}: boot done")
+
+  def _vega20_clock_policy(self):
+    """Design v2 B16 (critic gaps 14/15/30): level=-1 "max perf" is refused for the MI50; the card always gets the ruled cap and the lowest DPM
+    level, re-sent on every boot including partial ones (§8 U-S2). AM_MI50_PPT_W is the only cap mechanism for this card.
+    Review 2026-10-13 L1/TI3: the cap is sent only while FEATURE_PPT is enabled, exactly vega20_set_power_limit (vega20_powertune.c:37-42: Linux
+    silently returns 0 otherwise). The fork never sends EnableAllSmuFeatures at boot (ip.py _vega20_init_hw (4), §8 U-S1), so the feature state
+    is whatever the VBIOS/SMC boot left - unmeasured until T3/T7; a boot must not raise on it. The state is PRINTED unconditionally so the boot
+    log records "uncapped"; AM_SMU.set_power_limit keeps its raise for explicit callers (raise vs. Linux's silent return there is Leon's ruling).
+    One GetEnabledSmuFeaturesLow/High pair (get_features) feeds the cap gate and the clock gate (no duplicate messages)."""
+    if (p:=getenv("AM_POWER_LIMIT", 0.0)) > 0 and p != self.mi50_ppt_w:
+      raise RuntimeError(f"MI50: AM_POWER_LIMIT={p} conflicts with AM_MI50_PPT_W={self.mi50_ppt_w}; the MI50 cap is AM_MI50_PPT_W only")
+    self.vega20_check_thermal()
+    feats = self.smu.get_features()
+    if feats & self.smu.smu_mod.FEATURE_PPT_MASK: self.smu._vega20_set_power_limit(self.mi50_ppt_w, features=feats)
+    else: print(f"am {self.devfmt}: MI50 cap NOT applied - FEATURE_PPT (bit {self.smu.smu_mod.FEATURE_PPT_BIT}) off, GetEnabledSmuFeatures={feats:#x}; "
+                "vega20_set_power_limit sends nothing then (vega20_powertune.c:37-42): card UNCAPPED (design v2 §8 U-S1)")
+    # review S14: _vega20_set_clocks returns {} when no DPM feature is enabled (vega20_hwmgr.c:1827/:1928 skip) - record it, the rungs read levels
+    if not self.smu._vega20_set_clocks(0, features=feats) and DEBUG >= 1:
+      print(f"am {self.devfmt}: MI50: no DPM feature enabled (GetEnabledSmuFeatures={feats:#x}) - clocks not pinned, PPT cap only (vega20_hwmgr.c:1827/1928)")
 
   def init_sw(self, smi_dev=False):
     self.smi_dev, self.is_err_state = smi_dev, False
@@ -363,10 +407,24 @@ class AMDev:
     self.reg(f"{reg_base}{hi_suffix}").write(hi32(val), inst=inst)
 
   def indirect_rreg(self, reg:int) -> int:
+    if self.ip_ver[am.NBIO_HWIP] == (7,4,0):
+      # mi50 fork (review 2026-10-13 TI8): nbio_7_4 has no RSMU_INDEX/DATA (grep nbio_7_4_offset.h: none). Linux amdgpu_device_rreg routes a register
+      # past rmmio_size to amdgpu_reg_pcie_rd32 (amdgpu_reg_access.c:371-381) = amdgpu_device_indirect_rreg (:590-610): PCIE_INDEX2 = reg*4, read
+      # it back, read PCIE_DATA2 (nbio_v7_4.c:316-324 offsets; aliases mmBIF_BX0_PCIE_INDEX2/DATA2 in the nbio_7_4 table, patches README item 6).
+      self.regBIF_BX0_PCIE_INDEX2.write(reg * 4)
+      self.regBIF_BX0_PCIE_INDEX2.read()
+      return self.regBIF_BX0_PCIE_DATA2.read()
     self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
     return self.reg("regBIF_BX_PF0_RSMU_DATA").read()
 
   def indirect_wreg(self, reg:int, val:int):
+    if self.ip_ver[am.NBIO_HWIP] == (7,4,0):
+      # amdgpu_device_wreg (amdgpu_reg_access.c:500-511) -> amdgpu_device_indirect_wreg (:758-777): write index, read it back, write data, read it back
+      self.regBIF_BX0_PCIE_INDEX2.write(reg * 4)
+      self.regBIF_BX0_PCIE_INDEX2.read()
+      self.regBIF_BX0_PCIE_DATA2.write(val)
+      self.regBIF_BX0_PCIE_DATA2.read()
+      return
     self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
     self.reg("regBIF_BX_PF0_RSMU_DATA").write(val)
 
@@ -392,8 +450,9 @@ class AMDev:
     mmRCC_CONFIG_MEMSIZE = 0xde3
     self.vram_size = self.rreg(mmRCC_CONFIG_MEMSIZE) << 20
     self.large_bar = self.vram.nbytes >= self.vram_size
-    # mi50 fork (design v2 B3): Vega 20 needs no discovery binary (L/amdgpu/amdgpu_discovery.c:3196-3200 "not fatal ... only for sysfs")
-    if self.pci_dev.read_config(0, 4) == VEGA20_PCI_ID: return self._static_vega20()
+    # mi50 fork (design v2 B3): Vega 20 needs no discovery binary (L/amdgpu/amdgpu_discovery.c:3196-3200 "not fatal ... only for sysfs");
+    # is_vega20 = config dword 0 == VEGA20_PCI_ID, read once in __init__ (review TI4). Hand-built AMDevs (ladder boot_sw_only, offline checks) set it.
+    if self.is_vega20: return self._static_vega20()
     tmr_offset, tmr_size = self.vram_size - (64 << 10), (10 << 10)
 
     disc_tbl = self.vram.view(tmr_offset, tmr_size)[:] if self.large_bar else self._read_vram(tmr_offset, tmr_size)
@@ -457,9 +516,9 @@ class AMDev:
     # gc_info and reserved_vram_size come from the VBIOS in _vega20_vbios() (needs the register tables, i.e. after _build_regs)
 
   def _vega20_vbios(self):
-    """Design v2 B4: required inputs, POST gate, ROM dump, data tables. Runs right after _build_regs, before init_sw (no allocations needed)."""
-    self.mi50_ppt_w, self.mi50_temp_c = _required_env("AM_MI50_PPT_W", float), _required_env("AM_MI50_TEMP_C", int)
-    self.vega20_check_thermal()   # first thing read after the inputs: the card's current hotspot vs the ruled threshold
+    """Design v2 B4: POST gate, ROM dump, data tables (the required inputs are read in __init__, before any config write). Runs right after
+    _build_regs, before init_sw (no allocations needed)."""
+    self.vega20_check_thermal()   # first thing read: the card's current hotspot vs the ruled threshold
     if not self.vega20_is_posted():
       raise RuntimeError("MI50: card not POSTed (BIOS_SCRATCH_7 bit 9 clear, amdgpu_atombios.c:1634-1642). Linux would run the ATOM interpreter "
                          "(amdgpu_device.c:4068-4080); the fork does not port it (design v2 B4, §8 U-V1) - nothing boots before")
@@ -471,15 +530,21 @@ class AMDev:
                          f"{self.regBIOS_SCRATCH_0.addr[0]:#x}")
     self.gc_info = self.vbios.gc_info_v2_0()
     self.powerplay = self.vbios.powerplay_limits()   # §6 limits + the pptable blob; Linux vega20 hwmgr refuses to init without a valid table
-    # reserved_vram_size (design B3/B4, §8 U-M1): AM reserves the top of VRAM (mm size = vram_size - reserved_vram_size, init_sw). Linux reserves the
-    # VBIOS firmware region [start, start+size) wherever it is (amdgpu_atomfirmware.c:119-125); the top reservation covering it is vram_size - start.
+    # reserved_vram_size (design B3/B4, §8 U-M1 "the fork asserts no overlap and moves boot_size/reserved_vram_size accordingly"): AM reserves the
+    # top of VRAM (mm size = vram_size - reserved_vram_size, init_sw); the top reservation covering the VBIOS firmware region is vram_size - start.
+    # Review 2026-10-13 L4 (citation corrected): Linux acts on vram_usagebyfirmware only under SR-IOV - v2_1 amdgpu_atomfirmware.c:119-125 is the
+    # ATOM_VRAM_BLOCK_SRIOV_MSG_SHARE_RESERVATION branch, v2_2 :151-157 is amdgpu_sriov_vf; bare metal reads only drv_size (:129). Its bare-metal
+    # top reservation, amdgpu_ttm_init_fw_resv_region (amdgpu_ttm.c:1741-1772), returns at :1745 because reserve_tmr is set only when the discovery
+    # binary is read from VRAM (amdgpu_discovery.c:407-410) and CHIP_VEGA20 reads it from the file (:570-571, :721-727): Linux reserves NOTHING at
+    # the top for Vega 20. The reservation + overlap refusal below are the design's U-M1 step (kept; dropping it is Leon's ruling).
     if (region:=self.vbios.fw_vram_region()) is not None:
       start, size = region
       if start < (32 << 20) or start + size > self.vram_size:
         raise RuntimeError(f"MI50: VBIOS firmware VRAM region [{start:#x}, {start+size:#x}) overlaps AM's boot region [0, 32 MiB) or exceeds VRAM "
                            f"{self.vram_size:#x}: moving boot_size is Leon's decision (design v2 §8 U-M1)")
       self.reserved_vram_size = self.vram_size - start
-    else: self.reserved_vram_size = _required_env("AM_MI50_RESERVED_VRAM_MB", int) << 20   # no table / zero size: explicit value required
+    else: self.reserved_vram_size = _required_env("AM_MI50_RESERVED_VRAM_MB", "top-of-VRAM reservation in MiB (no vram_usagebyfirmware region)",
+                                                  0, self.vram_size >> 20) << 20   # no table / zero size: explicit value required
     if DEBUG >= 2: print(f"am {self.devfmt}: MI50 VBIOS ok, gc_info se={self.gc_info.gc_num_se} cu/sh={self.gc_info.gc_num_cu_per_sh} "
                          f"reserved_vram={self.reserved_vram_size >> 20} MiB bootup sclk={fwi.bootup_sclk_in10khz / 100} MHz")
 
@@ -516,15 +581,27 @@ class AMDev:
     (AM_PSP.mode1_reset = psp_v11_0_mode1_reset, L/amdgpu/psp_v11_0.c:410-432), then the post-reset gates: config space first (master ip.py:220-223:
     config reads fail fast on a wedged GPU, an MMIO read would hang - and here stall the whole TinyGPU client, design §1.3), RCC_CONFIG_MEMSIZE !=
     0xffffffff within usec_timeout (L/amdgpu/amdgpu_device.c:4978-4985; AMDGPU_MAX_USEC_TIMEOUT 100 ms, amdgpu.h:274), then the POST bit again
-    (B4)."""
+    (B4).
+    Review 2026-10-13 L3: amdgpu_device_mode1_reset caches the PCI config space before the reset (amdgpu_device.c:4947-4950 ->
+    amdgpu_device_cache_pci_state :6475-6484 pci_save_state) and restores it after (:4972 amdgpu_device_load_pci_state -> pci_restore_state), before
+    the bootloader wait (:4973) and the memsize poll (:4978-4985). drivers/pci is not in the Linux tree checked out here, so the exact dword set and
+    write order of pci_save/restore_state are UNVERIFIED (listed): the type-0 header dwords named by the review are snapshotted and only the ones
+    the reset changed are written back, descending offsets. :4942-4943/:4991-4992 amdgpu_atombios_scratch_regs_engine_hung (BIOS_SCRATCH_3 bit
+    ATOM_S3_ASIC_GUI_ENGINE_HUNG, amdgpu_atombios.c:1609-1618) is a flag for the ATOM interpreter the fork does not port (§8 U-V1): skipped, listed."""
     self.gfx.fini_hw()
     self.smu.set_clocks(level=0)
     self._vega20_halt_mec()
     self._vega20_halt_sdma()
     time.sleep(0.1)
+    cfg_offs = [0x04, 0x0c, *range(0x10, 0x28, 4), 0x30, 0x3c]   # command/status, cacheline/latency/header/BIST, BAR0..5, expansion ROM, int line/pin
+    cfg_saved = {off: self.pci_dev.read_config(off, 4) for off in cfg_offs}
     self.psp.mode1_reset()
     wait_cond(self.pci_dev.read_config, 0, 2, value=0x1002, timeout_ms=2000,
               msg=f"am {self.devfmt}: MI50 did not return from PSP mode1 reset (config space dead)")
+    for off in reversed(cfg_offs):
+      if (now:=self.pci_dev.read_config(off, 4)) != cfg_saved[off]:
+        if DEBUG >= 1: print(f"am {self.devfmt}: MI50 config dword {off:#04x} changed by the reset {now:#010x} -> restoring {cfg_saved[off]:#010x}")
+        self.pci_dev.write_config(off, cfg_saved[off], 4)
     wait_cond(lambda: self.regRCC_CONFIG_MEMSIZE.read() != 0xffffffff, value=True, timeout_ms=100,
               msg=f"am {self.devfmt}: MI50 RCC_CONFIG_MEMSIZE stuck at 0xffffffff after mode1 reset")
     if not self.vega20_is_posted():
@@ -532,35 +609,41 @@ class AMDev:
                          "(design v2 §8 U-V1)")
 
   def _emergency_quiesce(self):
-    """Design v2 §3 (critic gap 27) / §7.0 rule 6: runs when __init__ raises, Vega 20 only. Engines are halted only once the card was seen POSTed and
-    the register tables exist (Linux never touches GC before POST: amdgpu_device.c:4068-4080 posts before any IP hw_init); the SMU cap is attempted
-    whenever the mailbox answers (AM_SMU.is_smu_alive logic, ip.py:188-190, inlined because smu.init_sw may not have run). Each step in its own try
-    so a dead step never skips the next; nothing here raises."""
+    """Design v2 §3 (critic gap 27) / §7.0 rule 6: runs when __init__ raises (and from the ladder's abort path), Vega 20 only. Nothing here raises.
+    Review 2026-10-13 S7: the engine halts are gated on the register tables existing and a LIVE POST read (one MMIO read, vega20_is_posted), not on
+    the vega20_posted flag - a card left hot by a crashed session (HQDs active) or refused at the thermal check must still get its engines halted;
+    Linux never touches GC before POST (amdgpu_device.c:4068-4080), hence the live read.
+    Review S2/S3 (§7.0 rules 1 and 5): when the mailbox answers (AM_SMU.is_smu_alive logic; smu.init_sw may not have run), the ruled cap goes
+    FIRST as one message (the only lever rule 1 names for a passive card), then Linux's force-lowest = _vega20_set_clocks(0) (vega20_force_dpm_lowest
+    vega20_hwmgr.c:2417-2429: SetSoftMinByFreq THEN SetSoftMaxByFreq per DPM clock whose feature is enabled, :1827/:1928). The first mailbox
+    TimeoutError ends the quiesce (rule 5: no further messages); a ResponseError on the cap still lets the clocks run (own try each)."""
     if not getattr(self, 'is_vega20', False): return
     if DEBUG >= 1: print(f"am {getattr(self, 'devfmt', '?')}: MI50 emergency quiesce")
-    if getattr(self, 'vega20_posted', False):
-      for step in (self._vega20_halt_mec, self._vega20_halt_sdma):
-        try: step()
-        except Exception as e:
-          if DEBUG >= 1: print(f"am {self.devfmt}: quiesce {step.__name__} failed: {e!r}")
+    if 'mmCP_MEC_CNTL' in self.__dict__ and 'mmSDMA_F32_CNTL' in self.__dict__ and 'mmBIOS_SCRATCH_7' in self.__dict__:
+      try: posted = self.vega20_is_posted()
+      except Exception as e:
+        posted = False
+        if DEBUG >= 1: print(f"am {self.devfmt}: quiesce POST read failed, engines not touched: {e!r}")
+      if posted:
+        for step in (self._vega20_halt_mec, self._vega20_halt_sdma):
+          try: step()
+          except Exception as e:
+            if DEBUG >= 1: print(f"am {self.devfmt}: quiesce {step.__name__} failed: {e!r}")
     try:
       smu_mod, smu = import_module("smu", self.ip_ver[am.MP1_HWIP]), getattr(self, 'smu', None) or AM_SMU(self)
       if not hasattr(smu, 'smu_mod'):  # integration 2026-10-13: AM_SMU.init_sw never ran; ip.py AM_SMU._vega20_send_msg needs both fields
         smu.smu_mod, smu._vega20_results = smu_mod, {v: k for k, v in vars(smu_mod).items() if k.startswith("PPSMC_Result_")}
       if not smu.is_smu_alive(): return  # GetSmuVersion (100 ms) then C2PMSG_90 != 0; ip.py is_smu_alive also suppresses the Vega ResponseError
-      # SetSoftMaxByFreq to each clock's lowest GetDpmFreqByIndex level (design v2 §3 "SetSoftMaxByFreq level 0"; encoding = AM read_clocks
-      # ip.py:208-209, PPCLK order smu11_driver_if.h PPCLK_e: GFXCLK 0, SOCCLK 4, UCLK 5, FCLK 10), then the ruled cap (SetPptLimit 0xF)
-      for clk in (smu_mod.PPCLK_GFXCLK, smu_mod.PPCLK_SOCCLK, smu_mod.PPCLK_UCLK, smu_mod.PPCLK_FCLK):
-        try:
-          if smu._send_msg(smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clk << 16) | 0xff, read_back_arg=True) & 0x7fffffff:
-            lowest = smu._send_msg(smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clk << 16) | 0, read_back_arg=True) & 0x7fffffff
-            smu._send_msg(smu_mod.PPSMC_MSG_SetSoftMaxByFreq, (clk << 16) | lowest)
-        except Exception as e:
-          if DEBUG >= 1: print(f"am {self.devfmt}: quiesce SetSoftMaxByFreq clk {clk} failed: {e!r}")
       try:
-        if (cap:=getattr(self, 'mi50_ppt_w', None)) is not None: smu._send_msg(smu_mod.PPSMC_MSG_SetPptLimit, max(int(round(cap)), 1))
+        if (cap:=getattr(self, 'mi50_ppt_w', None)) is not None: smu._send_msg(smu_mod.PPSMC_MSG_SetPptLimit, max(int(round(cap)), 1))  # 0xF, cap first
+      except TimeoutError as e:
+        if DEBUG >= 1: print(f"am {self.devfmt}: quiesce SetPptLimit timed out - no further messages (§7.0 rule 5): {e!r}")
+        return
       except Exception as e:
         if DEBUG >= 1: print(f"am {self.devfmt}: quiesce SetPptLimit failed: {e!r}")
+      try: smu._vega20_set_clocks(0)   # min then max per enabled DPM clock; stops at the first failure like vega20_force_dpm_lowest's PP_ASSERT returns
+      except Exception as e:
+        if DEBUG >= 1: print(f"am {self.devfmt}: quiesce force-lowest clocks ended: {e!r}")
     except Exception as e:
       if DEBUG >= 1: print(f"am {getattr(self, 'devfmt', '?')}: quiesce SMU step failed: {e!r}")
 

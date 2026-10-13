@@ -5,6 +5,8 @@ subprocess because the dead-man and the abort paths end with os._exit.
   exception  - the rung raises RuntimeError            -> quiesce ran, power-off prompt, watchdog kept sampling, exit 1 (rule 6)
   thermal    - CTF_TEMP reaches the threshold          -> ABORT line, quiesce, power-off prompt, exit 2 (rules 1/4)
   invalid    - raw readings 0 and 0x3ffff (511/511)    -> logged INVALID, never counted as over threshold, exit 0 (rule 4)
+  invalid_forever - every reading 0x3ffff            -> no valid sample for 10 s reaches the dead-man: THERMAL UNKNOWN, exit 3 (review S6, rules 3/4)
+  raise      - the thermal read raises after 2 samples -> THERMAL UNKNOWN at once, quiesce, exit 3 (review S10, rule 3)
   contention - a thread hammers the rpc lock for 12 s  -> no dead-man, >= 10 watchdog samples, exit 0 (the unfair-RLock ceiling, measured)
 Run: PYTHONPATH=<fork> python3 extra/mi50/ladder_selfcheck.py
 """
@@ -30,6 +32,8 @@ class FakeDev:
     if FakeDev.mode == "hang" and n > 3: time.sleep(10_000)        # the blocking server loop (server.c:201-247) never answers
     if FakeDev.mode == "thermal": return encode(min(40 + n * 5, 510), 35)
     if FakeDev.mode == "invalid": return [0, 0x3ffff, encode(45, 40)][n % 3]
+    if FakeDev.mode == "invalid_forever": return 0x3ffff
+    if FakeDev.mode == "raise" and n > 2: raise RuntimeError("selfcheck: RPC failed (server status != 0)")
     return encode(45, 40)
   def _bulk_write(self, cmd, idx, offset, data): pass
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'): return FakeMMIO(self)
@@ -55,7 +59,7 @@ def scenario(mode:str):
       h.report.check(not h.wd.deadman_fired, "dead-man did not fire under 12 s of rpc-lock contention")
       h.report.check(len(h.wd.samples) >= 10, f"watchdog completed {len(h.wd.samples)} samples in 12 s (>= 10)")
       return
-    time.sleep(30 if mode == "hang" else 6.5)   # hang/thermal: the dead-man / ABORT must end the process before this returns
+    time.sleep(30 if mode in ("hang", "invalid_forever", "raise") else 6.5)   # hang/thermal/...: the dead-man / ABORT must end the process before this returns
     if mode == "invalid":
       inv = [s for s in h.wd.samples if not s[3]]
       h.report.check(len(inv) >= 3, f"{len(inv)} INVALID samples logged (raw 0 / 0x3ffff)")
@@ -74,7 +78,9 @@ def main():
           "exception": (1, ["EXCEPTION in rung", "FAKE QUIESCE ran", "POWER OFF: Leon", "RUNG selfcheck-exception: "]),
           "thermal": (2, ["ABORT: hotspot CTF_TEMP", "FAKE QUIESCE ran", "POWER OFF: Leon"]),
           "invalid": (0, ["INVALID(0/511", "INVALID samples logged (raw 0 / 0x3ffff)", "PASS  INVALID samples decode"]),
-          "contention": (0, ["PASS  dead-man did not fire", "PASS  watchdog completed"])}
+          "contention": (0, ["PASS  dead-man did not fire", "PASS  watchdog completed"]),
+          "invalid_forever": (3, ["INVALID(0/511", "THERMAL UNKNOWN - POWER OFF (no valid (1..510) thermal read", "FAKE QUIESCE ran", "POWER OFF: Leon"]),
+          "raise": (3, ["THERMAL UNKNOWN - POWER OFF (thermal read raised", "FAKE QUIESCE ran", "POWER OFF: Leon"])}
   ok = True
   for mode, (rc, needles) in want.items():
     t0 = time.monotonic()
@@ -86,6 +92,8 @@ def main():
     good = p.returncode == rc and not missing
     if mode == "exception": good = good and wd >= 2          # the watchdog kept sampling during the rung
     if mode == "hang": good = good and 10 <= dt <= 40          # dead-man at ~10 s after the last good read, quiesce bounded
+    if mode == "invalid_forever": good = good and 10 <= dt <= 14 and wd >= 9   # reads complete (and are logged) but none is valid: dead-man at ~10 s
+    if mode == "raise": good = good and dt <= 5                 # the raising read aborts immediately, not after the 10 s dead-man
     ok &= good
     print(f"{'ok  ' if good else 'FAIL'} {mode:10s} exit={p.returncode} (want {rc}) {dt:5.1f}s WD-samples={wd} missing={missing}")
     if not good: print(out)

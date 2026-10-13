@@ -122,9 +122,12 @@ class Watchdog(threading.Thread):
   def run(self):
     threading.Thread(target=self._deadman, name="mi50-deadman", daemon=True).start()
     while not self.stop_evt.is_set():
-      raw = self.read_raw()
-      now = time.monotonic(); self.last_ok = now
+      try: raw = self.read_raw()
+      except BaseException as e:   # review 2026-10-13 S10: a failed read is as unknown as a hung one (rule 3) - abort now, not after the dead-man
+        self.on_abort("deadman", f"THERMAL UNKNOWN - POWER OFF (thermal read raised {e!r}; design §7.0 rule 3)"); return
+      now = time.monotonic()
       ctf, mx, valid = decode_temp(raw)
+      if valid: self.last_ok = now   # review S6: an INVALID (0/511) sample is not a reading (rule 4); 10 s of them reach the dead-man (rule 3)
       self.samples.append((now - self.t0, ctf, mx, valid))
       line = f"WD +{now - self.t0:7.1f}s CTF_TEMP={ctf:3d} C ASIC_MAX_TEMP={mx:3d} C raw={raw:#010x}" + ("" if valid else " INVALID(0/511 = not a reading)")
       if self.metrics is not None:
@@ -140,18 +143,21 @@ class Watchdog(threading.Thread):
       self.stop_evt.wait(0.5)
       if not self.stop_evt.is_set() and time.monotonic() - self.last_ok > DEADMAN_S:
         self.deadman_fired = True
-        self.on_abort("deadman", f"THERMAL UNKNOWN - POWER OFF (no completed thermal read for {DEADMAN_S:.0f} s; design §7.0 rule 3)"); return
+        self.on_abort("deadman", f"THERMAL UNKNOWN - POWER OFF (no valid (1..510) thermal read for {DEADMAN_S:.0f} s; design §7.0 rules 3/4)"); return
   def stop(self): self.stop_evt.set()
 
 class LadderHalt(BaseException):
   """Intentional stop of AMDev.__init__ after a named block (design §7.1 T6b/T7/T8). BaseException so nothing in AM swallows it."""
 
-def make_ladder_amdev(stop_after:str|None, inject_after:str|None=None, on_init_sw=None):
+def make_ladder_amdev(stop_after:str|None, inject_after:str|None=None, on_init_sw=None, on_instance=None):
   """AMDev subclass: amdev.py:236 calls init_hw(soc, gmc, ih, psp, smu) and :242 init_hw(gfx, sdma). The override runs blocks in order and raises
   LadderHalt right after `stop_after`'s init_hw. If the first init_hw call does not contain the stop block (partial boot, amdev.py:219-225 skipped
   the full-boot call), it halts BEFORE running anything and records what was skipped. inject_after raises a RuntimeError after that block (T6d).
   _emergency_quiesce (the amdev implementer's hook, §3 amdev.py:160-163 row) is a no-op for the intentional halt and counted otherwise.
   on_init_sw(adev) runs right after init_sw (amdev.py:217), i.e. after the IP objects exist and before any init_hw: observers hook here.
+  on_instance(adev) runs on the first line of __init__ (review 2026-10-13 S1): the harness sees the AMDev while AMDev.__init__ is still running,
+  so an abort fired mid-boot reaches _emergency_quiesce instead of "no AMDev". The SMU message lock is installed right after init_sw (S5: the
+  IP objects exist, no init_hw has run) so a quiesce from the abort thread waits for the in-flight mailbox message instead of interleaving.
   stop_after=None halts at the first init_hw call before running any block (T6a needs the sw-built AMDev only)."""
   from tinygrad.runtime.support.am.amdev import AMDev
   class LadderAMDev(AMDev):
@@ -159,9 +165,11 @@ def make_ladder_amdev(stop_after:str|None, inject_after:str|None=None, on_init_s
     def __init__(self, pci_dev, **kw):
       type(self).instance = self
       self._ladder_halted, self._ladder_skipped, self._quiesce_calls = False, None, 0
+      if on_instance is not None: on_instance(self)
       super().__init__(pci_dev, **kw)
     def init_sw(self, smi_dev=False):
       super().init_sw(smi_dev=smi_dev)
+      install_smu_lock(self)
       if on_init_sw is not None: on_init_sw(self)
     def init_hw(self, *blocks):
       stop = getattr(self, stop_after) if stop_after is not None else None
@@ -207,6 +215,7 @@ class Harness:
     """T12: AMDDevice builds its own APLRemotePCIDevice inside PCIIfaceBase.__init__ (system.py:259) before AMDev boots (:261); wrap __init__ so
     the lock + watchdog are live before the boot starts."""
     from tinygrad.runtime.support.system import APLRemotePCIDevice
+    from tinygrad.runtime.support.am.amdev import AMDev
     if os.environ.get("TINYGPU_FORK") != "1": raise SystemExit("REQUIRED: env TINYGPU_FORK=1")
     APLRemotePCIDevice.ensure_app = classmethod(lambda cls: None)
     orig = APLRemotePCIDevice.__init__
@@ -214,13 +223,23 @@ class Harness:
       orig(dev_self, devpref, pcibus)
       if pcibus == PCIBUS and self.dev is None: self.attach(dev_self)
     APLRemotePCIDevice.__init__ = init
+    # review 2026-10-13 S1/S5 for T12: the stock AMDev is published to the harness on its first line and gets the SMU message lock right after
+    # init_sw, exactly like LadderAMDev - an abort during the AMDDevice boot reaches _emergency_quiesce and never races the mailbox.
+    orig_am_init, orig_am_init_sw = AMDev.__init__, AMDev.init_sw
+    def am_init(adev_self, pci_dev, **kw):
+      if self.adev is None: self.adev = adev_self
+      orig_am_init(adev_self, pci_dev, **kw)
+    def am_init_sw(adev_self, smi_dev=False):
+      orig_am_init_sw(adev_self, smi_dev=smi_dev)
+      if adev_self is self.adev: install_smu_lock(adev_self)
+    AMDev.__init__, AMDev.init_sw = am_init, am_init_sw
   # --- AM boot stages
   def boot_to(self, stop_after:str|None, inject_after:str|None=None, on_init_sw=None):
     """Run AMDev.__init__ on self.dev up to and including <stop_after>.init_hw (soc|gmc|ih|psp|smu; None = before any init_hw), then set
     is_booting=False exactly as amdev.py:239 does after the full-boot block, so the rung can allocate non-boot memory. Returns the AMDev.
     Everything __init__ does before the halt (B1 ASPM, B3/B4 static table + POST + VBIOS, B6 init_sw, B7 reset decision) is the amdev
     implementer's code, run unchanged."""
-    cls = make_ladder_amdev(stop_after, inject_after, on_init_sw)
+    cls = make_ladder_amdev(stop_after, inject_after, on_init_sw, on_instance=lambda a: setattr(self, "adev", a))
     try: cls(self.dev)
     except LadderHalt as e: print(f"BOOT halted: {e}")
     finally: self.adev = cls.instance
@@ -228,8 +247,9 @@ class Harness:
     self.report.check(hasattr(self.adev, "_emergency_quiesce") and type(self.adev).__mro__[1].__dict__.get("_emergency_quiesce") is not None,
                       "fork provides AMDev._emergency_quiesce (design §3 amdev.py:160-163 row)")
     if self.adev._ladder_skipped is not None:
-      self.report.check(False, f"full-boot init_hw call never happened: partial boot (amdev.py:219 SCRATCH_REG7 == AMDev.Version) skipped it; "
-                        f"halted before init_hw({', '.join(self.adev._ladder_skipped)}); rerun with AM_RESET=1 (amdev.py:219)")
+      self.report.check(False, f"full-boot init_hw call never happened: partial boot (SCRATCH_REG7 == adev.boot_version = "
+                        f"AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON, amdev.py _boot; NOT a ruling) skipped it; "
+                        f"halted before init_hw({', '.join(self.adev._ladder_skipped)}); rerun with AM_RESET=1")
     self.adev.is_booting = False   # amdev.py:239 "Booting done"
     install_smu_lock(self.adev)
     return self.adev
@@ -268,7 +288,10 @@ class Harness:
     rc, exc = 1, None
     try:
       fn(self)
-    except SystemExit: raise
+    except SystemExit:
+      if self.dev is None: raise   # pre-connect refusal (REQUIRED inputs etc.): nothing to quiesce
+      exc = sys.exc_info()[1]; print(f"EXCEPTION in rung {self.rung}: {exc!r} (SystemExit with a live device, review 2026-10-13 S9)")
+      self.quiesce_once(); self.report.fails.append(f"rung raised SystemExit: {exc}"); print(POWER_OFF_PROMPT)
     except BaseException as e:
       exc = e
       print(f"EXCEPTION in rung {self.rung}: {e!r}"); traceback.print_exc()
@@ -282,8 +305,8 @@ class Harness:
       rc = 0 if not self.report.fails else 1
       if self.wd is not None:
         self.wd.stop()
-        if time.monotonic() - self.wd.last_ok > DEADMAN_S:   # the rung ended while the thermal read was already hung: the state is unknown (rule 3)
-          print(f"THERMAL UNKNOWN - POWER OFF (last completed thermal read {time.monotonic() - self.wd.last_ok:.0f} s ago; design §7.0 rule 3)")
+        if time.monotonic() - self.wd.last_ok > DEADMAN_S:   # the rung ended while the thermal read was hung or invalid: the state is unknown (rule 3)
+          print(f"THERMAL UNKNOWN - POWER OFF (last valid thermal read {time.monotonic() - self.wd.last_ok:.0f} s ago; design §7.0 rules 3/4)")
           print(POWER_OFF_PROMPT); rc = 3
       self.report.summary(extra=f"watchdog samples={len(self.wd.samples) if self.wd else 0}")
     return rc
@@ -404,18 +427,21 @@ def boot_sw_only(h:"Harness"):
   """T6a only: the AMDev with its software state built and NO init_hw and NO reset decision - amdev.py:216-218 + 229-233 + 245-246 run verbatim
   (pci_dev, _disable_aspm, map BAR0/2/5, _run_discovery -> the amdev implementer's _static_vega20, _build_regs, _vega20_vbios, init_sw). The reset
   branch (amdev.py:257-265) is deliberately not reached: T6a issues AM_PSP.mode1_reset itself ("alone")."""
-  from tinygrad.runtime.support.am.amdev import AMDev
+  from tinygrad.runtime.support.am.amdev import AMDev, VEGA20_PCI_ID
   adev = AMDev.__new__(AMDev)
-  adev.pci_dev, adev.devfmt = h.dev, h.dev.pcibus                                                                       # amdev.py:199
-  adev._disable_aspm()                                                                                                   # amdev.py:200
-  adev.vram, adev.doorbell64, adev.mmio = h.dev.map_bar(0), h.dev.map_bar(2, fmt='Q'), h.dev.map_bar(5, fmt='I')         # amdev.py:201
-  adev.is_vega20 = False; adev._run_discovery(); adev._build_regs()                                                      # amdev.py:222, 229-230
+  h.adev = adev   # review 2026-10-13 S8: published before anything runs, so Harness.run / abort reach _emergency_quiesce (it copes with partial state)
+  adev.pci_dev, adev.devfmt = h.dev, h.dev.pcibus                                                                       # amdev.py __init__
+  adev.is_vega20 = h.dev.read_config(0, 4) == VEGA20_PCI_ID                                                              # amdev.py __init__ (one CFG_READ)
+  if adev.is_vega20: adev._vega20_required_inputs()                                                                      # amdev.py __init__ (review TI4)
+  adev._disable_aspm()                                                                                                   # amdev.py __init__
+  adev.vram, adev.doorbell64, adev.mmio = h.dev.map_bar(0), h.dev.map_bar(2, fmt='Q'), h.dev.map_bar(5, fmt='I')         # amdev.py __init__
+  adev._run_discovery(); adev._build_regs()                                                                              # amdev.py _boot
   # integration 2026-10-13: the amdev branch's _boot (amdev.py:232-233) derives boot_version and, on the Vega 20, runs _vega20_vbios() (required
   # inputs, POST gate, ROM dump: reads only) which sets reserved_vram_size and gc_info; init_sw needs both (amdev report, amdev.py:481-482).
   adev.boot_version = AMDev.VEGA20_BOOT_VERSION_PLACEHOLDER_NOT_RULED_BY_LEON if adev.is_vega20 else AMDev.Version      # amdev.py:232
   if adev.is_vega20: adev._vega20_vbios()                                                                                # amdev.py:233
   adev.is_booting = True; adev.init_sw(smi_dev=False)                                                                    # amdev.py:245-246
-  h.adev = adev; install_smu_lock(adev)
+  install_smu_lock(adev)
   return adev
 
 def power_off_prompt(): print(POWER_OFF_PROMPT)

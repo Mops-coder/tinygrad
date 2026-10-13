@@ -132,7 +132,13 @@ class AM_GMC(AM_IP):
 
   def init_hw(self):
     # mi50 fork: golden + HDP init + flush before the hubs (design v2 B9/B10)
-    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0): self._init_hw_vega20_pre_hub()
+    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0):
+      self._init_hw_vega20_pre_hub()
+      # review 2026-10-13 L6: gmc_v9_0_hw_init flushes vmid 0 on every hub BEFORE gart_enable (gmc_v9_0.c:2208-2212 -> :2217); AM's flush_tlb is
+      # that ENG17 request/ack (+ the MMHUB semaphore, gmc_v9_0_use_invalidate_semaphore :734-746). Ported for the MM hub here, in Linux order.
+      # The GFX hub's flush (:2211, same loop) is NOT issued: AM's flush_tlb returns while hub_initted["GC"] is False (ip.py :190) and the GC hub is
+      # programmed later by AM_GFX (init_hub("GC")); AM flushes after every mapping (on_range_mapped) - skip listed, T9 decides.
+      self.flush_tlb("MM", vmid=0)
     self.init_hub("MM", insts=self.mm_insts)
 
   def _golden(self, reg, and_mask:int, or_mask:int):
@@ -160,8 +166,7 @@ class AM_GMC(AM_IP):
     # 3. "After HDP is initialized, flush HDP." (:2195-2196)
     self.flush_hdp()
     # 4. set_fault_enable_default on both hubs (:2203-2207) is done per hub at the top of init_hub (the GC hub is programmed later by AM_GFX).
-    # 5. the vmid-0 flush before gart_enable (:2208-2212) is not added: AM flushes after every mapping (on_range_mapped) and VM_L2_CNTL2
-    #    invalidates the L1/L2 in init_hub (listed in the report's unknowns).
+    # 5. the vmid-0 flush before gart_enable (:2208-2212): MM hub flushed in init_hw right after this (review L6); GC hub skip listed there.
 
   def _set_fault_enable_default(self, ip:Literal["MM", "GC"], inst:int):
     # mi50 fork: gmc_v9_0_hw_init value = true unless amdgpu_vm_fault_stop == AMDGPU_VM_FAULT_STOP_ALWAYS (gmc_v9_0.c:2198-2201; module default 0
@@ -175,10 +180,13 @@ class AM_GMC(AM_IP):
 
   def flush_hdp(self):
     if self.adev.ip_ver[am.NBIO_HWIP] == (7,4,0):
-      # mi50 fork (design v2 B9): amdgpu_hdp_generic_flush (amdgpu_hdp.c:51-60) writes 0 at rmmio_remap.reg_offset >> 2 then reads memsize;
-      # nbio_v7_4_set_reg_remap's no-remap case makes reg_offset = SOC15_REG_OFFSET(NBIO, 0, mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL)
-      # << 2 (nbio_v7_4.c:792-803), i.e. the register itself (NBIO seg2 0xd20 + 0xf7); memsize = RCC_CONFIG_MEMSIZE (nbio_v7_4.c:133-136,
-      # dword 0xde3).
+      # mi50 fork (design v2 B9): amdgpu_hdp_generic_flush (amdgpu_hdp.c:51-60) writes 0 at (rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL)
+      # >> 2 then reads memsize. Review 2026-10-13 L5 (citation corrected): on x86 bare metal nbio_v7_4_set_reg_remap takes the REMAP branch
+      # (nbio_v7_4.c:794-796: reg_offset = MMIO_REG_HOLE_OFFSET = 0x80000 - PAGE_SIZE) and nbio_v7_4_remap_hdp_registers (:101-107, called from
+      # soc15 hw_init) points that hole at HDP_MEM_COHERENCY_FLUSH_CNTL, so the write lands on the same register this writes directly; the
+      # else-branch (:797-801, SR-IOV / PAGE_SIZE > 4096) names that register outright: mmBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL
+      # (NBIO seg2 0xd20 + 0xf7). The remap programming itself is NOT ported (KFD_MMIO_REMAP_* constants live in include/uapi/linux/kfd_ioctl.h,
+      # not in the amd tree here) - skip listed. memsize = RCC_CONFIG_MEMSIZE (nbio_v7_4.c:133-136, dword 0xde3).
       self.adev.regBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL.write(0x0)
       self.adev.regRCC_CONFIG_MEMSIZE.read()
       return
@@ -224,7 +232,9 @@ class AM_GMC(AM_IP):
       self.adev.reg(f"reg{ip}MC_VM_AGP_TOP").write(0, inst=inst)
 
       self.adev.reg(f"reg{ip}MC_VM_SYSTEM_APERTURE_LOW_ADDR").write(self.fb_base >> 18, inst=inst)
-      self.adev.reg(f"reg{ip}MC_VM_SYSTEM_APERTURE_HIGH_ADDR").write(self.fb_end >> 18, inst=inst)
+      # mi50 fork (review 2026-10-13 L12): Linux writes max(fb_end, agp_end) >> 18 with fb_end = vram_start + mc_vram_size - 1 (gfxhub_v1_0.c:119-122;
+      # amdgpu_gmc.c:221/:233), i.e. (FB_LOCATION_TOP << 24 | 0xffffff) >> 18 = AM's value | 0x3f (AGP disabled: agp_end 0). Other cards keep AM's.
+      self.adev.reg(f"reg{ip}MC_VM_SYSTEM_APERTURE_HIGH_ADDR").write(((self.fb_end | 0xffffff) if vega20 else self.fb_end) >> 18, inst=inst)
       self.adev.wreg_pair(f"reg{ip}MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR", "_LSB", "_MSB", self.memscratch_xgmi_paddr >> 12, inst=inst)
       self.adev.wreg_pair(f"reg{ip}VM_L2_PROTECTION_FAULT_DEFAULT_ADDR", "_LO32", "_HI32", self.dummy_page_xgmi_paddr >> 12, inst=inst)
 
@@ -409,8 +419,7 @@ class AM_SMU(AM_IP):
     self._vega20_only("write_table")
     sz = self._vega20_check_table(type(table), table_id)
     self.adev.vram.view(self.driver_table_paddr, sz)[:] = bytes(table)
-    self.adev.gmc.flush_hdp()
-    self.adev.regRCC_CONFIG_MEMSIZE.read()  # nbio_7_4 table (reg->mm fallback)
+    self.adev.gmc.flush_hdp()   # = the whole amdgpu_hdp_generic_flush incl. the one get_memsize read (review 2026-10-13 L11: no second read)
     self._vega20_set_driver_dram_addr()
     self._send_msg(self.smu_mod.PPSMC_MSG_TransferTableDram2Smu, table_id)
 
@@ -498,7 +507,8 @@ class AM_SMU(AM_IP):
       with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | (vals[level]), timeout=20)
       if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | (vals[level]))
 
-  def _vega20_set_clocks(self, level:int|None) -> dict[int, tuple[int, int]]:
+  def _vega20_set_clocks(self, level:int|None, features:int|None=None) -> dict[int, tuple[int, int]]:
+    # features: an already-read get_features() mask (amdev._vega20_clock_policy reads it once for the cap gate and this), else read here
     # vega20_force_dpm_highest / _lowest (vega20_hwmgr.c:2392-2475): soft_min = soft_max = the chosen level's MHz for GFXCLK, UCLK, SOCCLK
     # (:2399-2415), uploaded by vega20_upload_dpm_min_level (SetSoftMinByFreq 0x26, param (PPCLK << 16) | (freq & 0xffff), :1820-1919) and THEN
     # vega20_upload_dpm_max_level (SetSoftMaxByFreq 0x27, same param, :1921-2009) with FEATURE_DPM_GFXCLK|UCLK|SOCCLK (:2417-2426); a clock is
@@ -506,7 +516,7 @@ class AM_SMU(AM_IP):
     # (:2477-2532): soft_min = lowest, soft_max = highest level. GC 9.4.0 therefore gets BOTH messages (design v2 §3 row AM_SMU; the upstream
     # `GC >= (10,0,0)` gate above was never for Vega). Returns {PPCLK: (min MHz, max MHz)} actually sent; empty when no DPM feature is enabled
     # (then Linux has no clock lever either, vega20_hwmgr.c:1827/:1928 skip).
-    features = self.get_features()
+    if features is None: features = self.get_features()
     m = self.smu_mod
     enabled = [clk for clk, mask in ((m.PPCLK_GFXCLK, m.FEATURE_DPM_GFXCLK_MASK), (m.PPCLK_UCLK, m.FEATURE_DPM_UCLK_MASK),
                                      (m.PPCLK_SOCCLK, m.FEATURE_DPM_SOCCLK_MASK)) if features & mask]
@@ -523,10 +533,19 @@ class AM_SMU(AM_IP):
     return want
 
   def set_power_limit(self, watts:float):
+    if self._vega20(): return self._vega20_set_power_limit(watts)   # mi50 fork: same one-line gate pattern as set_clocks above
     ppt_limit = max(int(round(watts)), 1)
-    if self._vega20() and not (self.get_features() & self.smu_mod.FEATURE_PPT_MASK):
-      # vega20_set_power_limit sends SetPptLimit only while FEATURE_PPT is enabled and otherwise silently returns 0 (vega20_powertune.c:32-43);
-      # a silent no-op would leave the card uncapped, so the fork raises instead (design v2 §6 "SetPptLimit (if the PPT feature is on)").
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetPptLimit, ppt_limit)
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: GPU power limit set to {ppt_limit}W")
+
+  def _vega20_set_power_limit(self, watts:float, features:int|None=None):
+    # vega20_set_power_limit sends SetPptLimit only while FEATURE_PPT is enabled and otherwise silently returns 0 (vega20_powertune.c:32-43);
+    # a silent no-op would leave the card uncapped, so the fork raises instead (design v2 §6 "SetPptLimit (if the PPT feature is on)").
+    # Review 2026-10-13 L1/TI3: the BOOT path (amdev._vega20_clock_policy) gates on the feature itself, passes the mask in (`features`, one
+    # GetEnabledSmuFeatures pair per boot) and prints instead of raising; the raise stays for explicit callers - keeping it vs Linux's silent
+    # return is Leon's ruling.
+    ppt_limit = max(int(round(watts)), 1)
+    if not ((self.get_features() if features is None else features) & self.smu_mod.FEATURE_PPT_MASK):
       raise RuntimeError(f"am {self.adev.devfmt}: SetPptLimit needs FEATURE_PPT (bit {self.smu_mod.FEATURE_PPT_BIT}) enabled; "
                          "it is not (vega20_powertune.c:37-42)")
     self._send_msg(self.smu_mod.PPSMC_MSG_SetPptLimit, ppt_limit)
@@ -704,7 +723,7 @@ class AM_GFX(AM_IP):
       for i in range(0, 16):
         self._grbm_select(vmid=i, inst=xcc)
         self.adev.regSH_MEM_CONFIG.write(**({'initial_inst_prefetch':3} if self.adev.ip_ver[am.GC_HWIP][0]>=10 else {'retry_disable':1}),
-          **({'f8_mode':1} if self.adev.ip_ver[am.GC_HWIP] in {(9,4,3), (9,4,4)} else {}), # mi50 fork B14.5: gc_9_0 has no F8_MODE field
+          **({'f8_mode':1} if self.adev.ip_ver[am.GC_HWIP][:2]==(9,4) else {}),
           address_mode=self.adev.soc.module.SH_MEM_ADDRESS_MODE_64, alignment_mode=self.adev.soc.module.SH_MEM_ALIGNMENT_MODE_UNALIGNED, inst=xcc)
 
         # Configure apertures:
@@ -958,7 +977,10 @@ class AM_GFX(AM_IP):
       struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}{'_compute' if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else ''}_mqd")
       mqd_struct = struct_t(header=0xC0310800, cp_mqd_base_addr_lo=lo32(self.mqd_mc[queue] + 0x1000*xcc),
         cp_mqd_base_addr_hi=hi32(self.mqd_mc[queue] + 0x1000*xcc), cp_hqd_pipe_priority=0x2, cp_hqd_queue_priority=0xf, cp_hqd_quantum=0x111,
-        # gfx_v9_0.c:3660-3662: PRELOAD_SIZE 0x53, no PRELOAD_REQ
+        # gfx_v9_0.c:3660-3662: PRELOAD_SIZE 0x53, no PRELOAD_REQ. Review 2026-10-13 L8: design B14.9 takes these two deltas from gfx_v9_0_mqd_init
+        # (kernel queues, registers written one by one :3686-3797) while AM's HQD load below is the KFD window copy (amdgpu_amdkfd_gfx_v9.c:236-242,
+        # :293-294) whose MQD source for gfx906 sets PRELOAD_REQ|0x53, UNORD_DISPATCH=1, hq_status0 = 1<<14 (kfd_mqd_manager_v9.c:193-199, :211);
+        # rptr_block_size=5 / priv_state=1 below are AM's stock (= the KFD values). Mixed sources as the design specifies; U-G3 / T9 decide.
         cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x53) if vega20 else
                                 self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
         cp_hqd_pq_base_lo=lo32(ring_addr>>8), cp_hqd_pq_base_hi=hi32(ring_addr>>8),
@@ -1087,14 +1109,20 @@ class AM_IH(AM_IP):
       # mi50 fork: vega20_ih_enable_ring sets ring 0's RPTR_REARM = !!adev->irq.msi_enabled (vega20_ih.c:258-259); AM polls the ring with no MSI
       # (no irq_poller on APLRemotePCIDevice, design v2 B11) -> 0 on OSSSYS 4.2.0; other cards keep AM's 1
       ring0_flags = {'wptr_overflow_enable': 1, 'rptr_rearm': 0 if osssys_4_2_0 else 1}
-      self.adev.reg(f"regIH_RB_CNTL{suf}").write(mc_space=4, wptr_overflow_clear=1, rb_size=((self.ring_size//4)-1).bit_length(),
-        mc_snoop=1, mc_ro=0, mc_vmid=0, **(ring0_flags if ring_id == 0 else {'rb_full_drain_enable': 1}))
+      # review 2026-10-13 L7: vega20_ih_rb_cntl (vega20_ih.c:194-215) sets WPTR_OVERFLOW_ENABLE=1 (:202-203) and WPTR_WRITEBACK_ENABLE=1 (:208-209)
+      # on EVERY ring through the IH_RB_CNTL field masks. Ring 0 has both fields in the osssys_4_2_0 table; the IH_RB_CNTL_RING1 table lacks
+      # WPTR_WRITEBACK_ENABLE (bit 8), so ring 1 gets bit 8 raw (same bit, same mask Linux applies). Inert for AM (it polls IH_RB_WPTR by MMIO).
+      v420 = ({'wptr_writeback_enable': 1} if ring_id == 0 else {'wptr_overflow_enable': 1}) if osssys_4_2_0 else {}
+      self.adev.reg(f"regIH_RB_CNTL{suf}").write((1 << 8) if (osssys_4_2_0 and ring_id != 0) else 0, mc_space=4, wptr_overflow_clear=1,
+        rb_size=((self.ring_size//4)-1).bit_length(), mc_snoop=1, mc_ro=0, mc_vmid=0, **v420, **(ring0_flags if ring_id == 0 else {'rb_full_drain_enable': 1}))
 
       if ring_id == 0: self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", self.adev.paddr2mc(rwptr_vm))
 
       self.adev.reg(f"regIH_RB_WPTR{suf}").write(0)
       self.adev.reg(f"regIH_RB_RPTR{suf}").write(0)
 
+      # OSSSYS 4.2.0 deviation (review L7, listed): Linux enables the rptr doorbell with doorbell_index (vega20_ih_doorbell_rptr :221-227, use_doorbell
+      # :588); AM rings no IH doorbell (rptr written by MMIO in drain), so ENABLE=0 = Linux's !use_doorbell form (:228-231) on every card.
       self.adev.reg(f"regIH_DOORBELL_RPTR{suf}").write(enable=0)
 
     if self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
@@ -1342,7 +1370,9 @@ class AM_SDMA(AM_IP):
     r("DOORBELL_OFFSET").update(offset=doorbell_dw, inst=inst)                                                     # :1124, :1128-1130, :1132
     # :1134 ring_set_wptr with use_doorbell (:702-717 / :767-772): *wptr_cpu_addr = wptr << 2 and WDOORBELL64(doorbell_index, wptr << 2), wptr == 0.
     # WDOORBELL64 writes at a dword index into the doorbell aperture (amdgpu_doorbell_mgr.c:103-110); AM's doorbell64 view is 64-bit wide -> index
-    # // 2.
+    # // 2. Review 2026-10-13 L10: the 8-byte shadow write (:713 / :771) is NOT issued here - wptr_addr is a GPU VA of the caller's slot (the page
+    # queues: AM's zeroed boot page; the gfx ring: ops_amd.py:1096 gart alloc at :944) that AM_SDMA cannot address, and AM's stock path for every
+    # other card (setup_ring below) writes no shadow either: the caller's slot must read 0. Listed.
     self.adev.doorbell64[doorbell_dw // 2] = 0
     r("MINOR_PTR_UPDATE").write(0, inst=inst)                                                                      # :1137
     r("RB_WPTR_POLL_ADDR_LO").write(lo32(wptr_addr), inst=inst)                                                    # :1141-1142

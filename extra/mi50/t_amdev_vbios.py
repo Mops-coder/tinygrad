@@ -100,6 +100,7 @@ bad = bytearray(img); bad[HDR+4:HDR+8] = b"XXXX"; raises(lambda: v.VBIOS(bytes(b
 class FakeMMIO:
   """dword-indexed BAR5 (512 KiB = 0x20000 dwords, design §1.3); ROM_DATA auto-increments from the pointer ROM_INDEX sets; SMU mailbox optional."""
   ROM_INDEX, ROM_DATA, C2PMSG_66, C2PMSG_82, C2PMSG_90 = 0x168e4, 0x168e5, 0x16000 + 642, 0x16000 + 658, 0x16000 + 666
+  FEATURES_LOW = (1 << smu.FEATURE_DPM_GFXCLK_BIT) | (1 << smu.FEATURE_DPM_UCLK_BIT) | (1 << smu.FEATURE_DPM_SOCCLK_BIT) | (1 << smu.FEATURE_PPT_BIT)
   def __init__(self, img:bytes, smu_alive=False, seed=None):
     self.img, self.ptr, self.smu_alive, self.regs, self.log = img, 0, smu_alive, dict(seed or {}), []
   def __len__(self): return 0x20000
@@ -111,7 +112,9 @@ class FakeMMIO:
     if k == self.ROM_INDEX: self.ptr = val
     elif k == self.C2PMSG_66 and self.smu_alive:   # fake SMU: GetDpmFreqByIndex count 8 / level freq 800 (synthetic), every message answered OK
       param = self.regs.get(self.C2PMSG_82, 0)
-      self.regs[self.C2PMSG_82] = (8 if (param & 0xff) == 0xff else 800) if val == smu.PPSMC_MSG_GetDpmFreqByIndex else 0
+      if val == smu.PPSMC_MSG_GetDpmFreqByIndex: self.regs[self.C2PMSG_82] = 8 if (param & 0xff) == 0xff else 800
+      elif val == smu.PPSMC_MSG_GetEnabledSmuFeaturesLow: self.regs[self.C2PMSG_82] = self.FEATURES_LOW   # synthetic feature state
+      else: self.regs[self.C2PMSG_82] = 0
       self.regs[self.C2PMSG_90] = smu.PPSMC_Result_OK
     else: self.regs[k] = val
 mm = FakeMMIO(img)
@@ -136,9 +139,12 @@ class FakePCI:
   def write_config_flush(self, off, val, size): self.cfg_writes.append((off, val, size))
   def map_bar(self, bar, fmt='B'): return self.mmio_obj if bar == 5 else types.SimpleNamespace(nbytes=256 << 20)
 def seed(temp=60, maxtemp=70, posted=True, memsize_mib=32768): return {0xde3: memsize_mib, 0x53: 0x200 if posted else 0, 0x1665f: (temp << 9) | maxtemp}
-def fake_dev(mmio) -> AMDev:
+def fake_dev(mmio, inputs=True) -> AMDev:
+  """The hand-built AMDev mirrors __init__ (review 2026-10-13 TI4): is_vega20 from config dword 0, then the two REQUIRED inputs."""
   dev = AMDev.__new__(AMDev)
-  dev.pci_dev, dev.devfmt, dev.mmio, dev.vram, dev.is_vega20 = FakePCI(mmio=mmio), "fake", mmio, types.SimpleNamespace(nbytes=256 << 20), False
+  dev.pci_dev, dev.devfmt, dev.mmio, dev.vram = FakePCI(mmio=mmio), "fake", mmio, types.SimpleNamespace(nbytes=256 << 20)
+  dev.is_vega20 = dev.pci_dev.read_config(0, 4) == VEGA20_PCI_ID
+  if dev.is_vega20 and inputs: dev._vega20_required_inputs()
   return dev
 os.environ.update({"AM_MI50_PPT_W": "150", "AM_MI50_TEMP_C": "90"}); os.environ.pop("AM_MI50_RESERVED_VRAM_MB", None)
 mm = FakeMMIO(img, seed=seed()); dev = fake_dev(mm)
@@ -178,8 +184,19 @@ os.environ["AM_MI50_RESERVED_VRAM_MB"] = "64"; d5._vega20_vbios(); check(d5.rese
 d6 = fake_dev(FakeMMIO(img, seed=seed(temp=0))); d6._run_discovery(); d6._build_regs(); raises(d6._vega20_vbios, "invalid", "CTF_TEMP 0 is an invalid reading (§7.0 rule 4)")
 d7 = fake_dev(FakeMMIO(img, seed=seed(temp=95))); d7._run_discovery(); d7._build_regs(); raises(d7._vega20_vbios, ">= threshold", "hotspot 95 >= AM_MI50_TEMP_C 90 refused")
 for var in ("AM_MI50_PPT_W", "AM_MI50_TEMP_C"):
-  saved = os.environ.pop(var); d8 = fake_dev(FakeMMIO(img, seed=seed())); d8._run_discovery(); d8._build_regs()
-  raises(d8._vega20_vbios, f"{var} is REQUIRED", f"missing {var} is a clear error"); os.environ[var] = saved
+  saved = os.environ.pop(var); d8 = fake_dev(FakeMMIO(img, seed=seed()), inputs=False)
+  raises(d8._vega20_required_inputs, f"{var} = ", f"missing {var} is a clear error (REQUIRED)"); os.environ[var] = saved
+# review 2026-10-13 S13/TI4: one parse rule (int(v, 0), bounded) shared with extra/mi50/ladder.py _env_int
+for var, val, needle in (("AM_MI50_TEMP_C", "600", "outside 1..510"), ("AM_MI50_TEMP_C", "0", "outside 1..510"), ("AM_MI50_PPT_W", "150.5", "not an integer"),
+                         ("AM_MI50_PPT_W", "0", "outside 1..65535")):
+  saved = os.environ[var]; os.environ[var] = val; d9 = fake_dev(FakeMMIO(img, seed=seed()), inputs=False)
+  raises(d9._vega20_required_inputs, needle, f"{var}={val} refused"); os.environ[var] = saved
+os.environ["AM_MI50_PPT_W"] = "0x96"; d9 = fake_dev(FakeMMIO(img, seed=seed())); check(d9.mi50_ppt_w == 150, "AM_MI50_PPT_W=0x96 parsed as 150 (int(v, 0), the ladder's rule)")
+os.environ["AM_MI50_PPT_W"] = "150"
+saved = os.environ.pop("AM_MI50_TEMP_C"); mm9 = FakeMMIO(img, seed=seed()); pdev9 = FakePCI(mmio=mm9)
+raises(lambda: AMDev(pdev9), "AM_MI50_TEMP_C", "__init__ with a missing input raises")
+check(pdev9.cfg_writes == [] and mm9.log == [], "...before any config WRITE (ASPM) and before any MMIO access: nothing touched (review TI4)")
+os.environ["AM_MI50_TEMP_C"] = saved
 # non-Vega gating: a gfx11-shaped fake binds no Vega tables; boot_version is the stock constant
 g11 = AMDev.__new__(AMDev); g11.devfmt, g11.is_vega20 = "fake-gfx11", False
 g11.ip_ver = {am.GC_HWIP: (11,0,2), am.MP0_HWIP: (13,0,7), am.MP1_HWIP: (13,0,7), am.HDP_HWIP: (6,0,0), am.MMHUB_HWIP: (3,0,1), am.OSSSYS_HWIP: (6,0,0), am.NBIO_HWIP: (7,7,0), am.SDMA0_HWIP: (6,0,2)}
@@ -197,10 +214,46 @@ check((0x208d, 0x503f0010) in mm.log and (0x128a, 1) in mm.log and (0x188a, 1) i
 check(not any(r == FakeMMIO.C2PMSG_66 and val in (smu.PPSMC_MSG_SetSoftMaxByFreq, smu.PPSMC_MSG_SetPptLimit) for r, val in mm.log), "quiesce (SMU silent): no cap messages sent")
 mm.smu_alive = True; mm.log.clear(); dev._emergency_quiesce()
 msgs = [(val, mm.log[i-1][1]) for i, (r, val) in enumerate(mm.log) if r == FakeMMIO.C2PMSG_66]   # (msg, param written just before to C2PMSG_82)
-softmax = [p for m, p in msgs if m == smu.PPSMC_MSG_SetSoftMaxByFreq]
-check(softmax == [(c << 16) | 800 for c in (smu.PPCLK_GFXCLK, smu.PPCLK_SOCCLK, smu.PPCLK_UCLK, smu.PPCLK_FCLK)] and (smu.PPCLK_GFXCLK, smu.PPCLK_SOCCLK, smu.PPCLK_UCLK, smu.PPCLK_FCLK) == (0, 4, 5, 10),
-      f"quiesce (SMU alive): SetSoftMaxByFreq to the lowest level for GFXCLK 0, SOCCLK 4, UCLK 5, FCLK 10: {[hex(x) for x in softmax]}")
-check((smu.PPSMC_MSG_SetPptLimit, 150) in msgs and msgs[0][0] == smu.PPSMC_MSG_GetSmuVersion, "quiesce (SMU alive): GetSmuVersion first, SetPptLimit 150 W sent")
+softmin = [p for m, p in msgs if m == smu.PPSMC_MSG_SetSoftMinByFreq]; softmax = [p for m, p in msgs if m == smu.PPSMC_MSG_SetSoftMaxByFreq]
+want_clks = (smu.PPCLK_GFXCLK, smu.PPCLK_UCLK, smu.PPCLK_SOCCLK)   # _vega20_set_clocks order; FCLK is not in vega20_force_dpm_lowest's masks
+check(softmin == [(c << 16) | 800 for c in want_clks] and softmax == softmin and (smu.PPCLK_GFXCLK, smu.PPCLK_UCLK, smu.PPCLK_SOCCLK) == (0, 5, 4),
+      f"quiesce (SMU alive, review S3): SetSoftMinByFreq THEN SetSoftMaxByFreq to the lowest level for GFXCLK 0, UCLK 5, SOCCLK 4 (vega20_hwmgr.c:2417-2429), no FCLK: min {[hex(x) for x in softmin]} max {[hex(x) for x in softmax]}")
+i_min, i_max = msgs.index((smu.PPSMC_MSG_SetSoftMinByFreq, softmin[0])), msgs.index((smu.PPSMC_MSG_SetSoftMaxByFreq, softmax[0]))
+check(msgs[0][0] == smu.PPSMC_MSG_GetSmuVersion and msgs[1] == (smu.PPSMC_MSG_SetPptLimit, 150) and i_min < i_max,
+      "quiesce (SMU alive, review S2): GetSmuVersion, then SetPptLimit 150 W as the FIRST lever, mins before maxes")
+# review S2 (§7.0 rule 5): a mailbox timeout on the cap ends the quiesce; a rejection does not
+class StubSMU:
+  def __init__(self, fail): self.fail, self.sent, self.smu_mod = fail, [], smu
+  def is_smu_alive(self): return True
+  def _send_msg(self, msg, param, **k):
+    self.sent.append(msg)
+    if isinstance(self.fail, Exception): raise self.fail
+  def _vega20_set_clocks(self, level, features=None): self.sent.append("force_lowest")
+from tinygrad.runtime.support.am.ip import AM_SMU
+for fail, want, label in ((TimeoutError("fake mailbox timeout"), [smu.PPSMC_MSG_SetPptLimit], "TimeoutError on SetPptLimit -> no further messages (rule 5)"),
+                          (AM_SMU.ResponseError("fake reject"), [smu.PPSMC_MSG_SetPptLimit, "force_lowest"], "ResponseError on SetPptLimit -> clocks still forced lowest")):
+  dev.smu = StubSMU(fail); dev._emergency_quiesce(); check(dev.smu.sent == want, f"quiesce: {label}: {dev.smu.sent}")
+del dev.smu
+# review S7: the engine halts follow a LIVE POST read, not the vega20_posted flag
+dv = fake_dev(FakeMMIO(img, seed=seed(posted=True))); dv._run_discovery(); dv._build_regs()   # no _vega20_vbios -> flag never set
+dv.mmio.log.clear(); dv._emergency_quiesce()
+check((0x208d, 0x503f0010) in dv.mmio.log and (0x128a, 1) in dv.mmio.log, "quiesce halts MEC/SDMA on a POSTed card even when _vega20_vbios never ran (live POST read, review S7)")
+dv2 = fake_dev(FakeMMIO(img, seed=seed(posted=False))); dv2._run_discovery(); dv2._build_regs(); dv2.mmio.log.clear(); dv2._emergency_quiesce()
+check((0x208d, 0x503f0010) not in dv2.mmio.log and (0x128a, 1) not in dv2.mmio.log, "quiesce leaves the engines alone when the live POST read says unposted")
+# review L1/TI3/S4/S14: the boot clock policy gates the cap on FEATURE_PPT (vega20_powertune.c:37-42) and records the state; one get_features pair
+import io, contextlib
+class PolicySMU:
+  def __init__(self, feats): self.feats, self.calls, self.smu_mod = feats, [], smu
+  def get_features(self): self.calls.append("get_features"); return self.feats
+  def _vega20_set_power_limit(self, w, features=None): self.calls.append(("cap", w, features))
+  def _vega20_set_clocks(self, level, features=None): self.calls.append(("clocks", level, features)); return {} if not (self.feats & 0x30f) else {0: (800, 800)}
+dp = fake_dev(FakeMMIO(img, seed=seed())); dp._run_discovery(); dp._build_regs(); dp.ip_ver = dict(dp.ip_ver)
+dp.smu = PolicySMU(FakeMMIO.FEATURES_LOW); dp._vega20_clock_policy()
+check(dp.smu.calls == ["get_features", ("cap", 150, FakeMMIO.FEATURES_LOW), ("clocks", 0, FakeMMIO.FEATURES_LOW)], f"clock policy with PPT on: one get_features, cap 150 W, level 0, features passed through: {dp.smu.calls}")
+dp.smu = PolicySMU(0); buf = io.StringIO()
+with contextlib.redirect_stdout(buf): dp._vega20_clock_policy()
+check(dp.smu.calls == ["get_features", ("clocks", 0, 0)] and "MI50 cap NOT applied" in buf.getvalue() and "UNCAPPED" in buf.getvalue(),
+      f"clock policy with FEATURE_PPT off: no SetPptLimit, state printed (vega20_powertune.c:37-42 silent form), level 0 still sent: {dp.smu.calls}")
 # the __init__ wrapper: inject an error after the VBIOS step (design T6d), expect the quiesce ran and the error propagated
 mm2 = FakeMMIO(img, smu_alive=True, seed=seed()); pdev = FakePCI(mmio=mm2)
 def boom(*a, **k): raise RuntimeError("injected after _vega20_vbios")

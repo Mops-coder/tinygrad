@@ -103,7 +103,8 @@ def run(mod:types.ModuleType, ip_ver, bases, presets, extra_mods=(), gc_hub=True
 # INTERRUPT_CNTL / L1_TLB_CNTL / PROTECTION_FAULT_CNTL so the read-modify-write semantics are visible in the log
 PRESETS = {"regMMMC_VM_FB_LOCATION_BASE": 0x0, "regMMMC_VM_FB_LOCATION_TOP": 0x7ff, "regGCMC_VM_FB_OFFSET": 0x0, "regRCC_CONFIG_MEMSIZE": 0x8000,
            "regINTERRUPT_CNTL": 0x10, "regMMMC_VM_MX_L1_TLB_CNTL": 0x80, "regGCMC_VM_MX_L1_TLB_CNTL": 0x80, "regMMVM_L2_PROTECTION_FAULT_CNTL": 0xc0000000,
-           "regGCVM_L2_PROTECTION_FAULT_CNTL": 0xc0000000, "regDAGB1_WRCLI2": 0x12345678, "regRPB_ARB_CNTL": 0xffffffff}
+           "regGCVM_L2_PROTECTION_FAULT_CNTL": 0xc0000000, "regDAGB1_WRCLI2": 0x12345678, "regRPB_ARB_CNTL": 0xffffffff,
+           "regMMVM_INVALIDATE_ENG17_SEM": 0x1, "regMMVM_INVALIDATE_ENG17_ACK": 0x1}   # the pre-gart vmid-0 MM flush (review L6) acquires/acks at once
 VEGA_EXTRA = (("athub", am.ATHUB_HWIP),)   # design v2 §3 _build_regs row: athub bound when GC == (9,4,0) (the amdev.py owner's change)
 dev, log = run(ip_new, VEGA20, VEGA20_BASES, PRESETS, VEGA_EXTRA)
 print("=== Vega 20 (MI50) ordered register access log: AM_SOC, AM_GMC, AM_IH init_hw, then the GC hub + PTE flags ===")
@@ -179,6 +180,20 @@ check(not any("MSI_STORM" in l for l in log) and not any("RETRY_CAM" in l or "RE
 check(wrote("mmIH_STORM_CLIENT_LIST_CNTL") and wrote("mmIH_INT_FLOOD_CNTL"), "IH_STORM_CLIENT_LIST_CNTL / IH_INT_FLOOD_CNTL still written (fields exist in osssys_4_2_0)")
 last_rb = [l for l in writes if "W mmIH_RB_CNTL@" in l][-1]
 check(dev.regIH_RB_CNTL.decode(int(last_rb.split("<- ")[1], 16))['rb_enable'] == 1, "ring 0 enabled last")
+# review 2026-10-13 L7: vega20_ih_rb_cntl (vega20_ih.c:202-203, :208-209) on every ring
+rb0v = dev.regIH_RB_CNTL.decode(int(rb0[0].split("<- ")[1], 16)); rb1 = [l for l in writes if "W mmIH_RB_CNTL_RING1@" in l]; rb1v = int(rb1[0].split("<- ")[1], 16)
+check(rb0v['wptr_writeback_enable'] == 1 and rb0v['wptr_overflow_enable'] == 1, "IH_RB_CNTL ring 0: WPTR_WRITEBACK_ENABLE=1, WPTR_OVERFLOW_ENABLE=1")
+check((rb1v >> 8) & 1 == 1 and dev.regIH_RB_CNTL_RING1.decode(rb1v)['wptr_overflow_enable'] == 1 and dev.regIH_RB_CNTL_RING1.decode(rb1v)['rb_full_drain_enable'] == 1,
+      f"IH_RB_CNTL_RING1: bit 8 (WPTR_WRITEBACK_ENABLE, absent from the RING1 table) raw, WPTR_OVERFLOW_ENABLE=1, RB_FULL_DRAIN_ENABLE=1: {rb1v:#x}")
+check(wrote("mmIH_DOORBELL_RPTR", 0) and wrote("mmIH_DOORBELL_RPTR_RING1", 0), "IH_DOORBELL_RPTR ENABLE=0 on both rings (Linux !use_doorbell form; AM rings no IH doorbell - listed)")
+# review L6: vmid-0 MM-hub ENG17 flush BEFORE the MM hub's gart_enable (gmc_v9_0.c:2208-2212 -> :2217), after the HDP init/flush (:2193-2196)
+i_req, i_agp = idx("W", "mmMMVM_INVALIDATE_ENG17_REQ"), idx("W", "mmMMMC_VM_AGP_BASE")
+check(i_flush < i_req < i_agp and dev.regMMVM_INVALIDATE_ENG17_REQ.decode(int(log[i_req].split("<- ")[1], 16))['per_vmid_invalidate_req'] == 1,
+      "MM hub: ENG17 vmid-0 flush after the HDP flush and before init_hub's first aperture write (Linux order)")
+check(not any("W mmGCVM_INVALIDATE_ENG17_REQ@" in l for l in writes[:idx("W", "mmGCMC_VM_AGP_BASE")]), "GC hub: no pre-gart flush (AM's hub_initted guard; skip listed)")
+# review L12: SYSTEM_APERTURE_HIGH_ADDR = Linux fb_end >> 18 = ((TOP << 24) | 0xffffff) >> 18 on both hubs
+hi_want = ((0x7ff << 24) | 0xffffff) >> 18
+check(wrote("mmMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR", hi_want) and wrote("mmGCMC_VM_SYSTEM_APERTURE_HIGH_ADDR", hi_want), f"MC_VM_SYSTEM_APERTURE_HIGH_ADDR = {hi_want:#x} on MM and GC (gfxhub_v1_0.c:119-122, amdgpu_gmc.c:221)")
 print()
 
 # --- (2) non-Vega paths byte-identical to the mi50 branch ---------------------------------------------------------------------------------
