@@ -49,7 +49,7 @@ def scenario(mode:str):
   h = ladder.Harness(f"selfcheck-{mode}", needs_cap=False, needs_dev=False)   # a fake device is attached below
   calls = []
   h.quiesce_fn = lambda: calls.append(1) or print("FAKE QUIESCE ran")
-  h.attach(FakeDev())
+  h.attach(FakeDev()); h.start_watchdog()   # the fake card counts as POSTed: the watchdog starts after POST (ladder.py start_watchdog)
   def rung(h):
     if mode == "exception":
       time.sleep(2.5); raise RuntimeError("selfcheck injected exception")

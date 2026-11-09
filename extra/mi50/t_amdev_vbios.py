@@ -6,9 +6,9 @@
     powerplayinfo + OverDrive8 limits; (2) read_rom through fake ROM_INDEX/ROM_DATA registers at the design dwords 0x168e4/0x168e5 (auto-increment);
 (3) gc_info v2.0 shaping (every field lands in the slot Linux pairs it with); (4) AMDev._static_vega20 + _build_regs on a fake PCI device:
     ip_ver / regs_offset == egpu/mi50/port/vega20_ip_table.py (+ the NBIF alias), register dwords == the design's numbers, aids, harvested,
-    non-Vega gating (gfx11 fake binds no thm/smuio/athub/sdma tables, boot_version == AMDev.Version); (5) _vega20_vbios: POST via ATOM ASIC_Init, scratch-base
-    check, reserved_vram_size from the table / required env / overlap refusal, required inputs, invalid thermal reading, threshold;
-(6) _emergency_quiesce: MEC mask + SDMA halts + SMU SetSoftMaxByFreq/SetPptLimit through a fake mailbox, and the __init__ wrapper (injected error);
+    non-Vega gating (gfx11 fake binds no thm/smuio/athub/sdma tables, boot_version == AMDev.Version); (5) POST like Linux: ATOM ASIC_Init when
+    BIOS_SCRATCH_7 bit 9 is clear, only its return value judged (amdgpu_device.c:4067-4080), the VBIOS scratch base used as given, reserved VRAM 0,
+    the ATOM scratch size, the real __init__ order (nothing on the card before the ROM read and POST), the mode1-reset re-POST;
 (7) clang sizeof/offsetof of every ported struct against the Linux headers.
 Run: PYTHONPATH=<fork> python3 extra/mi50/t_amdev_vbios.py   [env MI50_LINUX_AMD=<linux>/drivers/gpu/drm/amd, MI50_IP_TABLE=<vega20_ip_table.py>]
 """
@@ -35,7 +35,7 @@ MARK = 0x1000   # synthetic ASIC_Init copies PS[0] (default sclk) here so the te
 SYN = dict(se=4, cu_per_sh=16, sh_per_se=1, rb=4, tccs=16, gprs=256, gs_thds=32, gs_depth=32, gsprim=1792, dbl_lds=1, wave=64, waves_simd=10,
            scratch_slots=32, lds=64, sclk10k=85200, mclk10k=100000, fw_start_kb=(32768 << 10) - (8 << 10), fw_kb=8192, shutdown_temp=118)
 def synthetic_image(scratch_base=0x4c, posted_fw_region=True, vru_version=(2, 1), gfx_crev=4, pptable_version=3, fw_start_kb=None,
-                    asic_init="set_post") -> bytes:
+                    asic_init="set_post", vru_flag=0x80000000) -> bytes:
   img = bytearray(4096)
   img[0:2] = b"\x55\xaa"; img[2] = len(img) >> 9                                               # amdgpu_bios.c:45-46
   img[0x30:0x3a] = v.AMD_VBIOS_SIGNATURE                                                       # :41-42
@@ -56,7 +56,7 @@ def synthetic_image(scratch_base=0x4c, posted_fw_region=True, vru_version=(2, 1)
   img[GFX:GFX+72] = bytes(g)
   if vru_version == (2, 1):
     u = v.vram_usagebyfirmware_v2_1(); u.table_header.structuresize, u.table_header.format_revision, u.table_header.content_revision = 12, 2, 1
-    u.start_address_in_kb = (SYN["fw_start_kb"] if fw_start_kb is None else fw_start_kb) | 0x80000000   # a flag bit, masked off by the reader (atombios.h:4298)
+    u.start_address_in_kb = (SYN["fw_start_kb"] if fw_start_kb is None else fw_start_kb) | vru_flag   # 0x2 << 30 = SRIOV msg-share flag, masked off by the reader (atombios.h:4298-4302)
     u.used_by_firmware_in_kb, u.used_by_driver_in_kb = (SYN["fw_kb"] if posted_fw_region else 0), 256
     img[VRU:VRU+12] = bytes(u)
   elif vru_version:
@@ -107,11 +107,10 @@ bad = bytearray(img); bad[HDR+4:HDR+8] = b"XXXX"; raises(lambda: v.VBIOS(bytes(b
 
 # ---------------- (2) read_rom through fake registers ----------------
 class FakeMMIO:
-  """dword-indexed BAR5 (512 KiB = 0x20000 dwords, design §1.3); ROM_DATA auto-increments from the pointer ROM_INDEX sets; SMU mailbox optional."""
-  ROM_INDEX, ROM_DATA, C2PMSG_66, C2PMSG_82, C2PMSG_90 = 0x168e4, 0x168e5, 0x16000 + 642, 0x16000 + 658, 0x16000 + 666
-  FEATURES_LOW = (1 << smu.FEATURE_DPM_GFXCLK_BIT) | (1 << smu.FEATURE_DPM_UCLK_BIT) | (1 << smu.FEATURE_DPM_SOCCLK_BIT) | (1 << smu.FEATURE_PPT_BIT)
-  def __init__(self, img:bytes, smu_alive=False, seed=None):
-    self.img, self.ptr, self.smu_alive, self.regs, self.log = img, 0, smu_alive, dict(seed or {}), []
+  """dword-indexed BAR5 (512 KiB = 0x20000 dwords, design §1.3); ROM_DATA auto-increments from the pointer ROM_INDEX sets."""
+  ROM_INDEX, ROM_DATA = 0x168e4, 0x168e5
+  def __init__(self, img:bytes, seed=None):
+    self.img, self.ptr, self.regs, self.log = img, 0, dict(seed or {}), []
   def __len__(self): return 0x20000
   def __getitem__(self, k):
     if k == self.ROM_DATA: val, self.ptr = int.from_bytes(self.img[self.ptr:self.ptr+4].ljust(4, b"\0"), 'little'), self.ptr + 4; return val
@@ -119,12 +118,6 @@ class FakeMMIO:
   def __setitem__(self, k, val):
     self.log.append((k, val))
     if k == self.ROM_INDEX: self.ptr = val
-    elif k == self.C2PMSG_66 and self.smu_alive:   # fake SMU: GetDpmFreqByIndex count 8 / level freq 800 (synthetic), every message answered OK
-      param = self.regs.get(self.C2PMSG_82, 0)
-      if val == smu.PPSMC_MSG_GetDpmFreqByIndex: self.regs[self.C2PMSG_82] = 8 if (param & 0xff) == 0xff else 800
-      elif val == smu.PPSMC_MSG_GetEnabledSmuFeaturesLow: self.regs[self.C2PMSG_82] = self.FEATURES_LOW   # synthetic feature state
-      else: self.regs[self.C2PMSG_82] = 0
-      self.regs[self.C2PMSG_90] = smu.PPSMC_Result_OK
     else: self.regs[k] = val
 mm = FakeMMIO(img)
 dump = v.read_rom(lambda r: mm[r], lambda r, val: mm.__setitem__(r, val), FakeMMIO.ROM_INDEX, FakeMMIO.ROM_DATA)
@@ -147,15 +140,13 @@ class FakePCI:
   def read_config(self, off, size): return {(0, 4): self.dev_id, (0, 2): self.dev_id & 0xffff, (4, 2): 0x7}.get((off, size), 0)
   def write_config_flush(self, off, val, size): self.cfg_writes.append((off, val, size))
   def map_bar(self, bar, fmt='B'): return self.mmio_obj if bar == 5 else types.SimpleNamespace(nbytes=256 << 20)
-def seed(temp=60, maxtemp=70, posted=True, memsize_mib=32768): return {0xde3: memsize_mib, 0x53: 0x200 if posted else 0, 0x1665f: (temp << 9) | maxtemp}
-def fake_dev(mmio, inputs=True) -> AMDev:
-  """The hand-built AMDev mirrors __init__ (review 2026-10-13 TI4): is_vega20 from config dword 0, then the two REQUIRED inputs."""
+def seed(posted=True, memsize_mib=32768): return {0xde3: memsize_mib, 0x53: 0x200 if posted else 0}
+def fake_dev(mmio) -> AMDev:
+  """The hand-built AMDev mirrors __init__: is_vega20 from config dword 0."""
   dev = AMDev.__new__(AMDev)
   dev.pci_dev, dev.devfmt, dev.mmio, dev.vram = FakePCI(mmio=mmio), "fake", mmio, types.SimpleNamespace(nbytes=256 << 20)
   dev.is_vega20 = dev.pci_dev.read_config(0, 4) == VEGA20_PCI_ID
-  if dev.is_vega20 and inputs: dev._vega20_required_inputs()
   return dev
-os.environ.update({"AM_MI50_PPT_W": "150", "AM_MI50_TEMP_C": "90"}); os.environ.pop("AM_MI50_RESERVED_VRAM_MB", None)
 mm = FakeMMIO(img, seed=seed()); dev = fake_dev(mm)
 dev._run_discovery(); dev._build_regs()
 check(dev.is_vega20 and dev.vram_size == 32768 << 20 and not dev.large_bar, "fake MI50: _run_discovery took the static branch; vram 32 GiB, small BAR")
@@ -178,8 +169,7 @@ dev.boot_version = AMDev.VEGA20_BOOT_VERSION
 dev._vega20_vbios()
 check(dev.vega20_posted and dev.vbios.img == img and dev.gc_info.gc_num_se == SYN["se"] and dev.powerplay["SoftwareShutdownTemp"] == SYN["shutdown_temp"],
       "_vega20_vbios: POST seen, ROM dumped through the register objects, gc_info and powerplay limits set")
-check(dev.reserved_vram_size == (32768 << 20) - (SYN["fw_start_kb"] << 10) == 8 << 20, f"reserved_vram_size = vram_size - fw region start = {dev.reserved_vram_size >> 20} MiB")
-check(dev.mi50_ppt_w == 150.0 and dev.mi50_temp_c == 90 and dev.vega20_hotspot_c() == 60, "required inputs read; hotspot 60 °C from CTF_TEMP bits 9..17")
+check(dev.reserved_vram_size == 0, "reserved_vram_size 0 even with a vram_usagebyfirmware table (bare metal: amdgpu_ttm.c:1741-1772, amdgpu_atomfirmware.c:119-125)")
 # failure paths
 d2 = fake_dev(FakeMMIO(img, seed=seed(posted=False))); d2._run_discovery(); d2._build_regs()
 d2._vega20_vbios()
@@ -189,50 +179,80 @@ check(d2.vega20_posted and mark_i is not None and rom_i < mark_i, "unposted card
 check((MARK, SYN["sclk10k"]) in w and d2.mmio.regs[0x53] & 0x200, "ASIC_Init got PS[0] = firmwareinfo bootup sclk (atom.c:1660) and set BIOS_SCRATCH_7 bit 9")
 check(not any(k == MARK for k, _ in dev.mmio.log), "POSTed card: ASIC_Init never runs (amdgpu_device_need_post false)")
 d2b = fake_dev(FakeMMIO(synthetic_image(asic_init="noop"), seed=seed(posted=False))); d2b._run_discovery(); d2b._build_regs()
-raises(d2b._vega20_vbios, "still clear", "ASIC_Init returning 0 without setting the POST bit is refused (fork's fail-closed re-read)")
-check(not getattr(d2b, 'vega20_posted', False), "that card is never marked posted")
+d2b._vega20_vbios()
+check(d2b.vega20_posted and any(k == MARK for k, _ in d2b.mmio.log) and not d2b.mmio.regs[0x53] & 0x200,
+      "ASIC_Init returning 0 is success even if the POST bit stays clear: Linux judges only the return value (amdgpu_device.c:4075-4079)")
 d2c = fake_dev(FakeMMIO(synthetic_image(asic_init=None), seed=seed(posted=False))); d2c._run_discovery(); d2c._build_regs()
 raises(d2c._vega20_vbios, "gpu post error! amdgpu_atom_asic_init returned 1", "no ASIC_Init table -> atom_asic_init 1 -> post error (atom.c:1665-1666)")
-# B7 reset path: engine-hung flag around the PSP mode1 reset, then the unconditional re-POST (amdgpu_device.c:4941-4991, :5142-5146)
+# POST first (how the hardware works, Leon 2026-10-13): the REAL _boot order, every MMIO access logged in sequence
+class OrderMMIO(FakeMMIO):
+  def __init__(self, *a, **k): super().__init__(*a, **k); self.seq = []
+  def __getitem__(self, k): self.seq.append(("R", k)); return super().__getitem__(k)
+  def __setitem__(self, k, val): self.seq.append(("W", k)); return super().__setitem__(k, val)
+class _StopBoot(Exception): pass
+om = OrderMMIO(img, seed=seed(posted=False)); pci5 = FakePCI(mmio=om)
+booted = []
+def _stop(self, smi_dev=False): booted.append(self); raise _StopBoot()   # stop right after the VBIOS tables (amdev.py _boot: init_sw follows)
+AMDev.init_sw, _orig_init_sw = _stop, AMDev.init_sw
+try: AMDev(pci5)   # the REAL __init__: identity, ASPM, BAR maps, _boot
+except _StopBoot: pass
+finally: AMDev.init_sw = _orig_init_sw
+d5 = booted[0]
+sq = om.seq
+first_rom = next(i for i, a in enumerate(sq) if a == ("W", FakeMMIO.ROM_INDEX))
+post_end = max(i for i, a in enumerate(sq) if a == ("W", MARK))
+pre = [a for a in sq[:first_rom]]
+check(pre == [], f"nothing touches the card's registers before the ROM read (POST needs it): {pre[:4]}")
+check(all(i > post_end for i, a in enumerate(sq) if a == ("R", 0xde3)) and ("R", 0xde3) in sq and ("R", 0x1665f) not in sq,
+      "memsize (0xde3) is read only AFTER ASIC_Init; no thermal read during boot up to init_sw")
+check([w for w in pci5.cfg_writes] == [], f"pre-POST config writes: only the ASPM link-control write when a PCIe cap exists (fake has none): {pci5.cfg_writes}")
+between = {a for a in sq[first_rom:post_end + 1] if a[1] not in (FakeMMIO.ROM_INDEX, FakeMMIO.ROM_DATA, 0x53, MARK)}
+check(not between, f"between the ROM read and the end of ASIC_Init only ROM_INDEX/ROM_DATA, the POST bit and ASIC_Init's own access: {sorted(between)[:4]}")
+check(d5.vega20_posted and d5.vram_size == 32768 << 20, "the real _boot POSTed the card, then read memsize")
+# mode1 reset = amdgpu_device_mode1_reset (amdgpu_device.c:4937-4999), then the full-reset re-POST (:5143-5146). No gfx/smu objects are installed:
+# AMDev.__getattr__ raises on them, so any quiesce call (gfx.fini_hw / smu.set_clocks) fails this check.
 check(d2.regBIOS_SCRATCH_3.addr[0] == 0x4f, "regBIOS_SCRATCH_3 -> dword 0x4f (scratch base 0x4c + 3, amdgpu_atombios.c:1613)")
 ev = []
-class _G:
-  def fini_hw(self): ev.append("gfx.fini_hw")
-class _S:
-  def set_clocks(self, level): ev.append(("clocks", level))
+class CfgPCI:
+  """256-byte config space: MI50 function, PCIe capability at 0x60 (version 2, endpoint), synthetic values."""
+  def __init__(self):
+    self.cfg = bytearray(256)
+    for off, val, size in ((0, VEGA20_PCI_ID, 4), (0x04, 0x0006, 2), (0x10, 0xe000000c, 4), (0x18, 0xf000000c, 4), (0x24, 0xf8000000, 4),
+                           (0x3c, 0x01ff, 2), (0x34, 0x60, 1), (0x60, 0x0010, 2), (0x62, 0x0002, 2), (0x68, 0x2810, 2), (0x70, 0x0040, 2),
+                           (0x78, 0x1111, 2), (0x7c, 0x2222, 2), (0x88, 0x0400, 2), (0x90, 0x0003, 2), (0x98, 0x3333, 2)): self.put(off, val, size)
+  def put(self, off, val, size): self.cfg[off:off + size] = val.to_bytes(size, "little")
+  def read_config(self, off, size): return int.from_bytes(self.cfg[off:off + size], "little")
+  def write_config(self, off, val, size): ev.append(("cfgw", off, val, size)); self.put(off, val, size)
 class _P:
   def mode1_reset(self):
-    ev.append(("psp.mode1_reset", d2.mmio.regs.get(0x4f, 0) & 0x20000000)); d2.mmio.regs[0x53] = 0   # the reset clears the POST bit
-d2.gfx, d2.smu, d2.psp = _G(), _S(), _P()
+    ev.append(("psp.mode1_reset", d2.mmio.regs.get(0x4f, 0) & 0x20000000)); d2.mmio.regs[0x53] = 0   # the reset clears the POST bit ...
+    for off, val, size in ((0x04, 0, 2), (0x10, 0x0000000c, 4), (0x70, 0x0043, 2), (0x88, 0, 2)): d2.pci_dev.put(off, val, size)   # ... and config
+  def _wait_for_bootloader(self): ev.append("psp._wait_for_bootloader")
+d2.pci_dev, d2.psp = CfgPCI(), _P()
 d2.mmio.log.clear()
 d2._vega20_reset()
 lg = d2.mmio.log
 mark_after = [i for i, (k, _) in enumerate(lg) if k == MARK]
-check(("psp.mode1_reset", 0x20000000) in ev, "BIOS_SCRATCH_3 ATOM_S3_ASIC_GUI_ENGINE_HUNG set while the PSP mode1 reset runs (amdgpu_device.c:4941-4942)")
-check(not d2.mmio.regs[0x4f] & 0x20000000, "engine-hung flag cleared after the reset (amdgpu_device.c:4990-4991)")
-check(len(mark_after) == 1 and d2.mmio.regs[0x53] & 0x200, "card re-POSTed by ATOM ASIC_Init after the reset (full reset posts unconditionally, amdgpu_device.c:5142-5146)")
-d3 = fake_dev(FakeMMIO(synthetic_image(scratch_base=0x4d), seed=seed())); d3._run_discovery(); d3._build_regs()
-raises(d3._vega20_vbios, "bios_scratch_reg_startaddr", "VBIOS scratch base != nbio_7_4 BIOS_SCRATCH_0 refused")
-d4 = fake_dev(FakeMMIO(synthetic_image(fw_start_kb=16 << 10), seed=seed())); d4._run_discovery(); d4._build_regs()
-raises(d4._vega20_vbios, "overlaps AM's boot region", "fw region inside the 32 MiB boot region refused (U-M1)")
+check(("psp.mode1_reset", 0x20000000) in ev, "BIOS_SCRATCH_3 ATOM_S3_ASIC_GUI_ENGINE_HUNG set while the PSP mode1 reset runs (amdgpu_device.c:4942-4943)")
+cfgw = [e[1:] for e in ev if e[0] == "cfgw"]
+check(cfgw == [(0x68, 0x2810, 2), (0x70, 0x0040, 2), (0x88, 0x0400, 2), (0x90, 0x0003, 2), (0x10, 0xe000000c, 4), (0x04, 0x0006, 4)],
+      f"PCI state restore: DEVCTL, LNKCTL, DEVCTL2, LNKCTL2 written back (endpoint: no SLTCTL/RTCTL/SLTCTL2), then only the changed header "
+      f"dwords, BAR0 before COMMAND (pci.c pci_restore_state order): {[(hex(o), hex(v), n) for o, v, n in cfgw]}")
+order = [e if isinstance(e, str) else e[0] for e in ev]
+check(order.index("psp.mode1_reset") < order.index("cfgw") and max(i for i, e in enumerate(order) if e == "cfgw") < order.index("psp._wait_for_bootloader"),
+      "order: PSP mode1 reset -> PCI state restore -> psp_v11_0_wait_for_bootloader (amdgpu_device.c:4960, :4972, :4973)")
+check(not d2.mmio.regs[0x4f] & 0x20000000, "engine-hung flag cleared after the reset (amdgpu_device.c:4991-4992)")
+check(len(mark_after) == 1 and d2.mmio.regs[0x53] & 0x200, "card re-POSTed by ATOM ASIC_Init after the reset (full reset posts unconditionally, amdgpu_device.c:5143-5146)")
+check(not AMDev._pcie_reg_implemented(0x0001, 0x30) and AMDev._pcie_reg_implemented(0x0142, 0x18) and AMDev._pcie_reg_implemented(0x0042, 0x1c),
+      "pcie_capability_reg_implemented: LNKCTL2 needs version > 1; SLTCTL on a downstream port with SLOT; RTCTL on a root port (access.c)")
+# the VBIOS scratch base is used as given (amdgpu_atomfirmware_scratch_regs_init, amdgpu_atomfirmware.c:88-103): POST bit read at base + 7
+d3 = fake_dev(FakeMMIO(synthetic_image(scratch_base=0x4d), seed={0xde3: 32768, 0x54: 0x200})); d3._run_discovery(); d3._build_regs(); d3._vega20_vbios()
+check(d3.bios_scratch_reg_offset == 0x4d and not any(k == MARK for k, _ in d3.mmio.log), "scratch base 0x4d from the VBIOS: POST bit read at 0x54, set -> no ASIC_Init")
 d5 = fake_dev(FakeMMIO(synthetic_image(vru_version=None), seed=seed())); d5._run_discovery(); d5._build_regs()
-d5._vega20_vbios(); check(d5.reserved_vram_size == 0, "no vram_usagebyfirmware -> reserved_vram_size 0 (Leon 2026-10-13: the optimal one = bare-metal Linux reserves nothing)")
-d6 = fake_dev(FakeMMIO(img, seed=seed(temp=0))); d6._run_discovery(); d6._build_regs(); raises(d6._vega20_vbios, "invalid", "CTF_TEMP 0 is an invalid reading (§7.0 rule 4)")
-d7 = fake_dev(FakeMMIO(img, seed=seed(temp=95))); d7._run_discovery(); d7._build_regs(); raises(d7._vega20_vbios, ">= threshold", "hotspot 95 >= AM_MI50_TEMP_C 90 refused")
-for var in ("AM_MI50_PPT_W", "AM_MI50_TEMP_C"):
-  saved = os.environ.pop(var); d8 = fake_dev(FakeMMIO(img, seed=seed()), inputs=False)
-  raises(d8._vega20_required_inputs, f"{var} = ", f"missing {var} is a clear error (REQUIRED)"); os.environ[var] = saved
-# review 2026-10-13 S13/TI4: one parse rule (int(v, 0), bounded) shared with extra/mi50/ladder.py _env_int
-for var, val, needle in (("AM_MI50_TEMP_C", "600", "outside 1..510"), ("AM_MI50_TEMP_C", "0", "outside 1..510"), ("AM_MI50_PPT_W", "150.5", "not an integer"),
-                         ("AM_MI50_PPT_W", "0", "outside 1..65535")):
-  saved = os.environ[var]; os.environ[var] = val; d9 = fake_dev(FakeMMIO(img, seed=seed()), inputs=False)
-  raises(d9._vega20_required_inputs, needle, f"{var}={val} refused"); os.environ[var] = saved
-os.environ["AM_MI50_PPT_W"] = "0x96"; d9 = fake_dev(FakeMMIO(img, seed=seed())); check(d9.mi50_ppt_w == 150, "AM_MI50_PPT_W=0x96 parsed as 150 (int(v, 0), the ladder's rule)")
-os.environ["AM_MI50_PPT_W"] = "150"
-saved = os.environ.pop("AM_MI50_TEMP_C"); mm9 = FakeMMIO(img, seed=seed()); pdev9 = FakePCI(mmio=mm9)
-raises(lambda: AMDev(pdev9), "AM_MI50_TEMP_C", "__init__ with a missing input raises")
-check(pdev9.cfg_writes == [] and mm9.log == [], "...before any config WRITE (ASPM) and before any MMIO access: nothing touched (review TI4)")
-os.environ["AM_MI50_TEMP_C"] = saved
+d5._vega20_vbios(); check(d5.reserved_vram_size == 0 and d5._vega20_atom_scratch_bytes() == 0, "no vram_usagebyfirmware -> reserved 0, ATOM scratch 0 (AtomContext default)")
+check(dev._vega20_atom_scratch_bytes() == 0, "vram_usagebyfirmware v2.1 with the SRIOV flag (0x2 << 30) -> ATOM scratch 0 (amdgpu_atomfirmware.c:105-131)")
+d5b = fake_dev(FakeMMIO(synthetic_image(vru_flag=0), seed=seed())); d5b._run_discovery(); d5b._build_regs(); d5b._vega20_vbios()
+check(d5b._vega20_atom_scratch_bytes() == 256 << 10, "v2.1 without the SRIOV flag -> ATOM scratch = used_by_driver_in_kb (256 KiB)")
 # non-Vega gating: a gfx11-shaped fake binds no Vega tables; boot_version is the stock constant
 g11 = AMDev.__new__(AMDev); g11.devfmt, g11.is_vega20 = "fake-gfx11", False
 g11.ip_ver = {am.GC_HWIP: (11,0,2), am.MP0_HWIP: (13,0,7), am.MP1_HWIP: (13,0,7), am.HDP_HWIP: (6,0,0), am.MMHUB_HWIP: (3,0,1), am.OSSSYS_HWIP: (6,0,0), am.NBIO_HWIP: (7,7,0), am.SDMA0_HWIP: (6,0,2)}
@@ -242,65 +262,6 @@ check(not any(n in g11.__dict__ for n in ("mmROM_INDEX", "mmCG_MULT_THERMAL_STAT
       "gfx11 fake: no thm/smuio/athub/sdma_4_2 tables bound (gate GC == (9,4,0) / SDMA in {4.2.0, 4.4.2, 4.4.4}); gc_11_0_0 bound")
 check((AMDev.VEGA20_BOOT_VERSION if g11.is_vega20 else AMDev.Version) == 0xA0000008, "non-Vega boot_version == AMDev.Version 0xA0000008")
 check(AMDev.VEGA20_BOOT_VERSION not in (0xA0000008, 0xA000000D), "Vega placeholder differs from stock 0xA0000008 and master 0xA000000D")
-q = fake_dev(FakeMMIO(img)); q.is_vega20 = False; q._emergency_quiesce(); check(q.mmio.log == [], "_emergency_quiesce is a no-op when not Vega 20")
-
-# ---------------- (6) emergency quiesce + __init__ wrapper ----------------
-mm.log.clear(); dev._emergency_quiesce()
-check((0x208d, 0x503f0010) in mm.log and (0x128a, 1) in mm.log and (0x188a, 1) in mm.log, "quiesce (SMU silent): MEC disable mask written, both SDMA F32_CNTL.HALT=1")
-check(not any(r == FakeMMIO.C2PMSG_66 and val in (smu.PPSMC_MSG_SetSoftMaxByFreq, smu.PPSMC_MSG_SetPptLimit) for r, val in mm.log), "quiesce (SMU silent): no cap messages sent")
-mm.smu_alive = True; mm.log.clear(); dev._emergency_quiesce()
-msgs = [(val, mm.log[i-1][1]) for i, (r, val) in enumerate(mm.log) if r == FakeMMIO.C2PMSG_66]   # (msg, param written just before to C2PMSG_82)
-softmin = [p for m, p in msgs if m == smu.PPSMC_MSG_SetSoftMinByFreq]; softmax = [p for m, p in msgs if m == smu.PPSMC_MSG_SetSoftMaxByFreq]
-want_clks = (smu.PPCLK_GFXCLK, smu.PPCLK_UCLK, smu.PPCLK_SOCCLK)   # _vega20_set_clocks order; FCLK is not in vega20_force_dpm_lowest's masks
-check(softmin == [(c << 16) | 800 for c in want_clks] and softmax == softmin and (smu.PPCLK_GFXCLK, smu.PPCLK_UCLK, smu.PPCLK_SOCCLK) == (0, 5, 4),
-      f"quiesce (SMU alive, review S3): SetSoftMinByFreq THEN SetSoftMaxByFreq to the lowest level for GFXCLK 0, UCLK 5, SOCCLK 4 (vega20_hwmgr.c:2417-2429), no FCLK: min {[hex(x) for x in softmin]} max {[hex(x) for x in softmax]}")
-i_min, i_max = msgs.index((smu.PPSMC_MSG_SetSoftMinByFreq, softmin[0])), msgs.index((smu.PPSMC_MSG_SetSoftMaxByFreq, softmax[0]))
-check(msgs[0][0] == smu.PPSMC_MSG_GetSmuVersion and msgs[1] == (smu.PPSMC_MSG_SetPptLimit, 150) and i_min < i_max,
-      "quiesce (SMU alive, review S2): GetSmuVersion, then SetPptLimit 150 W as the FIRST lever, mins before maxes")
-# review S2 (§7.0 rule 5): a mailbox timeout on the cap ends the quiesce; a rejection does not
-class StubSMU:
-  def __init__(self, fail): self.fail, self.sent, self.smu_mod = fail, [], smu
-  def is_smu_alive(self): return True
-  def _send_msg(self, msg, param, **k):
-    self.sent.append(msg)
-    if isinstance(self.fail, Exception): raise self.fail
-  def _vega20_set_clocks(self, level, features=None): self.sent.append("force_lowest")
-from tinygrad.runtime.support.am.ip import AM_SMU
-for fail, want, label in ((TimeoutError("fake mailbox timeout"), [smu.PPSMC_MSG_SetPptLimit], "TimeoutError on SetPptLimit -> no further messages (rule 5)"),
-                          (AM_SMU.ResponseError("fake reject"), [smu.PPSMC_MSG_SetPptLimit, "force_lowest"], "ResponseError on SetPptLimit -> clocks still forced lowest")):
-  dev.smu = StubSMU(fail); dev._emergency_quiesce(); check(dev.smu.sent == want, f"quiesce: {label}: {dev.smu.sent}")
-del dev.smu
-# review S7: the engine halts follow a LIVE POST read, not the vega20_posted flag
-dv = fake_dev(FakeMMIO(img, seed=seed(posted=True))); dv._run_discovery(); dv._build_regs()   # no _vega20_vbios -> flag never set
-dv.mmio.log.clear(); dv._emergency_quiesce()
-check((0x208d, 0x503f0010) in dv.mmio.log and (0x128a, 1) in dv.mmio.log, "quiesce halts MEC/SDMA on a POSTed card even when _vega20_vbios never ran (live POST read, review S7)")
-dv2 = fake_dev(FakeMMIO(img, seed=seed(posted=False))); dv2._run_discovery(); dv2._build_regs(); dv2.mmio.log.clear(); dv2._emergency_quiesce()
-check((0x208d, 0x503f0010) not in dv2.mmio.log and (0x128a, 1) not in dv2.mmio.log, "quiesce leaves the engines alone when the live POST read says unposted")
-# review L1/TI3/S4/S14: the boot clock policy gates the cap on FEATURE_PPT (vega20_powertune.c:37-42) and records the state; one get_features pair
-import io, contextlib
-class PolicySMU:
-  def __init__(self, feats): self.feats, self.calls, self.smu_mod = feats, [], smu
-  def get_features(self): self.calls.append("get_features"); return self.feats
-  def _vega20_set_power_limit(self, w, features=None): self.calls.append(("cap", w, features))
-  def _vega20_set_clocks(self, level, features=None): self.calls.append(("clocks", level, features)); return {} if not (self.feats & 0x30f) else {0: (800, 800)}
-dp = fake_dev(FakeMMIO(img, seed=seed())); dp._run_discovery(); dp._build_regs(); dp.ip_ver = dict(dp.ip_ver)
-dp.smu = PolicySMU(FakeMMIO.FEATURES_LOW); dp._vega20_clock_policy()
-check(dp.smu.calls == ["get_features", ("cap", 150, FakeMMIO.FEATURES_LOW), ("clocks", 0, FakeMMIO.FEATURES_LOW)], f"clock policy with PPT on: one get_features, cap 150 W, level 0, features passed through: {dp.smu.calls}")
-dp.smu = PolicySMU(0); buf = io.StringIO()
-with contextlib.redirect_stdout(buf): dp._vega20_clock_policy()
-check(dp.smu.calls == ["get_features", ("clocks", 0, 0)] and "MI50 cap NOT applied" in buf.getvalue() and "UNCAPPED" in buf.getvalue(),
-      f"clock policy with FEATURE_PPT off: no SetPptLimit, state printed (vega20_powertune.c:37-42 silent form), level 0 still sent: {dp.smu.calls}")
-# the __init__ wrapper: inject an error after the VBIOS step (design T6d), expect the quiesce ran and the error propagated
-mm2 = FakeMMIO(img, smu_alive=True, seed=seed()); pdev = FakePCI(mmio=mm2)
-def boom(*a, **k): raise RuntimeError("injected after _vega20_vbios")
-AMDev.init_sw, orig = boom, AMDev.init_sw
-try:
-  try: AMDev(pdev)
-  except RuntimeError as e: check("injected" in str(e), f"__init__ re-raised the injected error: {e}")
-  else: check(False, "__init__ did not raise")
-finally: AMDev.init_sw = orig
-check((0x208d, 0x503f0010) in mm2.log and (0x128a, 1) in mm2.log and any(r == FakeMMIO.C2PMSG_66 and val == smu.PPSMC_MSG_SetPptLimit for r, val in mm2.log),
-      "__init__ wrapper: _emergency_quiesce halted MEC/SDMA and capped the SMU before re-raising")
 
 # ---------------- (7) clang sizeof/offsetof of the ported structs ----------------
 C_SRC = r'''

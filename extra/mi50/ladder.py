@@ -149,7 +149,7 @@ class Watchdog(threading.Thread):
 class LadderHalt(BaseException):
   """Intentional stop of AMDev.__init__ after a named block (design §7.1 T6b/T7/T8). BaseException so nothing in AM swallows it."""
 
-def make_ladder_amdev(stop_after:str|None, inject_after:str|None=None, on_init_sw=None, on_instance=None):
+def make_ladder_amdev(stop_after:str|None, inject_after:str|None=None, on_init_sw=None, on_instance=None, on_posted=None):
   """AMDev subclass: amdev.py:236 calls init_hw(soc, gmc, ih, psp, smu) and :242 init_hw(gfx, sdma). The override runs blocks in order and raises
   LadderHalt right after `stop_after`'s init_hw. If the first init_hw call does not contain the stop block (partial boot, amdev.py:219-225 skipped
   the full-boot call), it halts BEFORE running anything and records what was skipped. inject_after raises a RuntimeError after that block (T6d).
@@ -158,7 +158,9 @@ def make_ladder_amdev(stop_after:str|None, inject_after:str|None=None, on_init_s
   on_instance(adev) runs on the first line of __init__ (review 2026-10-13 S1): the harness sees the AMDev while AMDev.__init__ is still running,
   so an abort fired mid-boot reaches _emergency_quiesce instead of "no AMDev". The SMU message lock is installed right after init_sw (S5: the
   IP objects exist, no init_hw has run) so a quiesce from the abort thread waits for the in-flight mailbox message instead of interleaving.
-  stop_after=None halts at the first init_hw call before running any block (T6a needs the sw-built AMDev only)."""
+  stop_after=None halts at the first init_hw call before running any block (T6a needs the sw-built AMDev only).
+  on_posted() runs right after AMDev._vega20_post: POST and power management come first (how the hardware works, Leon 2026-10-13), so the thermal
+  watchdog starts only once the card is POSTed - nothing samples an unPOSTed card."""
   from tinygrad.runtime.support.am.amdev import AMDev
   class LadderAMDev(AMDev):
     instance = None
@@ -167,6 +169,9 @@ def make_ladder_amdev(stop_after:str|None, inject_after:str|None=None, on_init_s
       self._ladder_halted, self._ladder_skipped, self._quiesce_calls = False, None, 0
       if on_instance is not None: on_instance(self)
       super().__init__(pci_dev, **kw)
+    def _vega20_post(self):
+      super()._vega20_post()
+      if on_posted is not None: on_posted()
     def init_sw(self, smi_dev=False):
       super().init_sw(smi_dev=smi_dev)
       install_smu_lock(self)
@@ -207,7 +212,8 @@ class Harness:
   def connect(self):
     return self.attach(connect_mi50())
   def attach(self, dev):
-    """Start the watchdog on an existing device (T12: the device AMDDevice created; hook_apl_device wires it)."""
+    """Identity gate + RPC lock on an existing device (T12: the device AMDDevice created; hook_apl_device wires it). The watchdog is NOT started
+    here: POST comes first (how the hardware works, Leon 2026-10-13); start_watchdog() runs right after AMDev._vega20_post."""
     # Identity gate (2026-10-13, T-1 on the mini): the fork server resolves the card on a connection's FIRST request and maps an unattached
     # dev_id to the first tinygpu service (server.c open_tinygpu), so with the MI50 off the bus the watchdog sampled the RX 7600 XT.
     # This read is that first request (dev_id 0x100266a1); nothing else touches the device unless config dword 0 is the MI50.
@@ -215,8 +221,11 @@ class Harness:
       raise SystemExit(f"WRONG CARD: config dword 0 = {got:#010x}, want {VENDOR_DEVICE:#010x} (MI50) - the server opened another card; "
                        "refusing before any watchdog or MMIO access")
     self.dev = dev; install_rpc_lock(dev)
-    self.wd = Watchdog(dev, self.threshold, self.abort); self.wd.start()
     return dev
+  def start_watchdog(self):
+    """Thermal watchdog + dead-man, started after POST (never on an unPOSTed card). Idempotent: a re-POST after a reset does not start a second."""
+    if self.wd is None:
+      self.wd = Watchdog(self.dev, self.threshold, self.abort); self.wd.start()
   def hook_apl_device(self):
     """T12: AMDDevice builds its own APLRemotePCIDevice inside PCIIfaceBase.__init__ (system.py:259) before AMDev boots (:261); wrap __init__ so
     the lock + watchdog are live before the boot starts."""
@@ -231,21 +240,24 @@ class Harness:
     APLRemotePCIDevice.__init__ = init
     # review 2026-10-13 S1/S5 for T12: the stock AMDev is published to the harness on its first line and gets the SMU message lock right after
     # init_sw, exactly like LadderAMDev - an abort during the AMDDevice boot reaches _emergency_quiesce and never races the mailbox.
-    orig_am_init, orig_am_init_sw = AMDev.__init__, AMDev.init_sw
+    orig_am_init, orig_am_init_sw, orig_post = AMDev.__init__, AMDev.init_sw, AMDev._vega20_post
+    def am_post(adev_self):
+      orig_post(adev_self)
+      if adev_self is self.adev: self.start_watchdog()   # POST first; the watchdog starts after it
     def am_init(adev_self, pci_dev, **kw):
       if self.adev is None: self.adev = adev_self
       orig_am_init(adev_self, pci_dev, **kw)
     def am_init_sw(adev_self, smi_dev=False):
       orig_am_init_sw(adev_self, smi_dev=smi_dev)
       if adev_self is self.adev: install_smu_lock(adev_self)
-    AMDev.__init__, AMDev.init_sw = am_init, am_init_sw
+    AMDev.__init__, AMDev.init_sw, AMDev._vega20_post = am_init, am_init_sw, am_post
   # --- AM boot stages
   def boot_to(self, stop_after:str|None, inject_after:str|None=None, on_init_sw=None):
     """Run AMDev.__init__ on self.dev up to and including <stop_after>.init_hw (soc|gmc|ih|psp|smu; None = before any init_hw), then set
     is_booting=False exactly as amdev.py:239 does after the full-boot block, so the rung can allocate non-boot memory. Returns the AMDev.
     Everything __init__ does before the halt (B1 ASPM, B3/B4 static table + POST + VBIOS, B6 init_sw, B7 reset decision) is the amdev
     implementer's code, run unchanged."""
-    cls = make_ladder_amdev(stop_after, inject_after, on_init_sw, on_instance=lambda a: setattr(self, "adev", a))
+    cls = make_ladder_amdev(stop_after, inject_after, on_init_sw, on_instance=lambda a: setattr(self, "adev", a), on_posted=self.start_watchdog)
     try: cls(self.dev)
     except LadderHalt as e: print(f"BOOT halted: {e}")
     finally: self.adev = cls.instance
@@ -441,11 +453,12 @@ def boot_sw_only(h:"Harness"):
   if adev.is_vega20: adev._vega20_required_inputs()                                                                      # amdev.py __init__ (review TI4)
   adev._disable_aspm()                                                                                                   # amdev.py __init__
   adev.vram, adev.doorbell64, adev.mmio = h.dev.map_bar(0), h.dev.map_bar(2, fmt='Q'), h.dev.map_bar(5, fmt='I')         # amdev.py __init__
-  adev._run_discovery(); adev._build_regs()                                                                              # amdev.py _boot
-  # integration 2026-10-13: the amdev branch's _boot (amdev.py:232-233) derives boot_version and, on the Vega 20, runs _vega20_vbios() (required
-  # inputs, POST gate, ROM dump: reads only) which sets reserved_vram_size and gc_info; init_sw needs both (amdev report, amdev.py:481-482).
-  adev.boot_version = AMDev.VEGA20_BOOT_VERSION if adev.is_vega20 else AMDev.Version      # amdev.py:232
-  if adev.is_vega20: adev._vega20_vbios()                                                                                # amdev.py:233
+  # amdev.py _boot, Vega 20: static tables + regs (no card access), POST first, then the watchdog, then discovery (memsize) and the VBIOS tables
+  if adev.is_vega20: adev._static_vega20(); adev._build_regs(); adev._vega20_post(); h.start_watchdog()
+  adev._run_discovery()
+  if not adev.is_vega20: adev._build_regs()
+  adev.boot_version = AMDev.VEGA20_BOOT_VERSION if adev.is_vega20 else AMDev.Version      # amdev.py _boot
+  if adev.is_vega20: adev._vega20_vbios()                                                                                # amdev.py _boot
   adev.is_booting = True; adev.init_sw(smi_dev=False)                                                                    # amdev.py:245-246
   install_smu_lock(adev)
   return adev

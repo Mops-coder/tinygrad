@@ -86,6 +86,22 @@ ATOM_VEGA20_ODSETTING = ("GFXCLKFMAX", "GFXCLKFMIN", "VDDGFXCURVEFREQ_P1", "VDDG
   "FANRPMACOUSTICLIMIT", "FANTARGETTEMPERATURE", "OPERATINGTEMPMAX")   # :57-73, COUNT = 14
 PPTABLE_V20_SMU_VERSION = 3   # L/pm/powerplay/inc/smu11_driver_if.h:34
 
+class smudpm_i2ccontrollerconfig_t(_P):   # atomfirmware.h:2403-2411
+  _fields_ = [(n, u32) for n in ("enabled", "slaveaddress", "controllerport", "controllername", "thermalthrottler", "i2cprotocol", "i2cspeed")]
+
+class atom_smc_dpm_info_v4_4(_P):   # atomfirmware.h:2413-2484 (read by append_vbios_pptable, vega20_processpptables.c:126-196)
+  _fields_ = [("table_header", atom_common_table_header), ("i2c_padding", u32 * 3), ("maxvoltagestepgfx", u16), ("maxvoltagestepsoc", u16),
+    ("vddgfxvrmapping", u8), ("vddsocvrmapping", u8), ("vddmem0vrmapping", u8), ("vddmem1vrmapping", u8),
+    ("gfxulvphasesheddingmask", u8), ("soculvphasesheddingmask", u8), ("externalsensorpresent", u8), ("padding8_v", u8),
+    ("gfxmaxcurrent", u16), ("gfxoffset", u8), ("padding_telemetrygfx", u8), ("socmaxcurrent", u16), ("socoffset", u8), ("padding_telemetrysoc", u8),
+    ("mem0maxcurrent", u16), ("mem0offset", u8), ("padding_telemetrymem0", u8), ("mem1maxcurrent", u16), ("mem1offset", u8),
+    ("padding_telemetrymem1", u8), ("acdcgpio", u8), ("acdcpolarity", u8), ("vr0hotgpio", u8), ("vr0hotpolarity", u8), ("vr1hotgpio", u8),
+    ("vr1hotpolarity", u8), ("padding1", u8), ("padding2", u8), ("ledpin0", u8), ("ledpin1", u8), ("ledpin2", u8), ("padding8_4", u8),
+    ("pllgfxclkspreadenabled", u8), ("pllgfxclkspreadpercent", u8), ("pllgfxclkspreadfreq", u16), ("uclkspreadenabled", u8),
+    ("uclkspreadpercent", u8), ("uclkspreadfreq", u16), ("fclkspreadenabled", u8), ("fclkspreadpercent", u8), ("fclkspreadfreq", u16),
+    ("fllgfxclkspreadenabled", u8), ("fllgfxclkspreadpercent", u8), ("fllgfxclkspreadfreq", u16),
+    ("i2ccontrollers", smudpm_i2ccontrollerconfig_t * 7), ("boardreserved", u32 * 10)]
+
 class ATOM_VEGA20_OVERDRIVE8_RECORD(_P):   # vega20_pptable.h:76-83
   _fields_ = [("ucODTableRevision", u8), ("ODFeatureCount", u32), ("ODFeatureCapabilities", u8 * ATOM_VEGA20_ODFEATURE_MAX_COUNT),
     ("ODSettingCount", u32), ("ODSettingsMax", u32 * ATOM_VEGA20_ODSETTING_MAX_COUNT), ("ODSettingsMin", u32 * ATOM_VEGA20_ODSETTING_MAX_COUNT)]
@@ -209,6 +225,12 @@ class VBIOS:
     ret["tdp_od_limit"] = od.ODSettingsMax[ATOM_VEGA20_ODSETTING.index("POWERPERCENTAGE")]   # :302
     ret["smc_pptable"] = bytes(pp.smcPPTable)   # the PPTable_t blob for a later DPM-enable step (design v2 B13, §8 U-S1)
     return ret
+
+  def smc_dpm_info(self) -> atom_smc_dpm_info_v4_4:
+    """append_vbios_pptable (vega20_processpptables.c:126-133): smu_atom_get_data_table(smc_dpm_info) cast to atom_smc_dpm_info_v4_4; Linux
+    fails init_powerplay_table_information when the table is missing ("Failed to retrieve Smc Dpm Table from VBIOS!")."""
+    if (h:=self.data_header("smc_dpm_info")) is None: raise ValueError("VBIOS: [appendVbiosPPTable] Failed to retrieve Smc Dpm Table from VBIOS!")
+    return self._at(atom_smc_dpm_info_v4_4, h[0])
 
   def gc_info_v2_0(self) -> am.struct_gc_info_v2_0:
     """gfx_info v2.4 -> discovery-shaped gc_info v2.0, paired through the adev->gfx.config / cu_info fields both Linux paths fill:
