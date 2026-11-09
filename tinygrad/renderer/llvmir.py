@@ -2,6 +2,7 @@ import math, struct, sys
 from tinygrad.codegen.opt import tc
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.cstyle import HIPRenderer, create_non_native_float_pats, pm_manual_bf16_cast
+from tinygrad.renderer.cstyle import gfx906_dot2_pattern, pm_gfx906_dot2, pm_gfx906_fma
 from tinygrad.codegen.decomp.transcendental import xexp2, xlog2
 from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp, range_str
 from tinygrad.dtype import dtypes, float_to_fp8, DType, truncate, AddrSpace
@@ -225,6 +226,19 @@ code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{c
                      "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{chr(120+int(x))}()"}
 # https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html#llvm-ir-intrinsics
 llvm_intrinsics = {Ops.SQRT: "sqrt", Ops.LOG2: "log2", Ops.EXP2: "exp2"}
+
+def render_gfx906_dot2(ctx, x:UOp) -> str:
+  n = ctx[x]
+  a0, a1, b0, b1, acc = (ctx[s] for s in x.src)
+  return (
+    f"  {n}_a0 = insertelement <2 x half> poison, half {a0}, i32 0\n"
+    f"  {n}_a = insertelement <2 x half> {n}_a0, half {a1}, i32 1\n"
+    f"  {n}_b0 = insertelement <2 x half> poison, half {b0}, i32 0\n"
+    f"  {n}_b = insertelement <2 x half> {n}_b0, half {b1}, i32 1\n"
+    f"  {n} = call float @llvm.amdgcn.fdot2("
+    f"<2 x half> {n}_a, <2 x half> {n}_b, float {acc}, i1 false)"
+  )
+
 class AMDLLVMRenderer(LLVMRenderer):
   shared_max = HIPRenderer.shared_max
   global_max = HIPRenderer.global_max
@@ -251,6 +265,8 @@ class AMDLLVMRenderer(LLVMRenderer):
     from tinygrad.renderer.amd.elf import assemble_linear
     return assemble_linear(prg, lin, self.target.arch)
   def render(self, uops: list[UOp]) -> str:
+    if self.target.arch.split(":", 1)[0] == "gfx906" and any(u.op is Ops.WMMA for u in uops):
+      raise RuntimeError("gfx906 has no WMMA/MFMA path")
     prefix = ["""define i8 @f32_to_fp8(float %val, i1 %is_bf8) {
 entry: %ival = bitcast float %val to i32\n  %exp = and i32 %ival, 2139095040\n  %is_special = icmp eq i32 %exp, 2139095040
 br i1 %is_special, label %select_clip, label %clip
@@ -276,6 +292,14 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
     super().__init__(target)
     from tinygrad.runtime.support.compiler_llvm import AMDLLVMCompiler
     self.compiler, self.tensor_cores, self.is_cdna = AMDLLVMCompiler(target.arch), tc.get_amd(target.arch), HIPRenderer.is_cdna(target.arch)
+    if target.arch.split(":", 1)[0] == "gfx906":
+      self.extra_matcher += pm_gfx906_dot2+pm_gfx906_fma
+      self.string_rewrite = PatternMatcher([
+        (gfx906_dot2_pattern("x"), render_gfx906_dot2),
+        (UPat(Ops.MULACC, dtype=(dtypes.float, dtypes.double), name="x"),
+         lambda ctx,x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.fma.f{x.dtype.bitsize}("
+         + ", ".join(f"{ldt(s.dtype)} {ctx[s]}" for s in x.src)+")"),
+      ])+self.string_rewrite
     self.string_rewrite += PatternMatcher([
       (UPat(Ops.WMMA, name="wmma"), lambda ctx, wmma, rdna4=AMDLLVMRenderer.is_rdna4(target.arch), cdna=self.is_cdna:
         render_wmma_amd(ctx, wmma, cdna, rdna4))

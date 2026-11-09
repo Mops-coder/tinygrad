@@ -1,0 +1,28 @@
+#!/bin/zsh
+# MI50 support for the TinyGPU driver: regenerate its tables from the primary sources, compile the driver code, run the offline tests.
+#   build_and_test.sh <linux drivers/gpu/drm/amd> <tinygrad autogen/am/regs.py> <vega20 firmware dir> <V420.rom> <build dir>
+set -euo pipefail
+LINUX=$1 REGS=$2 FW=$3 ROM=$4 OUT=$5
+HERE=${0:A:h}
+MI50=$HERE/../TinyGPUDriverExtension/MI50
+mkdir -p $OUT
+CXX=(clang++ -std=gnu++17 -Wall -Wextra -Werror)
+$CXX -O1 -o $OUT/mi50_gen $HERE/mi50_gen.cpp
+$OUT/mi50_gen $LINUX $REGS $FW $MI50
+# the driver's code, as the dext compiles it (no exceptions, no RTTI) and with the sanitizers for the tests
+$CXX -fno-exceptions -fno-rtti -Wno-unused-parameter -fsyntax-only $MI50/MI50Device.cpp
+$CXX -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-unused-parameter -o $OUT/t_mi50 $HERE/test/t_mi50.cpp $MI50/MI50Device.cpp
+$OUT/t_mi50 $FW $ROM
+# the dext's glue (MI50Dext.cpp, unchanged) against the stand-in DriverKit headers, over the virtual MI50
+$CXX -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -Wno-unused-parameter -I $HERE/test/fake_driverkit -o $OUT/t_dext $HERE/test/t_dext.cpp \
+  $MI50/MI50Dext.cpp $MI50/MI50Device.cpp
+$OUT/t_dext $FW
+# the ATOM interpreter against Linux's own atom.c, compiled unmodified. A copy sits in $OUT so its #include "amdgpu.h" finds the test shim
+# instead of the real header next to it; -ftrivial-auto-var-init=zero: see test/t_atom_diff.cpp.
+SAN=(-g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all)
+LINC=(-I $HERE/test/linux_atom_shim -I $LINUX/include -I $LINUX/amdgpu)
+cp $LINUX/amdgpu/atom.c $OUT/atom.c
+clang -std=gnu11 $SAN -ftrivial-auto-var-init=zero -w $LINC -c $OUT/atom.c -o $OUT/linux_atom.o
+clang++ -std=gnu++17 $SAN -w $LINC -c $HERE/test/oracle_wrap.cpp -o $OUT/oracle_wrap.o
+$CXX $SAN -o $OUT/t_atom_diff $HERE/test/t_atom_diff.cpp $OUT/oracle_wrap.o $OUT/linux_atom.o
+$OUT/t_atom_diff 20000

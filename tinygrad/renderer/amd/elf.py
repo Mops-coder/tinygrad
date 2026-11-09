@@ -13,6 +13,8 @@ from tinygrad.runtime.autogen.amd.cdna.ins import s_nop as s_nop_cdna
 
 _arch_map = {"gfx9": "cdna", "gfx10": "rdna3", "gfx11": "rdna3", "gfx12": "rdna4"}
 def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
+  if arch.split(":", 1)[0] == "gfx906":
+    raise NotImplementedError("gfx906 requires HIP/LLVM compilation; this assembler has no Vega 20 ISA backend")
   insts = [u.arg for u in lin.src]
 
   # ** scan for max vgpr/sgpr/accvgpr

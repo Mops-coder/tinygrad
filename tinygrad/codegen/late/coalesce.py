@@ -3,7 +3,7 @@ from collections import defaultdict
 from tinygrad.dtype import dtypes, AddrSpace, Invalid, DType
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat, GroupOp, shape_to_shape_arg, graph_rewrite
 from tinygrad.uop.symbolic import uop_given_valid, parse_valid, invalid_gate, sym
-from tinygrad.helpers import getenv, IMAGE, OSX, ceildiv, is_image_shape
+from tinygrad.helpers import getenv, IMAGE, OSX, ceildiv, is_image_shape, MI50_PREFETCH_TAG
 from tinygrad.renderer import Renderer
 
 # ***** image load valid simplification *****
@@ -112,6 +112,12 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
       buf, idx_u = u.src[0].src
       if buf.addrspace == AddrSpace.REG: continue
+      # Keep packed prefetch loads scalar: vector pointer casts discard their alias/alignment type.
+      view = buf
+      while view.op is Ops.AFTER: view = view.src[0]
+      if (u.op is Ops.LOAD and view.op is Ops.BITCAST and view.tag == MI50_PREFETCH_TAG
+          and view.addrspace is AddrSpace.GLOBAL and view.dtype == dtypes.uint
+          and view.src[0].op is Ops.PARAM and view.src[0].dtype == dtypes.half): continue
       idx, valid = idx_u.get_idx(), idx_u.get_valid()
       root_src: UOp|str
       if idx.op is Ops.ADD and idx.src[1].op is Ops.CONST: root_src, arg = idx.src[0], idx.src[1].val

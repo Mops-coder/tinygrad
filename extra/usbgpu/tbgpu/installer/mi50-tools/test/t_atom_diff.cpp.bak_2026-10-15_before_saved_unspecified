@@ -1,0 +1,260 @@
+// t_atom_diff.cpp - differential test of the TinyGPU driver's ATOM interpreter (atom_interp.h) against Linux's own (atom.c, unmodified):
+// thousands of random, well-formed ATOM BIOS images run on both; every register read and write, delay, return code, parameter and FB scratch
+// dword must be identical.
+// Programs always terminate: jumps and switch cases go forward to instruction boundaries, CALLTABLE only to later tables. They stay away from
+// what C leaves undefined (shift counts >= 32, IIO masks of width 0) and from the port's documented, fail-closed deviations (reads past the
+// image, the FB dword just past the scratch buffer, the total-time deadline).
+// usage: t_atom_diff [programs] [seed]
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+#include "../../TinyGPUDriverExtension/MI50/atom_interp.h"
+#include "oracle_wrap.h"
+
+struct Rng {
+  uint64_t s;
+  uint32_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)s; }
+  uint32_t below(uint32_t n) { return n ? next() % n : 0; }
+  bool pct(uint32_t p) { return below(100) < p; }
+};
+
+constexpr uint32_t IMG = 0x40000, HDR = 0x100, MDT = 0x200, CMT = 0x400, IIOB = 0x7000, DATA0 = 0x8000, TBL0 = 0x1000, TBL_STRIDE = 0x800,
+  NTBL = 8, SCRATCH = 0x5000;
+
+// ---- one random image ----
+struct Ins { std::vector<uint8_t> b; std::vector<std::pair<size_t, int>> patches; };   // (byte offset in b of a u16 target, target instruction)
+struct Gen {
+  Rng &r; int cur_tbl; int nins;
+  explicit Gen(Rng &rng, int t, int n) : r(rng), cur_tbl(t), nins(n) {}
+  void u8(Ins &i, uint32_t v) { i.b.push_back((uint8_t)v); }
+  void u16(Ins &i, uint32_t v) { u8(i, v & 0xff); u8(i, (v >> 8) & 0xff); }
+  void u32(Ins &i, uint32_t v) { u16(i, v & 0xffff); u16(i, v >> 16); }
+  uint32_t reg() { static const uint32_t R[] = {0, 1, 2, 3, 6, 0x10, 0x11, 0x20, 0x40, 0x53, 0x5a, 0x100, 0x1234}; return r.pct(80) ? R[r.below(13)] : r.below(0x400); }
+  uint32_t ws_idx(bool dst) {
+    if (r.pct(30)) { uint32_t w = 0x40 + r.below(9); if (dst && (w == 0x43 || w == 0x46)) w = 0x40; return w; }   // never WS_SHIFT or WS_FB_WINDOW as a destination (C shift UB / the FB wrap, see atom_interp.h)
+    return r.below(10);
+  }
+  void dst(Ins &i, uint32_t arg) {
+    switch (arg) { case 0: u16(i, reg()); break; case 1: u8(i, r.below(20)); break; case 2: u8(i, ws_idx(true)); break; case 3: u8(i, r.below(64)); break;
+                   default: u8(i, r.below(8)); }
+  }
+  void src(Ins &i, uint32_t attr) {
+    uint32_t arg = attr & 7, al = (attr >> 3) & 7;
+    switch (arg) {
+      case 0: u16(i, reg()); break; case 1: u8(i, r.below(20)); break; case 2: u8(i, ws_idx(false)); break; case 3: u8(i, r.below(64)); break;
+      case 4: u16(i, r.below(0x7000)); break;
+      case 5: if (al == 0) u32(i, r.next()); else if (al <= 3) u16(i, r.next()); else u8(i, r.next()); break;
+      default: u8(i, r.below(8));
+    }
+  }
+  uint32_t attr_any() { return r.next() & 0xff; }
+  int near(int idx) { int left = std::max(1, nins - idx); return idx + 1 + (int)(r.pct(80) ? r.below(std::min(2, left)) : r.below(left)); }   // mostly the next instruction or the one after
+  Ins make(int idx) {
+    Ins i;
+    uint32_t op;
+    int pick = r.below(30);
+    auto group = [&](uint32_t first) { uint32_t a = r.below(6); op = first + a; return a; };   // A6 order: REG PS WS FB PLL MC
+    static const uint32_t A6[6] = {0, 1, 2, 3, 6, 7};
+    auto dst_src = [&](uint32_t first) { uint32_t a = A6[group(first)]; u8(i, op); uint32_t at = attr_any(); u8(i, at); dst(i, a); src(i, at); };
+    switch (pick) {
+      case 0: case 1: case 2: dst_src(1); break;                        // move
+      case 3: dst_src(7); break; case 4: dst_src(13); break;            // and, or
+      case 5: case 6: { uint32_t a = A6[group(r.pct(50) ? 19 : 25)]; u8(i, op); u8(i, attr_any()); dst(i, a); u8(i, r.below(32)); break; }   // shift_left/right
+      case 7: dst_src(31); break; case 8: dst_src(37); break;           // mul, div
+      case 9: dst_src(43); break; case 10: dst_src(49); break;          // add, sub
+      case 11: { u8(i, 55 + r.below(3)); if (i.b[0] == 55) u16(i, r.below(6)); else u8(i, r.below(256)); break; }   // setport ATI / PCI / SYSIO
+      case 12: u8(i, 58); u16(i, r.below(0x200)); break;                // setregblock
+      case 13: { u8(i, 59); u8(i, 0x05); u32(i, 4 * r.below(0x1440) + 2); break; }   // setfbbase: IMM dword 4k+2 below 0x5100 (no uint32 wrap, never == the scratch size; see atom_interp.h)
+      case 14: dst_src(60); break; case 15: dst_src(74); break;         // compare, test
+      case 16: {                                                        // switch: forward cases
+        u8(i, 66); uint32_t at = attr_any(); u8(i, at); src(i, at);
+        uint32_t al = (at >> 3) & 7; int n = r.below(4);
+        for (int k = 0; k < n; k++) {
+          u8(i, 0x63);
+          if (al == 0) u32(i, r.pct(30) ? r.below(4) : r.next()); else if (al <= 3) u16(i, r.below(4)); else u8(i, r.below(4));
+          i.patches.push_back({i.b.size(), near(idx)}); u16(i, 0);
+        }
+        u16(i, 0x5A5A); break;
+      }
+      case 17: case 18: { u8(i, 67 + r.below(7)); i.patches.push_back({i.b.size(), near(idx)}); u16(i, 0); break; }   // jump
+      case 19: u8(i, 80 + r.below(2)); u8(i, r.below(20)); break;      // delay ms / us
+      case 20: { u8(i, 82); u8(i, r.pct(70) ? (cur_tbl + 1 + r.below(NTBL)) : NTBL + r.below(256 - NTBL)); break; }   // calltable: later tables or absent ones (no recursion)
+      case 21: dst_src(92); break;                                       // mask: attr, dst, mask, src
+      case 22: { uint32_t a = A6[group(84)]; u8(i, op); u8(i, attr_any()); dst(i, a); break; }          // clear
+      case 23: { static const uint32_t S[] = {90, 98, 99, 83, 100, 101, 121}; u8(i, S[r.below(7)]); if (i.b[0] == 98 || i.b[0] == 121) u8(i, r.below(256)); break; }
+      case 24: { u8(i, 102); uint32_t v = r.below(4); u8(i, v == 0 ? 0 : v == 1 ? 255 : 1 + r.below(60)); break; }   // setdatablock
+      case 25: dst_src(103); break;                                      // xor
+      case 26: { uint32_t a = A6[group(r.pct(50) ? 109 : 115)]; u8(i, op); uint32_t at = 0x25 | (r.below(4) << 6); u8(i, at); dst(i, a); u8(i, r.below(32)); break; }   // shl / shr
+      case 27: { u8(i, 122); uint32_t n = r.below(8); u16(i, n); for (uint32_t k = 0; k < n; k++) u8(i, r.next()); break; }   // processds
+      case 28: { op = 123 + r.below(2); u8(i, op); uint32_t at = attr_any(); u8(i, at); dst(i, op == 123 ? 1 : 2); src(i, at); break; }   // mul32 PS/WS
+      default: { op = 125 + r.below(2); u8(i, op); uint32_t at = attr_any(); u8(i, at); dst(i, op == 125 ? 1 : 2); src(i, at); break; }   // div32
+    }
+    // mask carries an extra direct operand between dst and src: rebuild it properly
+    if (i.b[0] >= 92 && i.b[0] <= 97) {
+      Ins m; uint32_t a = A6[i.b[0] - 92]; u8(m, i.b[0]); uint32_t at = attr_any(); u8(m, at); dst(m, a);
+      uint32_t al = (at >> 3) & 7;
+      if (al == 0) u32(m, r.next()); else if (al <= 3) u16(m, r.next()); else u8(m, r.next());
+      src(m, at); return m;
+    }
+    return i;
+  }
+};
+
+static std::vector<uint8_t> build(Rng &r) {
+  std::vector<uint8_t> img(IMG, 0);
+  auto w16 = [&](uint32_t o, uint32_t v) { img[o] = v & 0xff; img[o + 1] = (v >> 8) & 0xff; };
+  img[0] = 0x55; img[1] = 0xAA; img[2] = 0x80; memcpy(&img[0x30], " 761295520", 10); w16(0x48, HDR);
+  memcpy(&img[HDR + 4], "ATOM", 4); w16(HDR + 0x1E, CMT); w16(HDR + 0x20, MDT);
+  memcpy(&img[0x80], "113-D1631700-111", 16);   // part number (Linux atom_get_vbios_pn reads through NULL without one)
+  for (uint32_t o = DATA0; o < 0x10000; o++) img[o] = (uint8_t)r.next();          // data the ID operands and data blocks point at
+  for (uint32_t k = 0; k < 80; k++) w16(MDT + 4 + 2 * k, DATA0 + r.below(0x7F00));
+  w16(MDT + 0x32, IIOB - 4);                                                        // ATOM_DATA_IIO_PTR -> IIO methods at IIOB
+  // IIO methods 0..5 (well-formed: widths 1..32, shifts 0..31)
+  uint32_t p = IIOB;
+  static const uint32_t IIO_IDX[] = {0, 1, 2, 3, 4, 5, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85};   // reads use iio[io_mode & 0x7F], writes iio[io_mode & 0xFF]
+  for (uint32_t m : IIO_IDX) {
+    if (r.pct(25)) continue;
+    img[p++] = 1; img[p++] = (uint8_t)m;
+    int n = 1 + r.below(8);
+    for (int k = 0; k < n; k++) {
+      uint32_t op = r.below(9);
+      if (op == 1) op = 0;   // START is not an op inside a method
+      img[p++] = (uint8_t)op;
+      if (op == 2 || op == 3) { w16(p, r.below(0x60)); p += 2; }
+      else if (op == 4 || op == 5) { img[p++] = (uint8_t)(1 + r.below(32)); img[p++] = (uint8_t)r.below(32); }
+      else if (op >= 6) { img[p++] = (uint8_t)(1 + r.below(32)); img[p++] = (uint8_t)r.below(32); img[p++] = (uint8_t)r.below(32); }
+    }
+    img[p++] = 9; img[p++] = 0; img[p++] = 0;   // IIO_END + 2 bytes
+  }
+  img[p] = 0;
+  // command tables
+  for (uint32_t t = 0; t < NTBL; t++) {
+    if (t > 0 && r.pct(15)) continue;
+    uint32_t base = TBL0 + t * TBL_STRIDE;
+    w16(CMT + 4 + 2 * t, base);
+    int nins = 3 + r.below(40);
+    Gen g(r, (int)t, nins);
+    std::vector<Ins> ins;
+    for (int k = 0; k < nins; k++) ins.push_back(g.make(k));
+    std::vector<uint32_t> off(nins + 1);
+    uint32_t pos = 6;
+    for (int k = 0; k < nins; k++) { off[k] = pos; pos += (uint32_t)ins[k].b.size(); }
+    off[nins] = pos;   // the EOT
+    if (pos + 1 > TBL_STRIDE) { fprintf(stderr, "generator: table %u is %u bytes, over %u\n", t, pos + 1, TBL_STRIDE); exit(2); }
+    for (int k = 0; k < nins; k++)
+      for (auto &pt : ins[k].patches) { uint32_t tgt = off[std::min(pt.second, nins)]; ins[k].b[pt.first] = tgt & 0xff; ins[k].b[pt.first + 1] = tgt >> 8; }
+    uint32_t q = base + 6;
+    for (int k = 0; k < nins; k++) { memcpy(&img[q], ins[k].b.data(), ins[k].b.size()); q += (uint32_t)ins[k].b.size(); }
+    img[q++] = r.pct(10) ? (uint8_t)(r.pct(50) ? 0 : 127 + r.below(129)) : 91;   // EOT, or an opcode 0 / >= ATOM_OP_CNT that ends the table
+    w16(base, q - base); img[base + 2] = 1; img[base + 3] = 1; img[base + 4] = (uint8_t)r.below(7); img[base + 5] = (uint8_t)(r.below(2) * 4);   // PS shift 0/1: nested windows never pass the 16-dword parameter array (see atom_interp.h)
+  }
+  return img;
+}
+
+// ---- the two runs ----
+struct Ev { char k; uint32_t a, b; bool operator==(const Ev &o) const { return k == o.k && a == o.a && b == o.b; } };
+struct Run { std::vector<Ev> tr; std::map<uint32_t, uint32_t> regs; };
+static Run *cur;
+static uint32_t reg_init(uint32_t i) { return (i * 2654435761u) ^ 0x5a5a5a5au; }
+static uint32_t c_rd(uint32_t i) { auto it = cur->regs.find(i); uint32_t v = it == cur->regs.end() ? reg_init(i) : it->second; cur->tr.push_back({'R', i, v}); return v; }
+static void c_wr(uint32_t i, uint32_t v) { cur->regs[i] = v; cur->tr.push_back({'W', i, v}); }
+static void c_delay(int ms, unsigned n) { cur->tr.push_back({ms ? 'm' : 'u', n, 0}); }
+static uint64_t fake_ns = 0;
+static uint32_t p_rd(void *, uint32_t i) { return c_rd(i); }
+static void p_wr(void *, uint32_t i, uint32_t v) { c_wr(i, v); }
+static void p_dus(void *, uint32_t us) { c_delay(0, us); }
+static void p_dms(void *, uint32_t ms) { c_delay(1, ms); }
+static uint64_t p_now(void *) { return fake_ns += 1000; }
+static void p_log(void *, const char *) {}
+
+int main(int argc, char **argv) {
+  int N = argc > 1 ? atoi(argv[1]) : 5000;
+  Rng rng{argc > 2 ? strtoull(argv[2], nullptr, 0) : 0x9e3779b97f4a7c15ull};
+  oracle_io = {c_rd, c_wr, c_delay};
+  int fails = 0, ran = 0; long events = 0; std::map<int, int> rc_hist;
+  atom_ctx *g = (atom_ctx *)calloc(1, sizeof(atom_ctx));
+  {   // directed: table 0 calls itself with PS shift 0 -> nesting reaches ATOM_EXECUTE_MAX_DEPTH (-ELOOP), every level above aborts (-EINVAL)
+    Rng r0{1};
+    std::vector<uint8_t> img = build(r0);
+    const uint8_t code[] = {82, 0, 91};
+    memcpy(&img[TBL0 + 6], code, sizeof(code));
+    img[TBL0] = 6 + sizeof(code); img[TBL0 + 1] = 0; img[TBL0 + 4] = 0; img[TBL0 + 5] = 0;
+    uint32_t pa_[16] = {}, pb_[16] = {};
+    Run a, b;
+    std::vector<uint32_t> sa(SCRATCH / 4 + 4, 0);
+    atom_card card = {nullptr, p_rd, p_wr, p_dus, p_dms, p_now, p_log};
+    cur = &a; int ra = atom_parse(g, &card, img.data(), IMG, sa.data(), SCRATCH) ? 999 : atom_execute_table(g, 0, pa_, 16);
+    cur = &b; void *o = oracle_parse(img.data(), IMG, SCRATCH, 4); int rb = o ? oracle_execute(o, 0, pb_, 16) : 998;
+    bool ok = ra == rb && ra == -22 && a.tr == b.tr;
+    printf("%s recursion: port %d, linux %d (ATOM_EXECUTE_MAX_DEPTH -> -ELOOP inside, -EINVAL at the top)\n", ok ? "ok  " : "FAIL", ra, rb);
+    if (!ok) fails++;
+    if (o) oracle_destroy(o);
+  }
+  {   // directed: an indexed IIO method whose END sits in the image's last bytes -> execution stops at "runs past BIOS image", reads as 0
+    Rng r0{2};
+    std::vector<uint8_t> img = build(r0);
+    const uint8_t method[] = {1, 7, 2, 0x10, 0x00, 9};   // IIO_START 7: READ reg 0x10; END at the last byte
+    memcpy(&img[IMG - sizeof(method)], method, sizeof(method));
+    img[MDT + 0x32] = (uint8_t)((IMG - sizeof(method) - 4) & 0xff); img[MDT + 0x33] = (uint8_t)((IMG - sizeof(method) - 4) >> 8);
+    // ATOM_DATA_IIO_PTR is a u16: the method must lie below 64 KiB + 4 -> use a 64 KiB image for this case
+    std::vector<uint8_t> small(img.begin(), img.begin() + 0x10000);
+    memcpy(&small[0x10000 - sizeof(method)], method, sizeof(method));
+    uint32_t iio = 0x10000 - sizeof(method) - 4;
+    small[MDT + 0x32] = iio & 0xff; small[MDT + 0x33] = iio >> 8;
+    const uint8_t code[] = {55, 7, 0, 2, 0x00, 0, 0x10, 0x00, 91};   // SETPORT ATI 7; MOVE PS[0] = REG[0x10] (through IIO method 7); EOT
+    memcpy(&small[TBL0 + 6], code, sizeof(code));
+    small[TBL0] = 6 + sizeof(code); small[TBL0 + 1] = 0; small[TBL0 + 4] = 0; small[TBL0 + 5] = 0;
+    uint32_t pa_[16] = {1, 2}, pb_[16] = {1, 2};
+    Run a, b;
+    std::vector<uint32_t> sa(SCRATCH / 4 + 4, 0);
+    atom_card card = {nullptr, p_rd, p_wr, p_dus, p_dms, p_now, p_log};
+    cur = &a; int ra = atom_parse(g, &card, small.data(), 0x10000, sa.data(), SCRATCH) ? 999 : atom_execute_table(g, 0, pa_, 16);
+    cur = &b; void *o = oracle_parse(small.data(), 0x10000, SCRATCH, 4); int rb = o ? oracle_execute(o, 0, pb_, 16) : 998;
+    bool ok = ra == rb && ra == 0 && a.tr == b.tr && pa_[0] == pb_[0] && pa_[0] == 0 && a.tr.size() == 1;
+    printf("%s IIO method running into the image end: port %d / PS[0] %u, linux %d / PS[0] %u, %zu register events\n", ok ? "ok  " : "FAIL", ra, pa_[0], rb,
+           pb_[0], a.tr.size());
+    if (!ok) fails++;
+    if (o) oracle_destroy(o);
+  }
+  for (int n = 0; n < N; n++) {
+    std::vector<uint8_t> img = build(rng);
+    uint32_t params0[16]; for (auto &x : params0) x = rng.pct(50) ? rng.below(8) : rng.next();
+    // the port
+    Run a; cur = &a;
+    std::vector<uint32_t> scratch_a(SCRATCH / 4 + 4, 0);
+    atom_card card = {nullptr, p_rd, p_wr, p_dus, p_dms, p_now, p_log};
+    int pa = atom_parse(g, &card, img.data(), IMG, scratch_a.data(), SCRATCH);
+    uint32_t pa_params[16]; memcpy(pa_params, params0, sizeof(pa_params));
+    bool asic = n & 1;   // odd programs: amdgpu_atom_asic_init (firmwareinfo boot clocks into PS[0..1], table 0)
+    int ra = pa ? 1000 + pa : asic ? atom_asic_init(g) : atom_execute_table(g, 0, pa_params, 16);
+    // Linux
+    Run b; cur = &b;
+    void *o = oracle_parse(img.data(), IMG, SCRATCH, 4);
+    uint32_t pb_params[16]; memcpy(pb_params, params0, sizeof(pb_params));
+    int rb = o ? (asic ? oracle_asic_init(o) : oracle_execute(o, 0, pb_params, 16)) : 1000 - 22;
+    bool same = ra == rb && a.tr == b.tr && memcmp(pa_params, pb_params, sizeof(pa_params)) == 0 &&
+                (!o || memcmp(scratch_a.data(), oracle_scratch(o), SCRATCH) == 0);
+    if (!same) {
+      fails++;
+      if (fails <= 5) {
+        size_t i = 0; while (i < a.tr.size() && i < b.tr.size() && a.tr[i] == b.tr[i]) i++;
+        printf("MISMATCH program %d: rc port %d linux %d, trace %zu/%zu events, first difference at %zu", n, ra, rb, a.tr.size(), b.tr.size(), i);
+        if (i < a.tr.size()) printf(" port %c %x %x", a.tr[i].k, a.tr[i].a, a.tr[i].b);
+        if (i < b.tr.size()) printf(" linux %c %x %x", b.tr[i].k, b.tr[i].a, b.tr[i].b);
+        printf("%s%s\n", memcmp(pa_params, pb_params, sizeof(pa_params)) ? " params differ" : "",
+               o && memcmp(scratch_a.data(), oracle_scratch(o), SCRATCH) ? " scratch differs" : "");
+      }
+    }
+    if (o) oracle_destroy(o);
+    ran++; events += (long)a.tr.size(); rc_hist[ra]++;
+  }
+  free(g);
+  printf("%d programs, %ld register/delay events compared, %d mismatches; return codes:", ran, events, fails);
+  for (auto &h : rc_hist) printf(" %d x%d", h.first, h.second);
+  printf("\n");
+  return fails ? 1 : 0;
+}

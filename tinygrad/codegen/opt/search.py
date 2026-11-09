@@ -63,7 +63,8 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
   ret = None
   try:
     st = time.perf_counter()
-    ast, dev = x[1].copy().get_optimized_ast(name_override="test"), x[1].ren.target.device
+    ast = x[1].copy().get_optimized_ast(name_override="test")
+    dev = getattr(x[1].ren, "runtime_device", None) or x[1].ren.target.device
     prg = to_program(ast.substitute({p: p.replace(arg=replace(p.arg, device=dev)) for p in ast.toposort() if p.op is Ops.PARAM}), x[1].ren)
     et = time.perf_counter() - st
     uops = prg.src[1].src
@@ -109,7 +110,8 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
 
 BEAM_DEBUG = getenv("BEAM_DEBUG")
 def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:int, allow_test_size=True, disable_cache=IGNORE_BEAM_CACHE.value):
-  key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.target.device, "suffix": s.ren.suffix}
+  runtime_device = getattr(s.ren, "runtime_device", None) or s.ren.target.device
+  key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": runtime_device, "suffix": s.ren.suffix}
   if not disable_cache and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
     ret = s.copy()
     for o in val[len(s.applied_opts):]: ret.apply_opt(o)
@@ -129,7 +131,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
   try:
     rawbufs = _ensure_buffer_alloc(rawbufs)
     exiting, st = False, time.perf_counter()
-    dev = Device[s.ren.target.device]
+    dev = Device[runtime_device]
     while not exiting:
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       timed: list[tuple[Scheduler, float]] = []

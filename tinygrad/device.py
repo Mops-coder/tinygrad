@@ -17,7 +17,12 @@ class _Device:
     self._devices = [x.stem[len("ops_"):].upper() for x in (pathlib.Path(__file__).parent/"runtime").iterdir() if x.stem.startswith("ops_")]
     self._opened_devices:set[str] = set()
   @functools.cache  # this class is a singleton, pylint: disable=method-cache-max-size-none
-  def _canonicalize(self, device:str) -> str: return re.sub(r":0$", "", (d:=device.split(":", 1)[0].upper()) + device[len(d):])
+  def _canonicalize(self, device:str) -> str:
+    # mi50: a card named by its PCI ID "vvvv:dddd" (the IDs tinygrad reads off the card) is the device tinygrad lists that card as, e.g. "AMD:1"
+    if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}", device):
+      from tinygrad.runtime.support.system import System
+      device = System.pci_device(device)
+    return re.sub(r":0$", "", (d:=device.split(":", 1)[0].upper()) + device[len(d):])
   # NOTE: you can't cache canonicalize in case Device.DEFAULT changes
   def canonicalize(self, device:str|None) -> str: return self._canonicalize(device if device is not None else Device.DEFAULT)
   def __getitem__(self, ix:str) -> Compiled:
@@ -372,6 +377,8 @@ class Compiled:
     assert (rn:=next((self._renderer_name(r) for r in self.renderers if getenv(f"{self.device}_{self._renderer_name(r)}")), None)) is None, \
       f"{self.device}_{rn}=1 is deprecated, use DEV={self.device}:{rn} or {self.device}_CC={rn} instead"
     t = DEV.target(self.device.split(':')[0], **({"arch":self.arch} if self.arch else {}))
+    if self.device.split(":")[0] == "AMD" and self.arch == "gfx906" and t.arch.split(":", 1)[0] != "gfx906":
+      raise RuntimeError(f"MI50 requires a gfx906 compiler target, got {t.arch!r}")
     return select_first_inited(select_by_name(self.renderers, self._renderer_name, t.renderer, f"{self.device} has no renderer {t.renderer!r}"),
                                f"No renderer for {self.device} is available", self.cached_renderer, t)
 

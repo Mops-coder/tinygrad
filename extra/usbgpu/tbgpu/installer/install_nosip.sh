@@ -48,5 +48,12 @@ fi
 cp -r "$APP_PATH" /Applications/
 echo "Installed to /Applications/TinyGPU.app"
 
+# MI50: the overdrive file's folder (egpu_vega20.write_overdrive_file writes it as an admin user, MI50BarFix.kext reads it): root:admin 0775
+OD_DIR="/Library/Application Support/TinyGPU"
+sudo mkdir -p "$OD_DIR"
+sudo chown root:admin "$OD_DIR"
+sudo chmod 0775 "$OD_DIR"
+echo "Overdrive folder: $OD_DIR (root:admin 0775)"
+
 echo "Activating driver extension..."
 /Applications/TinyGPU.app/Contents/MacOS/TinyGPU install

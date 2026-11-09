@@ -3,6 +3,7 @@ from typing import Iterable, Literal
 from tinygrad.helpers import to_mv, data64, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.amd import import_soc
+from tinygrad.runtime.support.am import vbios
 from tinygrad.runtime.support.memory import AddrSpace
 
 class AM_IP:
@@ -42,6 +43,7 @@ class AM_SOC(AM_IP):
     if self.adev.ip_ver[am.HDP_HWIP] >= (5,2,1): self.adev.regHDP_MEM_POWER_CTRL.update(atomic_mem_power_ctrl_en=1, atomic_mem_power_ds_en=1)
 
   def doorbell_enable(self, port, awid=0, awaddr_31_28_value=0, offset=0, size=0, aid=0):
+    if self.adev.ip_ver[am.NBIO_HWIP] == (7,4,0): return # mi50: no S2A doorbell ports on NBIO 7.4
     reg = self.adev.reg(f"{'regGDC_S2A0_S2A' if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else 'regS2A'}_DOORBELL_ENTRY_{port}_CTRL")
     val = reg.encode(**{f"s2a_doorbell_port{port}_enable":1, f"s2a_doorbell_port{port}_awid":awid,  f"s2a_doorbell_port{port}_range_size":size,
       f"s2a_doorbell_port{port}_awaddr_31_28_value":awaddr_31_28_value, f"s2a_doorbell_port{port}_range_offset":offset})
@@ -176,8 +178,19 @@ class AM_GMC(AM_IP):
     return pte & (am.AMDGPU_PDE_PTE_GFX12 if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else am.AMDGPU_PDE_PTE)
 
 class AM_SMU(AM_IP):
+  class ResponseError(RuntimeError): pass  # Vega 20 mailbox answered with a PPSMC_Result_* other than OK (vega20_ppsmc.h:30-34)
+  # PMSTATUSLOG buffer: `tools_size = 0x19000` vega20_smumgr.c:421, allocated :467-479, handed to the SMU by vega20_set_tools_address :375-394
+  VEGA20_TOOLS_SIZE = 0x19000
+
+  def _vega20(self) -> bool: return self.adev.ip_ver[am.MP1_HWIP] == (11,0,2)
+  def _vega20_only(self, what:str):
+    if not self._vega20():
+      raise RuntimeError(f"am {self.adev.devfmt}: AM_SMU.{what} is implemented for Vega 20 (MP1 11.0.2) only, "
+                         f"this is MP1 {self.adev.ip_ver[am.MP1_HWIP]}")
+
   def init_sw(self):
     self.smu_mod = self.adev._ip_module("smu", am.MP1_HWIP)
+    if self._vega20(): return self._vega20_smu_init()
     self.driver_table_paddr = self.adev.mm.palloc(0x4000, zero=False, boot=True)
 
   def init_hw(self):
@@ -189,6 +202,149 @@ class AM_SMU(AM_IP):
     with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_GetSmuVersion, 0, timeout=100)
     return self.adev.mmMP1_SMN_C2PMSG_90.read() != 0
 
+  # ---- Vega 20 powerplay, ported from Linux pm/powerplay (smumgr/vega20_smumgr.c, hwmgr/vega20_hwmgr.c, vega20_processpptables.c,
+  # vega20_thermal.c, vega20_powertune.c, hwmgr.c, hardwaremanager.c, ppatomfwctrl.c). Line numbers refer to those files. ----
+  def _vega20_smu_init(self):
+    """vega20_smu_init (vega20_smumgr.c:418-553): one PAGE_SIZE-aligned VRAM buffer per SMU table. smu_v11_0_i2c_control_init (:542) only registers a
+    Linux i2c adapter object (smu_v11_0_i2c.c:727-753, no register access) and has no counterpart here."""
+    m = self.smu_mod
+    self._vega20_results = {v: k for k, v in vars(m).items() if k.startswith("PPSMC_Result_")}  # vega20_ppsmc.h:30-34 names for errors
+    self.vega20_tables = {tid: (self.adev.mm.palloc(size, align=0x1000, zero=False, boot=True), size) for tid, size in (
+      (m.TABLE_PPTABLE, ctypes.sizeof(m.PPTable_t)), (m.TABLE_WATERMARKS, ctypes.sizeof(m.Watermarks_t)),
+      (m.TABLE_PMSTATUSLOG, self.VEGA20_TOOLS_SIZE), (m.TABLE_OVERDRIVE, ctypes.sizeof(m.OverDriveTable_t)),
+      (m.TABLE_SMU_METRICS, ctypes.sizeof(m.SmuMetrics_t)), (m.TABLE_ACTIVITY_MONITOR_COEFF, ctypes.sizeof(m.DpmActivityMonitorCoeffInt_t)))}
+
+  def _vega20_pptable_init(self):
+    """vega20_pp_tables_initialize (vega20_processpptables.c:323-350): get_powerplay_table + check_powerplay_tables (vbios.VBIOS.powerplay),
+    set_platform_caps (:93-115), init_powerplay_table_information (:238-321) incl. append_vbios_pptable (:126-196); not Linux's fan target override
+    (:198-206): the table's own FanTargetTemperature stays (Leon 2026-10-17: the V420 tables verbatim, no override of the cooling values).
+    mi50: the soft PowerPlay table when one is set (vbios.VBIOS.powerplay)."""
+    pp = self.adev.vbios.powerplay()
+    caps = self.vega20_caps = set()
+    # review P-01: set_platform_caps (vega20_processpptables.c:93-115) maps these four (vega20_pptable.h:31-36: 0x4 is HARDWAREDC, not mapped)
+    for bit, cap in ((0x1, "PowerPlaySupport"), (0x2, "BiosPowerSourceControl"), (0x8, "BACO"), (0x10, "BAMACO")):
+      if pp.ulPlatformCaps & bit: caps.add(cap)
+    if pp.ucThermalControllerType != 0: caps.add("ThermalController")   # ATOM_VEGA20_PP_THERMALCONTROLLER_NONE 0 (vega20_pptable.h:28); :244-246
+    caps.add("MicrocodeFanControl")                                     # :248
+    info = self.vega20_pptable_info = {"od_feature_capabilities": [], "od_settings_max": [], "od_settings_min": []}
+    od = pp.OverDrive8Table
+    if od.ucODTableRevision == 1:   # :250-273
+      nf, ns = min(od.ODFeatureCount, len(vbios.ATOM_VEGA20_ODFEATURE)), min(od.ODSettingCount, len(vbios.ATOM_VEGA20_ODSETTING))
+      info["od_feature_capabilities"] = [od.ODFeatureCapabilities[i] & 0xff for i in range(nf)]          # copy_overdrive_feature_capabilities_array
+      if any(info["od_feature_capabilities"]): caps.add("ACOverdriveSupport")
+      info["od_settings_max"] = [od.ODSettingsMax[i] for i in range(ns)]                                  # phm_copy_overdrive_settings_limits_array
+      info["od_settings_min"] = [od.ODSettingsMin[i] for i in range(ns)]
+    for k in ("SmallPowerLimit1", "SmallPowerLimit2", "BoostPowerLimit", "ODTurboPowerLimit", "ODPowerSavePowerLimit", "SoftwareShutdownTemp"):
+      info["us_" + k] = getattr(pp, "us" + k)   # :275-282
+    self.vega20_tdp_od_limit = od.ODSettingsMax[vbios.ATOM_VEGA20_ODSETTING.index("POWERPERCENTAGE")]   # :284
+    if self.vega20_tdp_od_limit: caps.add("PowerControl")                                               # :286-289
+    pt = self.vega20_smc_pptable = self.smu_mod.PPTable_t.from_buffer_copy(bytes(pp.smcPPTable))       # :307-310 kmemdup
+    d = self.adev.vbios.smc_dpm_info()                                                                   # append_vbios_pptable :126-196
+    for dst, src in (("MaxVoltageStepGfx", "maxvoltagestepgfx"), ("MaxVoltageStepSoc", "maxvoltagestepsoc"), ("VddGfxVrMapping", "vddgfxvrmapping"),
+        ("VddSocVrMapping", "vddsocvrmapping"), ("VddMem0VrMapping", "vddmem0vrmapping"), ("VddMem1VrMapping", "vddmem1vrmapping"),
+        ("GfxUlvPhaseSheddingMask", "gfxulvphasesheddingmask"), ("SocUlvPhaseSheddingMask", "soculvphasesheddingmask"),
+        ("ExternalSensorPresent", "externalsensorpresent"), ("GfxMaxCurrent", "gfxmaxcurrent"), ("GfxOffset", "gfxoffset"),
+        ("Padding_TelemetryGfx", "padding_telemetrygfx"), ("SocMaxCurrent", "socmaxcurrent"), ("SocOffset", "socoffset"),
+        ("Padding_TelemetrySoc", "padding_telemetrysoc"), ("Mem0MaxCurrent", "mem0maxcurrent"), ("Mem0Offset", "mem0offset"),
+        ("Padding_TelemetryMem0", "padding_telemetrymem0"), ("Mem1MaxCurrent", "mem1maxcurrent"), ("Mem1Offset", "mem1offset"),
+        ("Padding_TelemetryMem1", "padding_telemetrymem1"), ("AcDcGpio", "acdcgpio"), ("AcDcPolarity", "acdcpolarity"), ("VR0HotGpio", "vr0hotgpio"),
+        ("VR0HotPolarity", "vr0hotpolarity"), ("VR1HotGpio", "vr1hotgpio"), ("VR1HotPolarity", "vr1hotpolarity"), ("Padding1", "padding1"),
+        ("Padding2", "padding2"), ("LedPin0", "ledpin0"), ("LedPin1", "ledpin1"), ("LedPin2", "ledpin2"),
+        ("PllGfxclkSpreadEnabled", "pllgfxclkspreadenabled"), ("PllGfxclkSpreadPercent", "pllgfxclkspreadpercent"),
+        ("PllGfxclkSpreadFreq", "pllgfxclkspreadfreq"), ("UclkSpreadPercent", "uclkspreadpercent"), ("UclkSpreadFreq", "uclkspreadfreq"),
+        ("FclkSpreadEnabled", "fclkspreadenabled"), ("FclkSpreadPercent", "fclkspreadpercent"), ("FclkSpreadFreq", "fclkspreadfreq"),
+        ("FllGfxclkSpreadEnabled", "fllgfxclkspreadenabled"), ("FllGfxclkSpreadPercent", "fllgfxclkspreadpercent"),
+        ("FllGfxclkSpreadFreq", "fllgfxclkspreadfreq")):
+      setattr(pt, dst, getattr(d, src))
+    pt.UclkSpreadEnabled = 0   # :172
+    for i in range(self.smu_mod.I2C_CONTROLLER_NAME_COUNT):   # :183-196
+      for dst, src in (("Enabled", "enabled"), ("SlaveAddress", "slaveaddress"), ("ControllerPort", "controllerport"),
+                       ("ThermalThrottler", "thermalthrottler"), ("I2cProtocol", "i2cprotocol"), ("I2cSpeed", "i2cspeed")):
+        setattr(pt.I2cControllers[i], dst, getattr(d.i2ccontrollers[i], src))
+
+  # GNLD order (vega20_hwmgr.h:49-84) -> smu11_driver_if.h FEATURE_*_BIT (vega20_init_dpm_defaults :331-389; GNLD_DIDT -> FEATURE_GFX_EDC_BIT)
+  VEGA20_GNLD = ("DPM_PREFETCHER", "DPM_GFXCLK", "DPM_UCLK", "DPM_SOCCLK", "DPM_UVD", "DPM_VCE", "ULV", "DPM_MP0CLK", "DPM_LINK", "DPM_DCEFCLK",
+    "DS_GFXCLK", "DS_SOCCLK", "DS_LCLK", "PPT", "TDC", "THERMAL", "GFX_PER_CU_CG", "RM", "DS_DCEFCLK", "ACDC", "VR0HOT", "VR1HOT", "FW_CTF",
+    "LED_DISPLAY", "FAN_CONTROL", "GFX_EDC", "GFXOFF", "CG", "DPM_FCLK", "DS_FCLK", "DS_MP1CLK", "DS_MP0CLK", "XGMI", "ECC")
+  # amdgpu_pp_feature_mask default (amdgpu_drv.c:202); PP_*_MASK (amd_shared.h:216-235). Thunderbolt-attached = removable -> PCIe dynamic switching is
+  # supported (amdgpu_device.c:1298-1309) so PP_PCIE_DPM_MASK stays (:2087-2088); KFD's default sched policy is HWS, so GFXOFF stays too (:2083-2084).
+  VEGA20_PP_FEATURE_MASK = 0xfff7bfff
+
+  def _vega20_feature(self, name:str) -> dict: return self.vega20_features[self.VEGA20_GNLD.index(name)]
+
+  def _vega20_backend_init(self):
+    """vega20_hwmgr_backend_init (vega20_hwmgr.c:433-497): vega20_set_default_registry_data (:62-174), vega20_set_features_platform_caps (:176-258;
+    only PowerContainment matters for this path and it stays unset, :246-247), vega20_init_dpm_defaults (:331-410)."""
+    m, fm = self.smu_mod, self.VEGA20_PP_FEATURE_MASK
+    disallowed = 0xE0041C00                                                       # :93-102 (GFXCLK/SOCCLK/LCLK/DCEFCLK/FCLK/MP1CLK/MP0CLK DS)
+    self.vega20_smu_version = self._send_msg(m.PPSMC_MSG_GetSmuVersion, 0, read_back_arg=True)   # :104
+    if self.vega20_smu_version < 0x282100: disallowed |= m.FEATURE_ECC_MASK                    # :105-106
+    for pp_mask, feat_mask in ((0x4, m.FEATURE_DPM_LINK_MASK), (0x1, m.FEATURE_DPM_GFXCLK_MASK), (0x1000, m.FEATURE_DPM_SOCCLK_MASK),
+                               (0x2, m.FEATURE_DPM_UCLK_MASK), (0x2000, m.FEATURE_DPM_DCEFCLK_MASK), (0x100, m.FEATURE_ULV_MASK),
+                               (0x8, m.FEATURE_DS_GFXCLK_MASK)):              # :108-127
+      if not fm & pp_mask: disallowed |= feat_mask
+    self.vega20_pcie_dpm_key_disabled = not (fm & 0x4)                           # :173
+    self.vega20_fclk_gfxclk_ratio = 0                                            # :165
+    self.vega20_caps.discard("PowerContainment")                                 # :246-247 "assume disabled"
+    self.vega20_features = [{"id": (fid:=getattr(m, f"FEATURE_{n}_BIT")), "bitmap": 1 << fid, "allowed": not ((disallowed >> i) & 1),
+                             "enabled": False, "supported": False} for i, n in enumerate(self.VEGA20_GNLD)]   # :339-396
+    top32 = self._send_msg(m.PPSMC_MSG_ReadSerialNumTop32, 0, read_back_arg=True)          # :399-401
+    bottom32 = self._send_msg(m.PPSMC_MSG_ReadSerialNumBottom32, 0, read_back_arg=True)    # :403-405
+    self.vega20_unique_id = (bottom32 << 32) | top32                                       # :407
+
+  def _vega20_bootup_values(self) -> dict:
+    fwi = self.adev.vbios.firmwareinfo()
+    b = self.vega20_boot = {"vddc": fwi.bootup_vddc_mv, "vddci": fwi.bootup_vddci_mv, "mvddc": fwi.bootup_mvddc_mv, "gfx": fwi.bootup_sclk_in10khz,
+      "mem": fwi.bootup_mclk_in10khz, "soc": 0, "dcef": 0, "e": 0, "v": 0, "d": 0, "f": 0, "cooling_id": fwi.coolingsolution_id}
+    v32 = (fwi.table_header.format_revision, fwi.table_header.content_revision) == (3, 2)
+    # v3.2: SMU11 clock ids (ppatomfwctrl.c:445-476, atomfirmware.h:3873-3895); v3.1: SMU9 ids, no FCLK (:478-511, atomfirmware.h:3856-3869)
+    for key, (clk_id, pll) in ((("soc", (1, 0)), ("dcef", (5, 0)), ("e", (0, 0)), ("v", (4, 0)), ("d", (3, 0)), ("f", (0, 3))) if v32 else
+                               (("soc", (1, 0)), ("dcef", (8, 0)), ("e", (7, 0)), ("v", (6, 0)), ("d", (5, 0)))):
+      if (f:=self._vega20_atom_clock(clk_id, pll)) is not None: b[key] = f
+    return b
+
+  def _vega20_live_state(self):
+    # mi50 (Leon 2026-10-13): a partial boot skips init_hw, so rebuild the feature state and clock tables from the running SMU the way init
+    # reads them: VBIOS tables, GetSmuVersion/ReadSerialNum, GetEnabledSmuFeatures, VBIOS boot clocks, GetDpmFreqByIndex. Nothing is written.
+    if hasattr(self, "vega20_dpm"): return
+    # mi50 (bug 2, Leon 2026-10-16): the SMU runs the TinyGPU driver's boot table, not the card's ROM table: it becomes the soft PowerPlay table
+    # (Linux's pp_table slot), so the read below and every later vbios.powerplay() see the table the SMU runs
+    if self.adev.vbios.soft_pp_table is None: self.adev.vbios.soft_pp_table = self.adev._vega20_driver_pptable()
+    self._vega20_pptable_init()
+    self._vega20_backend_init()
+    enabled = self.get_features()
+    for f in self.vega20_features: f["enabled"] = f["supported"] = bool(enabled & f["bitmap"])
+    self._vega20_bootup_values()
+    self._vega20_setup_default_dpm_tables()
+    m = self.smu_mod   # the PPT limit init reads last (vega20_enable_dpm_tasks :1765-1771): GetPptLimit is a read
+    self.vega20_default_power_limit = self.vega20_power_limit = self._send_msg(m.PPSMC_MSG_GetPptLimit, m.POWER_SOURCE_AC << 16, read_back_arg=True)
+
+  def _vega20_atom_clock(self, clk_id:int, syspll_id:int) -> int|None:
+    """pp_atomfwctrl_get_clk_information_by_clkid (ppatomfwctrl.c:418-441): ATOM command table getsmuclockinfo (master command list index 41,
+    offsetof/2 checked with clang) with atom_get_smu_clock_info_parameters_v3_1 {syspll_id, clk_id, command=GET_CLOCK_FREQ 0, dfsdid=0}
+    (4 bytes, passed with params_size = sizeof = 4 as Linux does); output dword 0 = smu_clock_freq_hz, returned / 10000. A failing table -> None."""
+    ps = [syspll_id | (clk_id << 8), 0, 0, 0]
+    if self.adev.atom.execute_table(41, ps, 4): return None
+    return (ps[0] & 0xFFFFFFFF) // 10000
+
+  def _vega20_single_dpm_table(self, clk:int) -> list[int]:
+    """vega20_setup_single_dpm_table (vega20_hwmgr.c:568-591): GetDpmFreqByIndex (clk << 16 | 0xFF) = level count, (clk << 16 | i) = level i."""
+    n = self._send_msg(self.smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clk << 16) | 0xFF, read_back_arg=True)
+    return [self._send_msg(self.smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clk << 16) | i, read_back_arg=True) for i in range(n)]
+
+  def _vega20_setup_default_dpm_tables(self):
+    """vega20_setup_default_dpm_tables (vega20_hwmgr.c:643-783): per clock the SMU's levels when its DPM feature is enabled, else one level = the
+    VBIOS boot clock / 100 (pix/disp/phy: no level). Every soft/hard min/max starts at 0 / VG20_CLOCK_MAX_DEFAULT (vega20_init_dpm_state :528-534)."""
+    m, b, f = self.smu_mod, self.vega20_boot, self._vega20_feature
+    def one(feat, clk, boot): return self._vega20_single_dpm_table(clk) if f(feat)["enabled"] else [boot // 100]
+    def disp(clk): return self._vega20_single_dpm_table(clk) if f("DPM_DCEFCLK")["enabled"] else []
+    self.vega20_dpm = {"soc": one("DPM_SOCCLK", m.PPCLK_SOCCLK, b["soc"]), "gfx": one("DPM_GFXCLK", m.PPCLK_GFXCLK, b["gfx"]),
+      "mem": one("DPM_UCLK", m.PPCLK_UCLK, b["mem"]), "eclk": one("DPM_VCE", m.PPCLK_ECLK, b["e"]), "vclk": one("DPM_UVD", m.PPCLK_VCLK, b["v"]),
+      "dclk": one("DPM_UVD", m.PPCLK_DCLK, b["d"]), "dcef": one("DPM_DCEFCLK", m.PPCLK_DCEFCLK, b["dcef"]), "pixel": disp(m.PPCLK_PIXCLK),
+      "display": disp(m.PPCLK_DISPCLK), "phy": disp(m.PPCLK_PHYCLK), "fclk": one("DPM_FCLK", m.PPCLK_FCLK, b["f"])}
+    self.vega20_dpm_state = {k: {"soft_min": 0, "soft_max": 0xFFFF, "hard_min": 0, "hard_max": 0xFFFF} for k in self.vega20_dpm}
+    self.vega20_golden_dpm = {k: list(v) for k, v in self.vega20_dpm.items()}   # :779-780
+
   def mode1_reset(self):
     if DEBUG >= 2: print(f"am {self.adev.devfmt}: mode1 reset")
     if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) or self.adev.ip_ver[am.MP0_HWIP] in {(13,0,0), (13,0,7), (13,0,10)}:
@@ -199,9 +355,39 @@ class AM_SMU(AM_IP):
     if not self.adev.is_hive(): time.sleep(0.5) # 500ms
 
   def read_table(self, table_t, arg):
+    if self._vega20(): return self._vega20_read_table(table_t, arg)
     if self.adev.ip_ver[am.MP0_HWIP] in {(13,0,6),(13,0,12),(13,0,15)}: self._send_msg(self.smu_mod.PPSMC_MSG_GetMetricsTable, arg)
     else: self._send_msg(self.smu_mod.PPSMC_MSG_TransferTableSmu2Dram, arg)
     return table_t.from_buffer(bytearray(self.adev.vram.view(self.driver_table_paddr, ctypes.sizeof(table_t))[:]))
+
+  def get_features(self) -> int:
+    # vega20_get_enabled_smc_features (vega20_smumgr.c:349-373): GetEnabledSmuFeaturesLow 0xC, GetEnabledSmuFeaturesHigh 0xD (Linux sends them
+    # without a
+    # parameter, :358-367; AM's mailbox always writes C2PMSG_82, here 0), result = low | high << 32 (:369-370; SMU_FEATURES_*_SHIFT/MASK
+    # vega20_smumgr.h:45-48). "DPM running" = any bit of SMC_DPM_FEATURES 0x30F (vega20_hwmgr.h:91; vega20_is_dpm_running :606-616).
+    self._vega20_only("get_features")
+    lo = self._send_msg(self.smu_mod.PPSMC_MSG_GetEnabledSmuFeaturesLow, 0, read_back_arg=True)
+    hi = self._send_msg(self.smu_mod.PPSMC_MSG_GetEnabledSmuFeaturesHigh, 0, read_back_arg=True)
+    return lo | (hi << 32)
+
+  def _vega20_table(self, table_id:int) -> tuple[int, int]:
+    # vega20_copy_table_from/to_smc guards (:171-176 / :216-221): id < TABLE_COUNT and a table that vega20_smu_init allocated (version/size != 0).
+    # Bits 31:16 of the id carry a workload type for TABLE_ACTIVITY_MONITOR_COEFF (:275, :305); the buffer is the one of bits 15:0.
+    if not (0 <= (table_id & 0xffff) < self.smu_mod.TABLE_COUNT) or (table_id & 0xffff) not in self.vega20_tables:
+      raise ValueError(f"am {self.adev.devfmt}: Invalid SMU Table ID {table_id:#x}")
+    return self.vega20_tables[table_id & 0xffff]
+
+  def _vega20_read_table(self, table_t, table_id:int):
+    # vega20_copy_table_from_smc (:163-201): SetDriverDramAddrHigh/Low = this table's buffer (:178-189), TransferTableSmu2Dram (:190-193),
+    # amdgpu_hdp_invalidate (:195) = hdp_v4_0_invalidate_hdp (hdp_v4_0.c:39-54: HDP_READ_CACHE_INVALIDATE = 1, read back), memcpy (:197-198).
+    paddr, size = self._vega20_table(table_id)
+    mc = self.adev.paddr2mc(paddr)
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrHigh, hi32(mc))
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrLow, lo32(mc))
+    self._send_msg(self.smu_mod.PPSMC_MSG_TransferTableSmu2Dram, table_id)
+    self.adev.regHDP_READ_CACHE_INVALIDATE.write(1)
+    self.adev.regHDP_READ_CACHE_INVALIDATE.read()
+    return table_t.from_buffer(bytearray(self.adev.vram.view(paddr, size)[:ctypes.sizeof(table_t)]))
 
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def read_clocks(self, clk_list:tuple[int]) -> dict[int, list[int]]:
@@ -209,6 +395,7 @@ class AM_SMU(AM_IP):
       for clck in clk_list if (cnt:=self._send_msg(self.smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clck<<16)|0xff, read_back_arg=True)&0x7fffffff)}
 
   def set_clocks(self, level:int|None):
+    if self._vega20(): return self._vega20_set_clocks(level)
     clks = tuple([self.smu_mod.PPCLK_UCLK, self.smu_mod.PPCLK_FCLK, self.smu_mod.PPCLK_SOCCLK])
     if self.adev.ip_ver[am.MP0_HWIP] not in {(13,0,6), (13,0,12), (13,0,15)}: clks += (self.smu_mod.PPCLK_GFXCLK,)
 
@@ -221,6 +408,27 @@ class AM_SMU(AM_IP):
     for clck, vals in self.read_clocks(clks).items():
       with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | (vals[level]), timeout=20)
       if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | (vals[level]))
+
+  def _vega20_set_clocks(self, level:int|None):
+    """AM's set_clocks(level) on Vega 20 = Linux's DPM level forcing on the DPM tables cached at init (vega20_setup_default_dpm_tables):
+    None = vega20_unforce_dpm_levels (vega20_hwmgr.c:2477-2530: soft min = lowest, soft max = highest level), -1 = vega20_force_dpm_highest
+    (:2392-2432), 0 = vega20_force_dpm_lowest (:2434-2475), any other index = that single level (vega20_force_clock_level with a one-level mask).
+    Levels are all enabled after setup_single_dpm_table, so find_lowest/highest = first/last (:1776-1818). Then vega20_upload_dpm_min_level and
+    vega20_upload_dpm_max_level (:1820-2009) with FEATURE_DPM_GFXCLK|UCLK|SOCCLK: per clock only while its DPM feature is enabled."""
+    self._vega20_live_state()
+    m = self.smu_mod
+    for key in ("gfx", "mem", "soc"):
+      lv = self.vega20_dpm[key]
+      lo, hi = (lv[0], lv[-1]) if level is None else (lv[level], lv[level])
+      self.vega20_dpm_state[key]["soft_min"], self.vega20_dpm_state[key]["soft_max"] = lo, hi
+    order = (("DPM_GFXCLK", m.PPCLK_GFXCLK, "gfx"), ("DPM_UCLK", m.PPCLK_UCLK, "mem"), ("DPM_SOCCLK", m.PPCLK_SOCCLK, "soc"))
+    for feat, clk, key in order:   # upload_dpm_min_level order: GFXCLK, UCLK, (UVD, VCE not in the mask), SOCCLK
+      if self._vega20_feature(feat)["enabled"]:
+        self._send_msg(m.PPSMC_MSG_SetSoftMinByFreq, (clk << 16) | (self.vega20_dpm_state[key]["soft_min"] & 0xffff))
+    for feat, clk, key in order:   # upload_dpm_max_level, same order
+      if self._vega20_feature(feat)["enabled"]:
+        self._send_msg(m.PPSMC_MSG_SetSoftMaxByFreq, (clk << 16) | (self.vega20_dpm_state[key]["soft_max"] & 0xffff))
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: Vega 20 DPM soft min/max: { {k: self.vega20_dpm_state[k] for k in ('gfx', 'mem', 'soc')} }")
 
   def set_power_limit(self, watts:float):
     ppt_limit = max(int(round(watts)), 1)
@@ -243,10 +451,33 @@ class AM_SMU(AM_IP):
     (self.adev.mmMP1_SMN_C2PMSG_66 if not debug else self.adev.mmMP1_SMN_C2PMSG_75).write(msg)
 
   def _send_msg(self, msg:int, param:int, read_back_arg=False, timeout=10000, debug=False): # default timeout is 10 seconds
+    if self._vega20(): return self._vega20_send_msg(msg, param, read_back_arg=read_back_arg, timeout=timeout, debug=debug)
     self._smu_cmn_send_msg(msg, param, debug=debug)
     wait_cond((self.adev.mmMP1_SMN_C2PMSG_90 if not debug else self.adev.mmMP1_SMN_C2PMSG_54).read, value=1, timeout_ms=timeout,
       msg=f"SMU msg {msg:#x} timeout")
     return (self.adev.mmMP1_SMN_C2PMSG_82 if not debug else self.adev.mmMP1_SMN_C2PMSG_53).read() if read_back_arg else None
+
+  def _vega20_send_msg(self, msg:int, param:int, read_back_arg=False, timeout=10000, debug=False):
+    # vega20_send_msg_to_smc_with_parameter (vega20_smumgr.c:130-149): wait for the previous response (:136 = vega20_wait_for_response :70-81, i.e.
+    # phm_wait_for_register_unequal(C2PMSG_90, 0) smu_helper.c:153-175 with usec_timeout = AMD_MAX_USEC_TIMEOUT = 1000 ms (hwmgr.c:85,
+    # amd_shared.h:30),
+    # its result discarded), C2PMSG_90 = 0 (:138), C2PMSG_82 = param (:140), C2PMSG_66 = msg (:142 -> :89-97), wait C2PMSG_90 != 0 (:144), require
+    # PPSMC_Result_OK else error (:145-148; codes vega20_ppsmc.h:30-34), argument back from C2PMSG_82 (:151-156). The MP1 13.x "debug" mailbox
+    # (C2PMSG_53/54/75, used by mode1_reset above) does not exist in vega20_smumgr.c.
+    if debug: raise RuntimeError(f"am {self.adev.devfmt}: Vega 20 has no debug SMU mailbox (vega20_smumgr.c uses C2PMSG_66/82/90 only)")
+    resp = self.adev.mmMP1_SMN_C2PMSG_90
+    with contextlib.suppress(TimeoutError):
+      wait_cond(lambda: resp.read() != 0, value=True, timeout_ms=1000, msg=f"SMU previous response pending before msg {msg:#x}")
+    self._smu_cmn_send_msg(msg, param)
+    try:
+      wait_cond(lambda: resp.read() != 0, value=True, timeout_ms=timeout, msg=f"SMU msg {msg:#x} timeout")
+      if (r:=resp.read()) != self.smu_mod.PPSMC_Result_OK:
+        raise AM_SMU.ResponseError(f"am {self.adev.devfmt}: SMU msg {msg:#x} param {param:#x} -> "
+                                   f"{self._vega20_results.get(r, 'unknown response')} ({r:#x})")
+    except (TimeoutError, AM_SMU.ResponseError):
+      self.adev.reg('regSCRATCH_REG6').write(1)   # review R5-05: the next open does the full boot (mode1 reset), not the same partial boot again
+      raise
+    return self.adev.mmMP1_SMN_C2PMSG_82.read() if read_back_arg else None
 
 class AM_GFX(AM_IP):
   def init_sw(self):
@@ -254,10 +485,48 @@ class AM_GFX(AM_IP):
     self.mqd_paddr = [self.adev.mm.palloc(0x1000 * self.xccs, zero=False, boot=True) for i in range(2)]
     self.mqd_mc = [self.adev.paddr2mc(mqd_paddr) for mqd_paddr in self.mqd_paddr]
 
+  # mi50: Linux gfx_v9_0_init_golden_registers for GC 9.4.0 (gfx_v9_0.c:1115-1121, :1153-1156): golden_settings_gc_9_0,
+  # golden_settings_gc_9_0_vg20, golden_settings_gc_9_x_common, as (name, offset, base index, and_mask, or_mask) from gc_9_0_offset.h
+  VEGA20_GOLDEN = [('DB_DEBUG2', 0x060d, 0, 0xf00fffff, 0x00000400),
+    ('DB_DEBUG3', 0x060e, 0, 0x80000000, 0x80000000),
+    ('GB_GPU_ID', 0x0640, 0, 0x0000000f, 0x00000000),
+    ('PA_SC_BINNER_EVENT_CNTL_3', 0x02cf, 0, 0x00000003, 0x82400024),
+    ('PA_SC_ENHANCE', 0x02fc, 0, 0x3fffffff, 0x00000001),
+    ('PA_SC_LINE_STIPPLE_STATE', 0x2281, 1, 0x0000ff0f, 0x00000000),
+    ('SH_MEM_CONFIG', 0x030d, 0, 0x00001000, 0x00001000),
+    ('SPI_RESOURCE_RESERVE_CU_0', 0x11dc, 0, 0x0007ffff, 0x00000800),
+    ('SPI_RESOURCE_RESERVE_CU_1', 0x11dd, 0, 0x0007ffff, 0x00000800),
+    ('SPI_RESOURCE_RESERVE_EN_CU_0', 0x11e6, 0, 0x01ffffff, 0x00ffff87),
+    ('SPI_RESOURCE_RESERVE_EN_CU_1', 0x11e7, 0, 0x01ffffff, 0x00ffff8f),
+    ('SQC_CONFIG', 0x0301, 0, 0x03000000, 0x020a2000),
+    ('TA_CNTL_AUX', 0x0542, 0, 0xfffffeef, 0x010b0000),
+    ('TCP_CHAN_STEER_HI', 0x0b04, 0, 0xffffffff, 0x4a2c0e68),
+    ('TCP_CHAN_STEER_LO', 0x0b03, 0, 0xffffffff, 0xb5d3f197),
+    ('VGT_CACHE_INVALIDATION', 0x0231, 0, 0x3fff3af3, 0x19200000),
+    ('VGT_GS_MAX_WAVE_ID', 0x0269, 0, 0x00000fff, 0x000003ff),
+    ('CP_MEC1_F32_INT_DIS', 0x10bd, 0, 0x00000800, 0x00000800),
+    ('CP_MEC2_F32_INT_DIS', 0x10be, 0, 0x00000800, 0x00000800),
+    ('CP_DEBUG', 0x107f, 0, 0x00008000, 0x00008000),
+    ('CB_DCC_CONFIG', 0x0688, 0, 0x0f000080, 0x04000080),
+    ('CB_HW_CONTROL_2', 0x0682, 0, 0x0f000000, 0x0a000000),
+    ('CB_HW_CONTROL_3', 0x0683, 0, 0x30000000, 0x10000000),
+    ('GB_ADDR_CONFIG', 0x063e, 0, 0xf3e777ff, 0x22014042),
+    ('GB_ADDR_CONFIG_READ', 0x0642, 0, 0xf3e777ff, 0x22014042),
+    ('DB_DEBUG2', 0x060d, 0, 0x00003e00, 0x00000400),
+    ('PA_SC_ENHANCE_1', 0x02fd, 0, 0xff840000, 0x04040000),
+    ('RMI_UTCL1_CNTL2', 0x078c, 0, 0x00030000, 0x00030000),
+    ('SPI_CONFIG_CNTL_1', 0x2441, 1, 0xffff010f, 0x01000107),
+    ('TA_CNTL_AUX', 0x0542, 0, 0x000b0000, 0x000b0000),
+    ('TD_CNTL', 0x0525, 0, 0x01000000, 0x01000000),
+    ('CP_SD_CNTL', 0x11b7, 0, 0xffffffff, 0x000001ff),
+    ('GRBM_CAM_INDEX', 0x5a04, 1, 0xffffffff, 0x00000000),
+    ('GRBM_CAM_DATA', 0x5a05, 1, 0xffffffff, 0x2544c382)]
+
   def init_hw(self):
     # Wait for RLC autoload to complete
-    wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
-              value=True, msg="RLC autoload timeout")
+    if self.adev.ip_ver[am.GC_HWIP] == (9,4,0): wait_cond(lambda: self.adev.regCP_STAT.read() == 0, value=True, msg="CP busy") # mi50: no RLC autoload
+    else: wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
+                    value=True, msg="RLC autoload timeout")
 
     self.adev.gmc.init_hub("GC", insts=range(self.xccs))
     if self.adev.partial_boot: return self.reset_mec()
@@ -366,9 +635,10 @@ class AM_GFX(AM_IP):
         self.adev.regSDMA0_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
         self.adev.regSDMA1_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
 
-      feats_gfx9 = {'gfxip_mgls_override':0, 'gfxip_rep_fgcg_override':0} if self.adev.ip_ver[am.GC_HWIP][0] == 9 else {}
+      fgcg = self.adev.ip_ver[am.GC_HWIP] != (9,4,0) # mi50: gc_9_0 has no fgcg override bits
+      feats_gfx9 = {'gfxip_mgls_override':0, **({'gfxip_rep_fgcg_override':0} if fgcg else {})} if self.adev.ip_ver[am.GC_HWIP][0] == 9 else {}
       feats_gfx11 = {'perfmon_clock_state':1, 'gfxip_repeater_fgcg_override':0} if self.adev.ip_ver[am.GC_HWIP][0] >= 11 else {}
-      self.adev.regRLC_CGTT_MGCG_OVERRIDE.update(**feats_gfx9, **feats_gfx11, gfxip_fgcg_override=0, grbm_cgtt_sclk_override=0,
+      self.adev.regRLC_CGTT_MGCG_OVERRIDE.update(**feats_gfx9, **feats_gfx11, **({'gfxip_fgcg_override':0} if fgcg else {}), grbm_cgtt_sclk_override=0,
         rlc_cgtt_sclk_override=0, gfxip_mgcg_override=0, gfxip_cgls_override=0, gfxip_cgcg_override=0, inst=xcc)
 
       self.adev.regRLC_SAFE_MODE.write(message=0, cmd=1, inst=xcc)
@@ -447,7 +717,10 @@ class AM_IH(AM_IP):
   def drain(self):
     _, _, suf, _ = self.rings[0]
     wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
-    self.adev.regIH_RB_RPTR.write(wptr['offset'] % (self.ring_size // 4))
+    # mi50: the OFFSET field (bits 2-17) holds the dword index: a raw write of the index set the hardware's read pointer 4x too low; every other
+    # card keeps TinyGPU's write
+    if getattr(self.adev, "is_vega20", False): self.adev.regIH_RB_RPTR.write(offset=wptr['offset'] % (self.ring_size // 4))
+    else: self.adev.regIH_RB_RPTR.write(wptr['offset'] % (self.ring_size // 4))
 
     if wptr['rb_overflow']:
       self.adev.reg(f"regIH_RB_WPTR{suf}").update(rb_overflow=0)
@@ -457,7 +730,7 @@ class AM_IH(AM_IP):
   def interrupt_handler(self):
     _, _, suf, _ = self.rings[0]
     wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
-    rptr = self.adev.regIH_RB_RPTR.read()
+    rptr = self.adev.regIH_RB_RPTR.read_bitfields()['offset'] if getattr(self.adev, "is_vega20", False) else self.adev.regIH_RB_RPTR.read()   # mi50: the same field
 
     while rptr != wptr['offset']:
       entry = [self.ring_view[(rptr + i) % (self.ring_size // 4)] for i in range(8)]
@@ -506,7 +779,7 @@ class AM_IH(AM_IP):
 class AM_SDMA(AM_IP):
   def init_sw(self): self.sdma_reginst, self.sdma_name = [], "F32" if self.adev.ip_ver[am.SDMA0_HWIP] < (7,0,0) else "MCU"
   def init_hw(self):
-    for pipe_id in range(16 if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else 1):
+    for pipe_id in range(2 if self.adev.ip_ver[am.SDMA0_HWIP] == (4,2,0) else 16 if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else 1): # mi50: 2 engines
       pipe, inst = ("", pipe_id) if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else (str(pipe_id), 0)
 
       if self.adev.ip_ver[am.SDMA0_HWIP] >= (6,0,0):
@@ -520,6 +793,8 @@ class AM_SDMA(AM_IP):
 
       self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1,
         **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)
+      # mi50: sdma_v4_0_start un-halts every engine even after a PSP load (F32_CNTL.HALT = 0, sdma_v4_0.c:1397-1398, :1418-1421)
+      if self.adev.ip_ver[am.SDMA0_HWIP] == (4,2,0): self.adev.regSDMA_F32_CNTL.update(halt=0, inst=inst)
 
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
       for aid_id in self.adev.aids:
@@ -544,9 +819,11 @@ class AM_SDMA(AM_IP):
 
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, idx:int) -> int:
     if self.adev.ip_ver[am.SDMA0_HWIP] >= (5,0,0) and idx > 0: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available")
+    if self.adev.ip_ver[am.SDMA0_HWIP] == (4,2,0) and idx > 1: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available")
 
-    pipe, queue = idx // 4, idx % 4
-    reg, inst = ("regSDMA_GFX", pipe+queue*4) if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4) else (f"regSDMA{pipe}_QUEUE{queue}", 0)
+    # mi50: 2 engines, queue idx = engine (ring i on engine i, the BIF_SDMA{i} doorbell range ENGINE0 + i*0xA set up in AM_SOC)
+    pipe, queue = (idx, 0) if self.adev.ip_ver[am.SDMA0_HWIP] == (4,2,0) else (idx // 4, idx % 4)
+    reg, inst = ("regSDMA_GFX", pipe+queue*4) if self.adev.ip_ver[am.SDMA0_HWIP][:2] in {(4,4), (4,2)} else (f"regSDMA{pipe}_QUEUE{queue}", 0)
     doorbell = am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (pipe+queue*4) * 0xA
     self.sdma_reginst.append((reg, inst))
 
@@ -559,13 +836,14 @@ class AM_SDMA(AM_IP):
     self.adev.reg(f"{reg}_DOORBELL_OFFSET").update(offset=doorbell * 2, inst=inst)
     self.adev.reg(f"{reg}_DOORBELL").update(enable=1, inst=inst)
     self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x0, inst=inst)
-    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP][:2]!=(4,4) else {}),
+    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP][:2] not in {(4,4), (4,2)} else {}),
       rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=4, rb_enable=1, rb_priv=1, rb_size=(ring_size//4).bit_length()-1, inst=inst)
     self.adev.reg(f"{reg}_IB_CNTL").update(ib_enable=1, inst=inst)
     return doorbell
 
 class AM_PSP(AM_IP):
   def init_sw(self):
+    self.vega20 = self.adev.ip_ver[am.MP0_HWIP] == (11,0,2)
     self.reg_pref = "regMP0_SMN_C2PMSG" if self.adev.ip_ver[am.MP0_HWIP] < (14,0,0) else "regMPASP_SMN_C2PMSG"
 
     if self.adev.devfmt.startswith("usb:"):
@@ -583,6 +861,7 @@ class AM_PSP(AM_IP):
     self.ring_paddr = self.adev.mm.palloc(self.ring_size, zero=False, boot=True)
 
     self.max_tmr_size, self.tmr_size = 0x1300000, 0
+    if self.vega20: self.ras_shared_paddr = self.adev.mm.palloc(am.PSP_RAS_SHARED_MEM_SIZE, align=0x4000, zero=False, boot=True) # psp_ta_init_shared_buf
     self.boot_time_tmr = self.adev.ip_ver[am.MP0_HWIP] in {(13,0,6), (13,0,14), (14,0,2), (14,0,3)}
     self.autoload_tmr = self.adev.ip_ver[am.MP0_HWIP] not in {(13,0,6), (13,0,14)}
     self.tmr_paddr = self.adev.mm.palloc(self.max_tmr_size, align=am.PSP_TMR_ALIGNMENT, zero=False, boot=True) if not self.boot_time_tmr else 0

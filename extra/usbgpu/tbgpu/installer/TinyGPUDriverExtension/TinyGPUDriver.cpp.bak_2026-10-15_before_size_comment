@@ -1,0 +1,323 @@
+#include "TinyGPUDriver.h"
+#include "TinyGPUDriverUserClient.h"
+#include <DriverKit/IOLib.h>
+#include <DriverKit/OSCollections.h>
+#include <PCIDriverKit/PCIDriverKit.h>
+#include <time.h>
+#include "MI50/MI50Device.h"
+
+struct TinyGPUDriver_IVars
+{
+	IOPCIDevice *pci = nullptr;
+};
+
+// mi50: native AMD Instinct MI50 (Vega 20) support. The card is initialised here, when it appears (power-up, driver start), before this
+// service is registered: VBIOS + POST, boot memory, SOC, GMC, IH, PSP with every firmware image, SMU with PowerPlay (250 W boot table, DPM,
+// OverDrive, thermal) - MI50/MI50Device.cpp. This is the hardware it runs on: the matched IOPCIDevice, its BAR5 registers and configuration space.
+class TinyGPUMI50Hw final : public mi50::Hw
+{
+public:
+	TinyGPUMI50Hw(IOService *svc, IOPCIDevice *pci, uint8_t bar5_index, uint64_t bar5_size)
+		: svc_(svc), pci_(pci), bar5_(bar5_index), dwords_((uint32_t)(bar5_size / 4)) {}
+	uint32_t mmio_rd(uint32_t idx) override { uint32_t v = 0xffffffff; pci_->MemoryRead32(bar5_, (uint64_t)idx * 4, &v); return v; }
+	void mmio_wr(uint32_t idx, uint32_t v) override { pci_->MemoryWrite32(bar5_, (uint64_t)idx * 4, v); }
+	uint32_t mmio_dwords() override { return dwords_; }
+	uint32_t cfg_rd(uint32_t off, unsigned size) override {
+		if (size == 1) { uint8_t v = 0xff; pci_->ConfigurationRead8(off, &v); return v; }
+		if (size == 2) { uint16_t v = 0xffff; pci_->ConfigurationRead16(off, &v); return v; }
+		uint32_t v = 0xffffffff; pci_->ConfigurationRead32(off, &v); return v;
+	}
+	void cfg_wr(uint32_t off, uint32_t v, unsigned size) override {
+		if (size == 1) pci_->ConfigurationWrite8(off, (uint8_t)v);
+		else if (size == 2) pci_->ConfigurationWrite16(off, (uint16_t)v);
+		else pci_->ConfigurationWrite32(off, v);
+	}
+	void delay_us(uint32_t us) override { IODelay(us); }
+	void sleep_ms(uint32_t ms) override { IOSleep(ms); }
+	uint64_t now_ns() override { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+	void log(const char *m) override { os_log(OS_LOG_DEFAULT, "tinygpu: mi50: %{public}s", m); }
+	void *alloc(size_t n) override { return IOMallocZero(n); }
+	void release(void *p, size_t n) override { IOFree(p, n); }
+	bool link_partner(uint32_t *lnkcap, uint32_t *lnkcap2) override;
+private:
+	IOService *svc_;
+	IOPCIDevice *pci_;
+	uint8_t bar5_;
+	uint32_t dwords_;
+};
+
+// amdgpu_device_init_pcie_links (amdgpu_device.c:1957-1967; tinygrad amdev.py _vega20_pcie_platform_caps): from the card up the PCI chain, past
+// every ATI (0x1002) bridge (the card's own switch); the device above is the link partner and its LNKCAP / LNKCAP2 are IOPCIFamily's
+// IOPCIExpressLinkCapabilities / IOPCIExpressLinkCapabilities2 properties. The chain is this service's provider chain (card towards the root);
+// PCI entries are the ones with vendor-id, device-id and class-code.
+bool TinyGPUMI50Hw::link_partner(uint32_t *lnkcap, uint32_t *lnkcap2)
+{
+	static const char *const KEYS[] = {"vendor-id", "device-id", "class-code", "IOPCIExpressLinkCapabilities", "IOPCIExpressLinkCapabilities2"};
+	OSArray *keys = OSArray::withCapacity(5);
+	if (!keys) return false;
+	for (const char *k : KEYS) { OSString *s = OSString::withCString(k); if (s) { keys->setObject(s); s->release(); } }
+	OSArray *chain = nullptr;
+	kern_return_t err = svc_->CopyProviderProperties(keys, &chain);
+	keys->release();
+	if (err || !chain) { os_log(OS_LOG_DEFAULT, "tinygpu: mi50: provider chain unavailable (0x%x): default PCIe caps", err); return false; }
+	auto u32of = [](OSDictionary *d, const char *k, bool *ok) -> uint32_t {
+		OSData *x = OSDynamicCast(OSData, d->getObject(k));
+		if (!x || x->getLength() < 4) { *ok = false; return 0; }
+		uint32_t v; memcpy(&v, x->getBytesNoCopy(), 4); return v;
+	};
+	bool found = false, have = false;
+	for (uint32_t i = 0; i < chain->getCount() && !have; i++) {
+		OSDictionary *d = OSDynamicCast(OSDictionary, chain->getObject(i));
+		if (!d) continue;
+		bool ok = true;
+		uint32_t ven = u32of(d, "vendor-id", &ok), dev = u32of(d, "device-id", &ok);
+		if (!ok || !d->getObject("class-code")) continue;   // not a PCI device node
+		if (!found) { found = (ven & 0xffff) == 0x1002 && (dev & 0xffff) == 0x66a1; continue; }
+		if ((ven & 0xffff) == 0x1002) continue;              // the card's own switch
+		OSNumber *c = OSDynamicCast(OSNumber, d->getObject("IOPCIExpressLinkCapabilities"));
+		OSNumber *c2 = OSDynamicCast(OSNumber, d->getObject("IOPCIExpressLinkCapabilities2"));
+		if (c != nullptr) { *lnkcap = c->unsigned32BitValue(); *lnkcap2 = c2 != nullptr ? c2->unsigned32BitValue() : 0; have = true; }
+		break;
+	}
+	chain->release();
+	os_log(OS_LOG_DEFAULT, "tinygpu: mi50: link partner %{public}s lnkcap 0x%x lnkcap2 0x%x", have ? "found" : "not found (default caps)",
+	       have ? *lnkcap : 0, have ? *lnkcap2 : 0);
+	return have;
+}
+
+// the MI50's power-up initialisation; false = the card is not usable (the reason is logged) and the service is not registered
+static bool StartMI50(IOService *svc, IOPCIDevice *pci)
+{
+	uint8_t idx = 0, type = 0;
+	uint64_t size = 0;
+	kern_return_t err = pci->GetBARInfo(5, &idx, &size, &type);   // tinygrad AMDev: mmio = map_bar(5)
+	if (err || size < 4) { os_log(OS_LOG_DEFAULT, "tinygpu: mi50: no BAR5 register aperture (0x%x)", err); return false; }
+	TinyGPUMI50Hw hw(svc, pci, idx, size);
+	// MI50BarFix.kext's first BAR0 placement runs with this start; the bring-up waits for it (5 s at most: without the kext BAR0 is never placed)
+	uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	bool placed = mi50::wait_bar0_placed(hw, 5000);
+	os_log(OS_LOG_DEFAULT, "tinygpu: mi50: BAR0 %{public}s after %llu ms", placed ? "placed by MI50BarFix" : "not placed (no MI50BarFix?), going on",
+	       (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0) / 1000000);
+	mi50::MI50Device *dev = new mi50::MI50Device(hw);   // ~11 KB of state: on the heap, not on this dispatch thread's stack
+	if (!dev) { os_log(OS_LOG_DEFAULT, "tinygpu: mi50: out of memory"); return false; }
+	uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	mi50::MI50Device::Result r = dev->init();
+	uint64_t ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1000000;
+	if (r == mi50::MI50Device::FAILED)
+		os_log(OS_LOG_DEFAULT, "tinygpu: mi50: INITIALISATION FAILED after %llu ms: %{public}s - power the card down", ms, dev->error());
+	else
+		os_log(OS_LOG_DEFAULT, "tinygpu: mi50: %{public}s in %llu ms: VRAM %llu MiB, SMU 0x%x, features 0x%llx, PPT %u W%{public}s",
+		       r == mi50::MI50Device::FULL_BOOT ? "initialised" : "already initialised", ms, dev->vram_size() >> 20, dev->smu_version(),
+		       dev->enabled_features(), dev->power_limit_w(), dev->posted_here() ? ", POSTed" : "");
+	delete dev;   // before hw goes out of scope (MI50Device releases its buffers through it)
+	return r != mi50::MI50Device::FAILED;
+}
+
+bool TinyGPUDriver::init()
+{
+	os_log(OS_LOG_DEFAULT, "tinygpu: init");
+
+	auto answer = super::init();
+	if (!answer) {
+		return false;
+	}
+
+	ivars = new TinyGPUDriver_IVars();
+	if (ivars == nullptr) {
+		return false;
+	}
+
+	return true;
+}
+
+void TinyGPUDriver::free()
+{
+	IOSafeDeleteNULL(ivars, TinyGPUDriver_IVars, 1);
+	super::free();
+}
+
+kern_return_t TinyGPUDriver::Start_Impl(IOService* in_provider)
+{
+	IOServiceName service_name;
+	os_log(OS_LOG_DEFAULT, "tinygpu: on gpu detected");
+
+	kern_return_t err = Start(in_provider, SUPERDISPATCH);
+	if (err) return err;
+
+	ivars->pci = OSDynamicCast(IOPCIDevice, in_provider);
+	if (!ivars->pci) return kIOReturnNoDevice;
+
+	err = ivars->pci->Open(this, 0);
+	if (err) {
+		os_log(OS_LOG_DEFAULT, "tinygpu: Open() failed 0x%08x", err);
+		ivars->pci = nullptr;
+		return err;
+	}
+
+	uint16_t ven = 0, dev = 0;
+	ivars->pci->ConfigurationRead16(kIOPCIConfigurationOffsetVendorID, &ven);
+	ivars->pci->ConfigurationRead16(kIOPCIConfigurationOffsetDeviceID, &dev);
+	os_log(OS_LOG_DEFAULT, "tinygpu: opened device ven=0x%04x dev=0x%04x", ven, dev);
+
+	uint16_t commandRegister;
+	ivars->pci->ConfigurationRead16(kIOPCIConfigurationOffsetCommand, &commandRegister);
+	commandRegister |= (kIOPCICommandIOSpace | kIOPCICommandBusMaster | kIOPCICommandMemorySpace);
+	ivars->pci->ConfigurationWrite16(kIOPCIConfigurationOffsetCommand, commandRegister);
+
+	// mi50: the card is identified by the IDs read above (configuration dword 0 = 0x66a11002, amdev.py VEGA20_PCI_ID)
+	if (ven == 0x1002 && dev == 0x66a1 && !StartMI50(this, ivars->pci)) {
+		ivars->pci->Close(this, 0);
+		ivars->pci = nullptr;
+		return kIOReturnNotReady;
+	}
+
+	memcpy((void*)service_name, (void*)"tinygpu\0", 8);
+	SetName(service_name);
+
+	os_log(OS_LOG_DEFAULT, "tinygpu: will register service %s", service_name);
+	RegisterService();
+
+	os_log(OS_LOG_DEFAULT, "tinygpu: service started %s", service_name);
+	return 0;
+}
+
+kern_return_t TinyGPUDriver::Stop_Impl(IOService* in_provider)
+{
+	// mi50: after Close the device is no longer this driver's: a user client stopping later (QuiesceOnStop) finds no device (CfgRead/CfgWrite
+	// return kIOReturnNotReady) instead of a closed one; the pointer is the non-retained cast from Start
+	if (ivars->pci) { ivars->pci->Close(this, 0); ivars->pci = nullptr; }
+	return Stop(in_provider, SUPERDISPATCH);
+}
+
+kern_return_t TinyGPUDriver::NewUserClient_Impl(uint32_t in_type, IOUserClient** out_user_client)
+{
+	kern_return_t err = 0;
+
+	IOService* user_client_service = nullptr;
+	err = Create(this, "TinyGPUDriverUserClientProperties", &user_client_service);
+	if (err) {
+		os_log(OS_LOG_DEFAULT, "tinygpu: failed to create NewUserClient");
+		goto error;
+	}
+	*out_user_client = OSDynamicCast(IOUserClient, user_client_service);
+	if (!*out_user_client) {   // mi50: stock returned success with no client and leaked the created object (clang analyzer, osx.cocoa.RetainCount)
+		os_log(OS_LOG_DEFAULT, "tinygpu: NewUserClient: created object is not an IOUserClient");
+		user_client_service->release();
+		err = kIOReturnError;
+		goto error;
+	}
+	os_log(OS_LOG_DEFAULT, "tinygpu: NewUserClient created");
+
+error:
+	return err;
+}
+
+kern_return_t TinyGPUDriver::MapBar(uint32_t bar, IOMemoryDescriptor** memory)
+{
+	uint8_t barMemoryIndex, barMemoryType;
+	uint64_t barMemorySize;
+	kern_return_t err = ivars->pci->GetBARInfo(bar, &barMemoryIndex, &barMemorySize, &barMemoryType);
+	if (err) return err;
+	os_log(OS_LOG_DEFAULT, "tinygpu: bar mapping %d idx=%d", bar, barMemoryIndex);
+	return ivars->pci->_CopyDeviceMemoryWithIndex(barMemoryIndex, memory, this);
+}
+
+static kern_return_t WriteDMASegments(IOMemoryDescriptor* mem, IOAddressSegment* segments, uint32_t segCount,
+                                      uint64_t mapOffset = 0, uint64_t mapSize = 0)
+{
+	// write dma segments to mapped memory as [addr0, len0, addr1, len1, ..., 0, 0]
+
+	IOMemoryMap* map = nullptr;
+	// mi50: CreateMapping(options, address, offset, length, alignment, map) (IOMemoryDescriptor.iig; only alignment 0 is supported): the
+	// segment list goes at mapOffset, mapSize long - stock passed them as length and alignment, so it landed at offset 0
+	kern_return_t err = mem->CreateMapping(0, 0, mapOffset, mapSize, 0, &map);
+	if (err || !map) return err ?: kIOReturnError;
+
+	uint64_t* out = (uint64_t*)map->GetAddress();
+	for (uint32_t i = 0; i < segCount; i++) { out[i * 2] = segments[i].address; out[i * 2 + 1] = segments[i].length; }
+	out[segCount * 2] = 0; out[segCount * 2 + 1] = 0;
+	map->release();
+	return 0;
+}
+
+kern_return_t TinyGPUDriver::SetupDMA(IOMemoryDescriptor* memory, uint64_t size, IODMACommand** outCmd,
+                                       IOAddressSegment* segments, uint32_t* segCount)
+{
+	IODMACommandSpecification dmaSpec = {.options = 0, .maxAddressBits = 40};
+	IODMACommand* dmaCmd = nullptr;
+
+	kern_return_t err = IODMACommand::Create(ivars->pci, kIODMACommandCreateNoOptions, &dmaSpec, &dmaCmd);
+	if (err) { os_log(OS_LOG_DEFAULT, "tinygpu: DMA create failed err=%d", err); return err; }
+
+	uint64_t flags = kIOMemoryDirectionInOut;
+	err = dmaCmd->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, memory, 0, size, &flags, segCount, segments);
+	if (err) { os_log(OS_LOG_DEFAULT, "tinygpu: PrepareForDMA failed err=%d", err); dmaCmd->release(); return err; }
+
+	*outCmd = dmaCmd;
+	return 0;
+}
+
+kern_return_t TinyGPUDriver::CreateDMA(size_t size, TinyGPUCreateDMAResp* dmaDesc)
+{
+	IOBufferMemoryDescriptor* sharedBuf = nullptr;
+	kern_return_t err = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, size, IOVMPageSize, &sharedBuf);
+	if (err) { os_log(OS_LOG_DEFAULT, "tinygpu: alloc failed err=%d", err); return err; }
+
+	IODMACommand* dmaCmd = nullptr;
+	IOAddressSegment segments[32];
+	uint32_t segCount = 32;
+	err = SetupDMA(sharedBuf, size, &dmaCmd, segments, &segCount);
+	if (err) { sharedBuf->release(); return err; }
+
+	err = WriteDMASegments(sharedBuf, segments, segCount, IOVMPageSize, IOVMPageSize);
+	if (err) { dmaCmd->CompleteDMA(kIODMACommandCompleteDMANoOptions); dmaCmd->release(); sharedBuf->release(); return err; }
+
+	dmaDesc->sharedBuf = sharedBuf;
+	dmaDesc->dmaCmd = dmaCmd;
+	dmaDesc->iova = segments[0].address;
+	os_log(OS_LOG_DEFAULT, "tinygpu: CreateDMA size=0x%zx segs=%u", size, segCount);
+	return 0;
+}
+
+kern_return_t TinyGPUDriver::CfgRead(uint32_t off, uint32_t size, uint32_t* outVal)
+{
+  if (!ivars->pci || !outVal) return kIOReturnNotReady;
+  if ((size != 1 && size != 2 && size != 4) || off > 0x1000 - size) return kIOReturnBadArgument;   // mi50: no silent 0 for a bad request
+
+  if (size == 1) {
+	uint8_t v8 = 0;
+	ivars->pci->ConfigurationRead8(off, &v8);
+	*outVal = v8;
+  } else if (size == 2) {
+	uint16_t v16 = 0;
+	ivars->pci->ConfigurationRead16(off, &v16);
+	*outVal = v16;
+  } else if (size == 4) {
+	uint32_t v32 = 0;
+	ivars->pci->ConfigurationRead32(off, &v32);
+	*outVal = v32;
+  }
+  return 0;
+}
+
+kern_return_t TinyGPUDriver::CfgWrite(uint32_t off, uint32_t size, uint32_t val)
+{
+  if (!ivars->pci) return kIOReturnNotReady;
+  if ((size != 1 && size != 2 && size != 4) || off > 0x1000 - size) return kIOReturnBadArgument;   // mi50: no silent success
+  if (size == 1) ivars->pci->ConfigurationWrite8 (off, (uint8_t)val);
+  else if (size == 2) ivars->pci->ConfigurationWrite16(off, (uint16_t)val);
+  else if (size == 4) ivars->pci->ConfigurationWrite32(off, (uint32_t)val);
+  return 0;
+}
+
+kern_return_t TinyGPUDriver::ResetDevice()
+{
+	if (!ivars->pci) return kIOReturnNotReady;
+	kern_return_t ret = ivars->pci->Reset(kIOPCIDeviceResetTypeFunctionReset);
+	return ret == kIOReturnSuccess ? ret : ivars->pci->Reset(kIOPCIDeviceResetTypeHotReset);
+}
+
+IOPCIDevice* TinyGPUDriver::GetPCI()
+{
+	return ivars->pci;
+}

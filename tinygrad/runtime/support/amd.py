@@ -30,7 +30,8 @@ class AMDIP:
 # https://github.com/torvalds/linux/blob/9207d47f966be9f4d52e7e0119ac2b7a7e366f3e/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c#L3163
 def import_module(name:str, target:tuple[int, int, int], submod=""):
   # version overrides
-  target = {("smu", (13, 0, 7)): (13, 0, 0)}.get((name, target), target)
+  # mi50: Vega 20 reports MMHUB 9.4.0, which AMD drives with mmhub_v1_0 and the mmhub_1_0 header
+  target = {("smu", (13, 0, 7)): (13, 0, 0), ("mmhub", (9, 4, 0)): (1, 0, 0)}.get((name, target), target)
   mod = getattr(tinygrad.runtime.autogen.am, submod) if submod else tinygrad.runtime.autogen.am
   if (children:=[c for c in mod.__all__ if c.startswith(name) and (v:=tuple(map(int, c.split('_')[1:])))[0] == target[0] and v <= target]):
     return getattr(mod, children[-1])

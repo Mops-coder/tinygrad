@@ -55,7 +55,8 @@ class Scheduler:
       special_ops = [colored(str(x.vmax+1), "blue" if x.arg[0] == "g" else "cyan") for x in special_uops]
       name = k_type + colored('_', 'BLACK').join(['']+special_ops+[colored(x.src[0].render(), color) for x,color in zip(self.rngs, self.colors())])
     self.ast = graph_rewrite(self.ast, pm_flatten_range, name="flatten range")
-    return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts), dont_use_locals=self.dont_use_locals), tag=1)
+    return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts), dont_use_locals=self.dont_use_locals,
+                                         useful_ops=self.ast.arg.useful_ops if self.ast.arg is not None else None), tag=1)
 
   def _output_rngs(self) -> list[UOp]:
     return flatten([[r for r in UOp.sink(*s.src[1:]).ranges if r.arg[-1] != AxisType.REDUCE] for s in self.ast.src if s.op is Ops.END])
@@ -339,7 +340,7 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
     for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
   elif beam >= 1:
     from tinygrad.codegen.opt.search import beam_search
-    rawbufs, var_vals = args_from_ast(ast, ren.target.device)
+    rawbufs, var_vals = args_from_ast(ast, getattr(ren, "runtime_device", None) or ren.target.device)
     # beam search may open devices
     with Context(ALLOW_DEVICE_USAGE=1):
       k = beam_search(k, rawbufs, var_vals, beam, bool(getenv("BEAM_ESTIMATE", 1)))

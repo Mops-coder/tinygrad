@@ -1,0 +1,273 @@
+// t_driver.cpp - the TinyGPU driver's vendor paths: TinyGPUDriver.cpp and TinyGPUDriverUserClient.cpp compiled unchanged, in this translation
+// unit, against the stand-in DriverKit headers (fake_driverkit/): the user-client access check, config bounds, PrepareDMA / ReleaseDMA
+// bookkeeping, Stop teardown, every failure returned and logged, and the MI50 hook in Start (the bring-up on the virtual MI50 itself:
+// t_dext.cpp D12/D13). No card is attached here (dk_card.hpp: CARD = nullptr): a device is its configuration space.
+// Build/run: see mi50-tools/build_and_test.sh.
+#include <functional>
+#include <tuple>
+#include "../../TinyGPUDriverExtension/TinyGPUDriver.cpp"
+#include "../../TinyGPUDriverExtension/TinyGPUDriverUserClient.cpp"
+#include "dk_card.hpp"
+static bool logged(const char* s) { for (auto& l : g_logs) if (l.find(s) != std::string::npos) return true; return false; }
+static int logged_n(const char* s) { int n = 0; for (auto& l : g_logs) n += l.find(s) != std::string::npos; return n; }
+
+static int fails;
+static void check(bool ok, const char* msg) { printf("%s %s\n", ok ? "ok  " : "FAIL", msg); fails += !ok; }
+static OSDictionary* ents(OSObject* value) { auto d = new OSDictionary; if (value) d->d["com.apple.developer.driverkit.userclient-access"] = value; return d; }
+static OSArray* arr(std::vector<const char*> v) { auto a = new OSArray; for (auto s : v) a->a.push_back(new OSString(s)); return a; }
+static kern_return_t call(TinyGPUDriverUserClient* uc, uint64_t sel, std::vector<uint64_t> in, uint64_t* out = nullptr,
+                          IOMemoryDescriptor* sin = nullptr, IOMemoryDescriptor* sout = nullptr) {
+  uint64_t o[2] = {}; IOUserClientMethodArguments a{in.data(), (uint32_t)in.size(), o, 2, sin, sout};
+  kern_return_t r = uc->ExternalMethod(sel, &a, nullptr, nullptr, nullptr); if (out) *out = o[0]; return r;
+}
+static TinyGPUDriverUserClient* client(TinyGPUDriver* drv, OSDictionary* e) {
+  g_ents = e; g_ent_calls = 0; auto uc = new TinyGPUDriverUserClient; uc->init(); uc->Start_Impl(drv); return uc;
+}
+
+int main() { setvbuf(stdout, nullptr, _IONBF, 0);
+  char m[256];
+  // the vendor paths on an AMD GPU that is not the MI50 (Navi 21, 1002:73bf): an MI50 here would run the bring-up, which needs the card
+  auto pci = new IOPCIDevice; uint32_t id = 0x73bf1002; memcpy(pci->cfg, &id, 4);
+  auto drv = new TinyGPUDriver; drv->init(); drv->Start_Impl(pci);
+  // ---- access check (R1-09 / R2-01) ----
+  for (auto [what, e, ok] : std::vector<std::tuple<const char*, OSDictionary*, bool>>{
+         {"no entitlements at all", nullptr, false}, {"entitlement absent", ents(nullptr), false},
+         {"a boolean instead of the array", ents(new OSBoolean(true)), false}, {"array without this driver", ents(arr({"org.example.other"})), false},
+         {"array listing org.tinygrad.tinygpu.driver2", ents(arr({"x", "org.tinygrad.tinygpu.driver2"})), true}}) {
+    auto uc = client(drv, e); uint64_t v = 0; IOMemoryDescriptor* md = nullptr;
+    kern_return_t r1 = call(uc, ReadCfg, {0, 4}, &v), r2 = call(uc, ReadCfg, {0, 4}, &v), r3 = uc->CopyClientMemoryForType_Impl(2, nullptr, &md);
+    snprintf(m, sizeof m, "%s -> %s (ReadCfg %#x, BAR map %#x), entitlements read %d time(s)", what, ok ? "served" : "refused", r1, r3, g_ent_calls);
+    check(ok ? (r1 == 0 && v == id && r2 == 0 && r3 == 0) : (r1 == kIOReturnNotPermitted && r2 == kIOReturnNotPermitted && r3 == kIOReturnNotPermitted && !md),
+          m);
+    check(g_ent_calls == 1, "  the decision is taken once per user client and cached");
+  }
+  auto uc = client(drv, ents(arr({"org.tinygrad.tinygpu.driver2"})));
+  // ---- config bounds (R2-13) ----
+  uint64_t v = 0;
+  check(call(uc, ReadCfg, {0, 3}, &v) == kIOReturnBadArgument && call(uc, ReadCfg, {0xFFE, 4}, &v) == kIOReturnBadArgument &&
+        call(uc, ReadCfg, {0xFFC, 4}, &v) == 0 && call(uc, ReadCfg, {0xFFFFFFFF, 1}, &v) == kIOReturnBadArgument, "ReadCfg: size 3, a dword past 0xFFF, offset -1 refused; 0xFFC/4 served");
+  check(call(uc, WriteCfg, {0x40, 8, 1}) == kIOReturnBadArgument && call(uc, WriteCfg, {0x1000, 1, 1}) == kIOReturnBadArgument &&
+        call(uc, WriteCfg, {0x40, 2, 0xBEEF}) == 0 && pci->cfg[0x40] == 0xEF && pci->cfg[0x41] == 0xBE, "WriteCfg: size 8 and offset 0x1000 refused; a word at 0x40 written");
+  // ---- PrepareDMA / ReleaseDMA (R1-01 / R6-05) ----
+  std::vector<uint64_t> iovas;
+  auto in = new IOMemoryDescriptor; in->len = 0x10000; auto out = new IOMemoryDescriptor; out->len = 8192;
+  for (int i = 0; i < 20; i++) {   // past the first growth of the 16-entry array
+    call(uc, PrepareDMA, {}, nullptr, in, out); iovas.push_back(((uint64_t*)out->mem.data())[0]); }
+  snprintf(m, sizeof m, "20 PrepareDMA -> 20 entries, 20 DMA commands alive, segment list [iova, len, 0, 0] written for each (first %#llx)", (unsigned long long)iovas[0]);
+  check(uc->ivars->dmaCount == 20 && g_cmd_alive == 20 && ((uint64_t*)out->mem.data())[2] == 0, m);
+  bool keys = true; for (size_t i = 0; i < 20; i++) keys = keys && uc->ivars->dmas[i].iova == iovas[i];
+  check(keys, "each entry is keyed by its first segment address (the server's iova)");
+  int c0 = g_completes;
+  check(call(uc, ReleaseDMA, {iovas[5]}) == 0 && g_completes == c0 + 1 && g_cmd_alive == 19 && uc->ivars->dmaCount == 19,
+        "ReleaseDMA(iova of #5) -> that command completed and released, 19 left");
+  bool others = true; for (size_t i = 0; i < 20; i++) if (i != 5) { bool f = false; for (size_t j = 0; j < 19; j++) f = f || uc->ivars->dmas[j].iova == iovas[i]; others = others && f; }
+  check(others, "every other entry is still present");
+  check(call(uc, ReleaseDMA, {iovas[5]}) == kIOReturnNotFound && call(uc, ReleaseDMA, {0x1234}) == kIOReturnNotFound &&
+        call(uc, ReleaseDMA, {iovas[0], 1}) == kIOReturnBadArgument && g_cmd_alive == 19, "the same iova again, an unknown iova, two scalars -> refused, nothing released");
+  g_map_fail = 1; int alive = g_cmd_alive;
+  check(call(uc, PrepareDMA, {}, nullptr, in, out) != 0 && g_cmd_alive == alive && uc->ivars->dmaCount == 19,
+        "PrepareDMA whose output mapping fails -> its DMA command completed and released, no entry (R2-13)"); g_map_fail = 0;
+  // ---- the CreateDMA path's shared buffer belongs to the caller: ReleaseDMA never releases it ----
+  IOMemoryDescriptor* shared = nullptr;
+  check(uc->CopyClientMemoryForType_Impl(0x8000, nullptr, &shared) == 0 && shared && uc->ivars->dmaCount == 20, "CopyClientMemoryForType(size) -> CreateDMA entry");
+  { const uint64_t* seg = (const uint64_t*)(shared->mem.data() + IOVMPageSize); bool page0 = true;
+    for (size_t i = 0; i < IOVMPageSize; i++) page0 = page0 && shared->mem[i] == 0;
+    snprintf(m, sizeof m, "CreateDMA maps the segment list at offset %#llx, length %#llx, alignment %llu; list [%#llx, %#llx, 0, 0]; page 0 untouched",
+             (unsigned long long)g_map_off, (unsigned long long)g_map_len, (unsigned long long)g_map_align, (unsigned long long)seg[0], (unsigned long long)seg[1]);
+    check(g_map_off == IOVMPageSize && g_map_len == IOVMPageSize && g_map_align == 0 && seg[0] == uc->ivars->dmas[19].iova && seg[1] == 0x8000 &&
+          seg[2] == 0 && seg[3] == 0 && page0, m); }
+  { IOMemoryDescriptor* small = nullptr; int alive = g_cmd_alive; uint32_t n = uc->ivars->dmaCount;
+    check(uc->CopyClientMemoryForType_Impl(IOVMPageSize, nullptr, &small) == kIOReturnBadArgument && !small && g_cmd_alive == alive && uc->ivars->dmaCount == n,
+          "CopyClientMemoryForType(one page): no room for the list at the second page -> refused, its DMA command released, no entry"); }
+  int rc = shared->rc; uint64_t siova = uc->ivars->dmas[19].iova;
+  check(call(uc, ReleaseDMA, {siova}) == 0 && shared->rc == rc, "ReleaseDMA of that entry releases its DMA command, not the caller's buffer");
+  // ---- Stop: every remaining mapping completed and released ----
+  int c1 = g_completes, left = (int)uc->ivars->dmaCount;
+  uc->Stop_Impl(drv);
+  snprintf(m, sizeof m, "user client Stop -> %d remaining DMA commands completed and released (alive now %d)", left, g_cmd_alive);
+  check(g_completes == c1 + left && g_cmd_alive == 0 && uc->ivars->dmaCount == 0, m);
+  // ---- QuiesceOnStop: bus master cleared in the user client's Stop, before its first DMA mapping is completed ----
+  auto quiesce_case = [&](bool arm, uint16_t cmd0, const char* what, uint16_t want, bool written) {
+    auto q = client(drv, ents(arr({"org.tinygrad.tinygpu.driver2"}))); memcpy(pci->cfg + 4, &cmd0, 2);
+    kern_return_t ra = arm ? call(q, QuiesceOnStop, {}) : 0;
+    for (int i = 0; i < 2; i++) call(q, PrepareDMA, {}, nullptr, in, out);
+    int c0 = g_completes; g_cmdw_completes = -1; q->Stop_Impl(drv); uint16_t cmd; memcpy(&cmd, pci->cfg + 4, 2);
+    snprintf(m, sizeof m, "%s: PCI_COMMAND %#x -> %#x%s, 2 DMA mappings completed", what, cmd0, cmd,
+             g_cmdw_completes < 0 ? ", not written" : g_cmdw_completes == c0 ? ", written before the first completion" : ", written AFTER a completion");
+    check(ra == 0 && cmd == want && (written ? g_cmdw_completes == c0 : g_cmdw_completes < 0) && g_completes == c0 + 2, m); };
+  { uint16_t on = 0x0406, cmd; memcpy(pci->cfg + 4, &on, 2);   // each client's first call reads the entitlements current at that moment
+    auto q = client(drv, ents(arr({"org.tinygrad.tinygpu.driver2"}))); kern_return_t r1 = call(q, QuiesceOnStop, {1});
+    auto bad = client(drv, ents(nullptr)); kern_return_t r2 = call(bad, QuiesceOnStop, {});
+    q->Stop_Impl(drv); bad->Stop_Impl(drv); memcpy(&cmd, pci->cfg + 4, 2);
+    snprintf(m, sizeof m, "QuiesceOnStop with a scalar -> %#x, from an unentitled client -> %#x; neither arms it: PCI_COMMAND after both Stops %#x", r1, r2, cmd);
+    check(r1 == kIOReturnBadArgument && r2 == kIOReturnNotPermitted && cmd == 0x0406, m); }
+  quiesce_case(true, 0x0406, "armed, bus master on", 0x0402, true);
+  quiesce_case(false, 0x0406, "not armed (stock client), bus master on", 0x0406, false);
+  quiesce_case(true, 0xffff, "armed, config reads 0xffff (card gone)", 0xffff, false);
+  quiesce_case(true, 0x0402, "armed, bus master already off", 0x0402, false);
+  { uint16_t z = 0; memcpy(pci->cfg + 4, &z, 2); }
+  // ---- NewUserClient: a created object that is not an IOUserClient is released and refused (stock leaked it and returned success) ----
+  { IOUserClient* o = (IOUserClient*)0x1; g_create_kind = 0; kern_return_t r0 = drv->NewUserClient_Impl(0, &o);
+    check(r0 == kIOReturnUnsupported, "NewUserClient: Create failing -> its error returned");
+    o = (IOUserClient*)0x1; g_create_kind = 1; g_create_freed = 0; kern_return_t r1 = drv->NewUserClient_Impl(0, &o);
+    snprintf(m, sizeof m, "NewUserClient: created object not an IOUserClient -> %#x, client %p, object released %d time(s)", r1, (void*)o, g_create_freed);
+    check(r1 == kIOReturnError && o == nullptr && g_create_freed == 1, m);
+    g_create_kind = 2; o = nullptr; kern_return_t r2 = drv->NewUserClient_Impl(0, &o);
+    check(r2 == 0 && o && o->rc == 1, "NewUserClient: a user client -> success, handed to the caller with its one reference"); g_create_kind = 0; }
+  // ---- driver Stop closes its provider (R2-12) ----
+  drv->Stop_Impl(pci);
+  check(pci->closes == 1, "driver Stop closes the PCI provider and calls the superclass Stop");
+  auto drv2 = new TinyGPUDriver; drv2->init(); check(drv2->Stop_Impl(pci) == 0 && pci->closes == 1, "driver Stop without an opened provider -> no dereference, nothing closed");
+  { auto pci3 = new IOPCIDevice; memcpy(pci3->cfg, &id, 4); uint16_t on = 0x0406, cmd; memcpy(pci3->cfg + 4, &on, 2);
+    auto drv3 = new TinyGPUDriver; drv3->init(); drv3->Start_Impl(pci3); memcpy(pci3->cfg + 4, &on, 2);
+    auto q = client(drv3, ents(arr({"org.tinygrad.tinygpu.driver2"}))); kern_return_t ra = call(q, QuiesceOnStop, {});
+    drv3->Stop_Impl(pci3); g_cmdw_completes = -1; q->Stop_Impl(drv3); memcpy(&cmd, pci3->cfg + 4, 2);
+    check(ra == 0 && pci3->closes == 1 && cmd == 0x0406 && g_cmdw_completes < 0,
+          "driver stopped before its armed user client -> the user client's Stop finds no device and writes nothing to the closed one"); }
+  // ---- the MI50 hook in Start: the bring-up runs for 1002:66a1 only (seen as its GetBARInfo(5)), on the opened device, its command register
+  // written (IO, memory, bus master) only after MI50BarFix's state was read (finding 8); a bring-up that fails -> registered all the same, and
+  // the user client serves RESET only (finding 15). Here it fails because no card is behind the device (every register reads all-ones: no
+  // VBIOS); the bring-up on the virtual MI50, done and failed: t_dext.cpp D12/D13 ----
+  for (auto [dev_id, tag] : std::vector<std::tuple<uint32_t, const char*>>{{0x66a11002, "MI50 without a card behind it, bring-up fails"},
+         {0x73bf1002, "another AMD device"}, {0x66a110de, "device 66a1 of another vendor"}}) {
+    auto p = new IOPCIDevice; memcpy(p->cfg, &dev_id, 4); auto d = new TinyGPUDriver; d->init();
+    BARINFO5_CALLS = 0; BARINFO5_OPENS = 0; BARINFO5_CMD = 0; g_registers = 0; g_logs.clear(); STATE_QUERIES = 0; FIRST_CMDW_QUERIES = -1;
+    kern_return_t r = d->Start_Impl(p); uint32_t v = 0; kern_return_t rc = d->CfgRead(0, 4, &v);
+    bool mi50 = dev_id == 0x66a11002;
+    uint16_t cmd; memcpy(&cmd, p->cfg + 4, 2);
+    bool good = mi50 ? r == 0 && p->closes == 0 && d->GetPCI() == p && g_registers == 1 && d->MI50Refused() && logged("tinygpu: mi50: INITIALISATION FAILED")
+                     : r == 0 && p->closes == 0 && d->GetPCI() == p && g_registers == 1 && rc == 0 && v == dev_id && !d->MI50Refused();
+    bool hook = mi50 ? BARINFO5_CALLS == 1 && BARINFO5_OPENS == 1 && (BARINFO5_CMD & 7) == 0 && FIRST_CMDW_QUERIES >= 1 && (cmd & 7) == 7
+                     : BARINFO5_CALLS == 0 && !logged("tinygpu: mi50:") && (cmd & 7) == 7;
+    snprintf(m, sizeof m, "Start, %s: bring-up x%d (command %#x at GetBARInfo(5), written after %d kext state read(s), %#x after), Start -> %#x, "
+             "registered %d, closed %d%s", tag, BARINFO5_CALLS, BARINFO5_CMD, FIRST_CMDW_QUERIES, cmd, r, g_registers, p->closes, mi50 ? ", refused" : "");
+    check(good && hook, m);
+    if (mi50) {   // the user client of a MI50 whose bring-up failed: RESET only
+      auto u = client(d, ents(arr({"org.tinygrad.tinygpu.driver2"}))); uint64_t x = 0; IOMemoryDescriptor* md = nullptr; g_logs.clear();
+      kern_return_t r1 = call(u, ReadCfg, {0, 4}, &x), r2 = u->CopyClientMemoryForType_Impl(5, nullptr, &md), r3 = call(u, Reset, {});
+      snprintf(m, sizeof m, "MI50 bring-up failed: ReadCfg -> %#x, BAR map -> %#x, RESET -> %#x (the bring-up tried again: %s)", r1, r2, r3,
+               logged("(reset)") ? "yes" : "no");
+      check(r1 == kIOReturnNotReady && r2 == kIOReturnNotReady && !md && r3 == kIOReturnNotReady && logged("INITIALISATION FAILED after") && logged("(reset)"), m);
+      // bug 1: the MI50 selector passes the gate and answers with the bring-up's failure reason (OP_SMU_VERSION 17: status 1, err = c->why)
+      uint8_t rq[72] = {}; uint32_t op = 17; memcpy(rq, &op, sizeof(op));
+      uint64_t so[2] = {}; IOUserClientMethodArguments a{nullptr, 0, so, 0, nullptr, nullptr};
+      a.structureInput = OSData::withBytes(rq, sizeof(rq)); a.structureOutputMaximumSize = 1568;
+      kern_return_t r4 = u->ExternalMethod(MI50, &a, nullptr, nullptr, nullptr); a.structureInput->release();
+      int32_t st = -1; char why[505] = {};
+      if (a.structureOutput) { const char* b = (const char*)a.structureOutput->getBytesNoCopy(); memcpy(&st, b, 4); memcpy(why, b + 8, 504); a.structureOutput->release(); }
+      snprintf(m, sizeof m, "MI50 bring-up failed: the MI50 selector -> %#x, status %d, reason \"%s\" (the reason logged at the failure: %s)", r4, st, why,
+               why[0] && logged(why) ? "yes" : "no");
+      check(r4 == 0 && st == 1 && why[0] && logged(why), m);
+      u->Stop_Impl(d);
+    }
+    d->Stop_Impl(p);
+  }
+  // ---- the MI50 selector on a card that is not a MI50: no request -> bad argument; a request -> unsupported (no MI50 state) ----
+  { auto u = client(drv, ents(arr({"org.tinygrad.tinygpu.driver2"})));
+    uint64_t o[2] = {}; IOUserClientMethodArguments a{nullptr, 0, o, 0, nullptr, nullptr};
+    kern_return_t r1 = u->ExternalMethod(MI50, &a, nullptr, nullptr, nullptr);
+    uint8_t req[72] = {}; a.structureInput = OSData::withBytes(req, sizeof(req)); a.structureOutputMaximumSize = 1568;
+    kern_return_t r2 = u->ExternalMethod(MI50, &a, nullptr, nullptr, nullptr); a.structureInput->release();
+    snprintf(m, sizeof m, "MI50 selector on another card: no request -> %#x, a request -> %#x, no reply set", r1, r2);
+    check(r1 == kIOReturnBadArgument && r2 == kIOReturnUnsupported && !a.structureOutput, m);
+    u->Stop_Impl(drv); }
+  // ---- vendor fixes (2026-10-16) ----
+  // init: IONewZero (IOFree's allocator, NULL on failure) instead of new; every init failure logged
+  { auto d = new TinyGPUDriver; g_logs.clear(); g_alloc_fail_at = g_allocs + 1; bool ok = d->init(); g_alloc_fail_at = 0; TinyGPUDriver_IVars* iv = d->ivars; d->free();
+    check(!ok && !iv && logged("tinygpu: init: no memory for the driver state"), "driver init, no memory for its state -> false, logged, free() after it is safe");
+    auto d2 = new TinyGPUDriver; g_logs.clear(); g_init_fail = 1; bool ok2 = d2->init(); g_init_fail = 0;
+    check(!ok2 && logged("tinygpu: init: IOService::init failed"), "driver init, IOService::init failing -> false, logged");
+    auto u = new TinyGPUDriverUserClient; g_logs.clear(); g_alloc_fail_at = g_allocs + 1; bool ok3 = u->init(); g_alloc_fail_at = 0; u->free();
+    auto u2 = new TinyGPUDriverUserClient; g_init_fail = 1; bool ok4 = u2->init(); g_init_fail = 0;
+    check(!ok3 && !ok4 && logged("tinygpu: user client: no memory for its state") && logged("tinygpu: user client: IOUserClient::init failed"),
+          "user client init: no memory / IOUserClient::init failing -> false, both logged"); }
+  // a user client that outlives the driver's Stop (the device closed, ivars->pci = nullptr): BAR map, PrepareDMA, CreateDMA, Reset refused, not
+  // dereferenced (stock MapBar / SetupDMA used the device pointer unchecked)
+  { auto p = new IOPCIDevice; memcpy(p->cfg, &id, 4); auto d = new TinyGPUDriver; d->init(); d->Start_Impl(p);
+    auto u = client(d, ents(arr({"org.tinygrad.tinygpu.driver2"})));
+    d->Stop_Impl(p); g_logs.clear();
+    IOMemoryDescriptor *md = nullptr, *sh = nullptr; int alive = g_cmd_alive;
+    kern_return_t rb = u->CopyClientMemoryForType_Impl(0, nullptr, &md), rp = call(u, PrepareDMA, {}, nullptr, in, out),
+                  rc = u->CopyClientMemoryForType_Impl(0x8000, nullptr, &sh), rr = call(u, Reset, {});
+    snprintf(m, sizeof m, "driver stopped, its user client still up: BAR map %#x, PrepareDMA %#x, CreateDMA %#x, Reset %#x, each logged", rb, rp, rc, rr);
+    check(rb == kIOReturnNotReady && !md && rp == kIOReturnNotReady && rc == kIOReturnNotReady && !sh && rr == kIOReturnNotReady && g_cmd_alive == alive &&
+          logged("tinygpu: bar mapping 0: no device") && logged_n("tinygpu: DMA setup: no device") == 2 && logged("tinygpu: reset: no device"), m);
+    // the user client's own Stop resets its provider: an RPC after it is refused (stock dereferenced the null provider)
+    u->Stop_Impl(d); g_logs.clear(); uint64_t v = 0;
+    kern_return_t ra = call(u, ReadCfg, {0, 4}, &v);
+    check(ra == kIOReturnNotAttached && logged("tinygpu: rpc (0): not attached"), "an RPC after the user client's Stop -> kIOReturnNotAttached, logged"); }
+  // a user client started on a provider that is not the TinyGPU driver: Start fails (stock started with a null provider)
+  { auto u = new TinyGPUDriverUserClient; u->init(); auto plain = new IOPCIDevice; g_logs.clear(); g_ents = ents(arr({"org.tinygrad.tinygpu.driver2"}));
+    kern_return_t rs = u->Start_Impl(plain); uint64_t v = 0; kern_return_t re = call(u, ReadCfg, {0, 4}, &v);
+    snprintf(m, sizeof m, "user client on a provider that is not the TinyGPU driver: Start %#x, then ReadCfg %#x", rs, re);
+    check(rs == kIOReturnBadArgument && logged("tinygpu: user client provider is not the TinyGPU driver") && re == kIOReturnNotAttached, m); }
+  // every failure is logged: a sample of each kind of refusal
+  { auto p = new IOPCIDevice; memcpy(p->cfg, &id, 4); auto d = new TinyGPUDriver; d->init(); d->Start_Impl(p);
+    auto u = client(d, ents(arr({"org.tinygrad.tinygpu.driver2"}))); g_logs.clear(); uint64_t v = 0;   // access is decided at the first call
+    IOMemoryDescriptor* md = nullptr; IOUserClientMethodArguments a{nullptr, 0, nullptr, 0, nullptr, nullptr};
+    call(u, ReadCfg, {0, 3}, &v); call(u, WriteCfg, {0x1000, 1, 1}); call(u, ReadCfg, {0}, &v); call(u, WriteCfg, {0}); call(u, ReleaseDMA, {0x1234});
+    call(u, ReleaseDMA, {}); call(u, QuiesceOnStop, {1}); u->ExternalMethod(99, &a, nullptr, nullptr, nullptr); call(u, PrepareDMA, {});
+    u->CopyClientMemoryForType_Impl(0, nullptr, nullptr); u->CopyClientMemoryForType_Impl(IOVMPageSize, nullptr, &md);
+    auto bad = client(d, ents(nullptr)); call(bad, ReadCfg, {0, 4}, &v); call(bad, ReadCfg, {0, 4}, &v);
+    const char* want[] = {"cfg read off:0 sz:3: bad request", "cfg write off:1000 sz:1: bad request", "read cfg: bad arguments", "wr cfg: bad arguments",
+                          "ReleaseDMA: no mapping at iova 0x1234", "ReleaseDMA: bad arguments", "QuiesceOnStop: bad arguments", "rpc (99): unsupported",
+                          "PrepareDMA requires buffers", "memory for type 0: no output", "DMA segment list map failed"};
+    std::string miss; for (auto w : want) if (!logged(w)) miss += std::string(" [") + w + "]";
+    check(miss.empty() && logged_n("client refused") == 2, ("each refusal logged, a refused client on every call" + (miss.empty() ? std::string("") : ", missing:" + miss)).c_str()); }
+  // Reset: function reset, hot reset when that fails; each failure logged
+  { auto p = new IOPCIDevice; memcpy(p->cfg, &id, 4); auto d = new TinyGPUDriver; d->init(); d->Start_Impl(p);
+    auto u = client(d, ents(arr({"org.tinygrad.tinygpu.driver2"})));
+    const char* what[4] = {"both work", "function reset fails, hot reset works", "hot reset would fail, function reset works", "both fail"};
+    for (int k = 0; k < 4; k++) {   // p->reset_fail: bit 1 function reset, bit 2 hot reset
+      p->reset_fail = k; g_logs.clear(); kern_return_t r = call(u, Reset, {});
+      bool fl = logged("function reset failed"), hl = logged("hot reset failed");
+      snprintf(m, sizeof m, "Reset, %s -> %#x%s%s", what[k], r, fl ? ", function reset failure logged" : "", hl ? ", hot reset failure logged" : "");
+      check(k == 3 ? r != 0 && fl && hl : r == 0 && fl == (k == 1) && !hl, m); }
+    p->reset_fail = 0;
+    // the 1-byte read and the 4-byte write of the config space
+    uint64_t v = 0; p->cfg[0x3c] = 0x5a;
+    check(call(u, ReadCfg, {0x3c, 1}, &v) == 0 && v == 0x5a && call(u, WriteCfg, {0x40, 4, 0x11223344}) == 0 && p->cfg[0x40] == 0x44 && p->cfg[0x43] == 0x11,
+          "ReadCfg size 1, WriteCfg size 4 served");
+    // a user client freed after a normal init returns its state; started without a provider it refuses
+    auto u2 = new TinyGPUDriverUserClient; u2->init(); g_logs.clear(); kern_return_t rs = u2->Start_Impl(nullptr); u2->free();
+    check(rs == kIOReturnBadArgument && logged("tinygpu: provider is null") && !u2->ivars, "user client Start without a provider -> refused, logged; free() returns its state"); }
+  // every DriverKit failure on the dext's paths is returned and logged (g_fail: the mock's failure points)
+  { auto p = new IOPCIDevice; memcpy(p->cfg, &id, 4); auto d = new TinyGPUDriver; d->init();
+    g_fail = F_START; g_logs.clear(); kern_return_t r1 = d->Start_Impl(p); g_fail = 0;
+    auto d2 = new TinyGPUDriver; d2->init(); auto other = new TinyGPUDriver; g_logs.clear(); kern_return_t r2 = d2->Start_Impl(other);
+    check(r1 == kIOReturnError && r2 == kIOReturnNoDevice && logged("tinygpu: provider is not a PCI device"), "driver Start: IOService::Start failing / a provider "
+          "that is not a PCI device -> the error, logged");
+    g_fail = F_START; g_logs.clear(); d->Start_Impl(p); bool sl = logged("tinygpu: IOService::Start failed"); g_fail = 0;
+    check(sl, "  IOService::Start failing is logged");
+    d->Start_Impl(p);
+    auto u = client(d, ents(arr({"org.tinygrad.tinygpu.driver2"}))); IOMemoryDescriptor* md = nullptr; uint32_t n0 = (uint32_t)u->ivars->dmaCount; int alive = g_cmd_alive;
+    struct { int f; const char* what; std::function<kern_return_t()> op; const char* log; } fp[] = {
+      {F_BARINFO, "BAR map, GetBARInfo failing", [&] { return u->CopyClientMemoryForType_Impl(0, nullptr, &md); }, "bar mapping 0: GetBARInfo failed"},
+      {F_DEVMEM, "BAR map, _CopyDeviceMemoryWithIndex failing", [&] { return u->CopyClientMemoryForType_Impl(0, nullptr, &md); }, "_CopyDeviceMemoryWithIndex failed"},
+      {F_DMACREATE, "PrepareDMA, IODMACommand::Create failing", [&] { return call(u, PrepareDMA, {}, nullptr, in, out); }, "DMA create failed"},
+      {F_DMAPREP, "PrepareDMA, PrepareForDMA failing", [&] { return call(u, PrepareDMA, {}, nullptr, in, out); }, "PrepareForDMA failed"},
+      {F_BUFCREATE, "CreateDMA, IOBufferMemoryDescriptor::Create failing", [&] { return u->CopyClientMemoryForType_Impl(0x8000, nullptr, &md); }, "alloc failed"}};
+    for (auto& f : fp) { g_fail = f.f; g_logs.clear(); md = nullptr; kern_return_t r = f.op(); g_fail = 0;
+      snprintf(m, sizeof m, "%s -> %#x, logged, no entry, no DMA command left", f.what, r);
+      check(r != 0 && !md && logged(f.log) && u->ivars->dmaCount == n0 && g_cmd_alive == alive, m); }
+    // the DMA record array cannot grow: a new client's first mapping
+    auto u2 = client(d, ents(arr({"org.tinygrad.tinygpu.driver2"}))); g_logs.clear();
+    g_alloc_fail_at = g_allocs + 1; kern_return_t ra = call(u2, PrepareDMA, {}, nullptr, in, out);
+    g_alloc_fail_at = g_allocs + 1; kern_return_t rb = u2->CopyClientMemoryForType_Impl(0x8000, nullptr, &md); g_alloc_fail_at = 0;
+    check(ra == kIOReturnNoMemory && rb == kIOReturnNoMemory && logged_n("no memory for 16 DMA records") == 2 && logged("PrepareDMA: cannot grow dma array") &&
+          logged("tinygpu: cannot grow dma array"), "the DMA record array cannot grow -> PrepareDMA / CreateDMA refused, both logged");
+    // CfgRead without an output, IOService::Stop failing, the user client's super Start failing
+    g_logs.clear(); kern_return_t rc = d->CfgRead(0, 4, nullptr);
+    check(rc == kIOReturnNotReady && logged("cfg read off:0 sz:4: no output"), "CfgRead without an output -> refused, logged");
+    g_fail = F_STOP; g_logs.clear(); kern_return_t rs = u2->Stop_Impl(d); g_fail = 0;
+    check(rs == kIOReturnError && logged("tinygpu: IOService::Stop failed"), "user client Stop, IOService::Stop failing -> its error, logged");
+    auto u3 = new TinyGPUDriverUserClient; u3->init(); g_fail = F_START; g_logs.clear(); kern_return_t r3 = u3->Start_Impl(d); g_fail = 0;
+    check(r3 == kIOReturnError && logged("tinygpu: failed to start super"), "user client Start, IOService::Start failing -> its error, logged");
+    // after Stops: the client's memory request, the driver's config write
+    u->Stop_Impl(d); g_logs.clear(); kern_return_t rm = u->CopyClientMemoryForType_Impl(0, nullptr, &md);
+    g_fail = F_STOP; kern_return_t rd = d->Stop_Impl(p); g_fail = 0; kern_return_t rw = d->CfgWrite(0x40, 2, 0);
+    check(rm == kIOReturnNotAttached && logged("memory for type 0: not attached") && rd == kIOReturnError && logged("tinygpu: IOService::Stop failed") &&
+          rw == kIOReturnNotReady && logged("cfg write off:40 sz:2: no device"), "after the Stops: memory request, driver Stop failing, config write -> refused, each logged"); }
+  printf("\n%d failure(s)\n", fails);
+  return fails != 0;
+}

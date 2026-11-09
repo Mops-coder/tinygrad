@@ -42,7 +42,8 @@ class PMCSample: name:str; block:str; xcc:int; inst:int; se:int; sa:int; wgp:int
 class ProfilePMCEvent(ProfileEvent): device:str; kern:int; sched:list[PMCSample]; blob:bytes; exec_tag:int # noqa: E702
 
 class AMDSignal(HCQSignal):
-  def __init__(self, *args, **kwargs): super().__init__(*args, **{**kwargs, 'timestamp_divider': 100})
+  # timestamps tick at the device's clock: 100 MHz unless the device knows its own (mi50: the VBIOS reference clock, 25 MHz)
+  def __init__(self, *args, **kwargs): super().__init__(*args, **{**kwargs, 'timestamp_divider': getattr(kwargs.get('owner'), 'timestamp_mhz', 100)})
 
   def _sleep(self, time_spent_since_last_sleep_ms:int):
     # Reasonable to sleep for long workloads (which take more than 200ms) and only timeline signals.
@@ -132,8 +133,12 @@ class AMDComputeQueue(HWQueue):
 
   def memory_barrier(self):
     pf = '0' if self.nbio.version[:2] != (7, 11) else '1'
+    # mi50: GPU_HDP_FLUSH_DONE has 12 client bits (reads 0xfff on the card), so an all-ones >= wait never ends. Linux waits for the ring's
+    # own bit with ==: amdgpu_gfx_get_hdp_flush_mask (compute: ref_and_mask_cp2 << pipe = 0x4, AM's one compute queue is ME1 pipe 0)
+    # + gfx_v9_0_wait_reg_mem (FUNCTION 3, equal)
+    val, op = (0x4, WAIT_REG_MEM_FUNCTION_EQ) if self.dev.target == (9, 0, 6) else (0xffffffff, WAIT_REG_MEM_FUNCTION_GEQ)
     self.wait_reg_mem(reg=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ').addr[0],
-                      reg_done=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE').addr[0], value=0xffffffff)
+                      reg_done=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE').addr[0], value=val, mask=val, op=op)
     return self.acquire_mem()
 
   def spi_config(self, tracing:bool):
@@ -328,7 +333,8 @@ class AMDComputeQueue(HWQueue):
       scratch_hilo = data64_le(prg.dev.scratch.va_addr)
       # sgpr word1 bit31 enables swizzle
       # sgpr word3 = 0x14 << 12 | 2 << 28 | 2 << 21 | 1 << 23
-      user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, 0x20c14000]
+      # mi50: gfx9 reads word3 in its own (wave64) layout: the AQL path's gfx9 descriptor, DST_SEL XYZW, UINT/32, ELEMENT_SIZE 4 B, INDEX_STRIDE 64
+      user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, 0x00ea4fac if self.dev.target == (9,0,6) else 0x20c14000]
 
     if prg.enable_dispatch_ptr:
       dp = (dp_t:=hsa.hsa_kernel_dispatch_packet_t).from_address(int((disp_buf:=args_state.buf.offset(prg.kernargs_segment_size)).va_addr))
@@ -340,12 +346,15 @@ class AMDComputeQueue(HWQueue):
       user_regs += [*data64_le(disp_buf.va_addr)]
 
     user_regs += [*data64_le(args_state.buf.va_addr)]
+    # mi50: gfx906 has "absolute flat scratch" (LLVM AMDGPUUsage): Flat Scratch Init follows the kernarg pointer and holds the 64-bit base of the
+    # queue's scratch backing memory; the kernel prolog adds the wave offset. Targets with architected flat scratch never set the bit.
+    if prg.enable_flat_scratch_init: user_regs += [*data64_le(prg.dev.scratch.va_addr)]
 
     if prg.dev.sqtt_enabled: self.sqtt_setup_exec(prg, global_size)
 
     self.wreg(self.gc.regCOMPUTE_PGM_LO, *data64_le(prg.prog_addr >> 8))
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, prg.rsrc1, prg.rsrc2)
-    self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3)
+    if prg.dev.target != (9,0,6): self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3) # mi50: gfx906 has no COMPUTE_PGM_RSRC3
     self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, prg.dev.tmpring_size)
 
     # this is what llvm refers to as "architected flat scratch"
@@ -571,6 +580,15 @@ class AMDProgram(HCQProgram['AMDDevice']):
       if typ == 5: image[apply_image_offset:apply_image_offset+8] = struct.pack('<q', rel_sym_offset - apply_image_offset + addent) # R_AMDGPU_REL64
       else: raise RuntimeError(f"unknown AMD reloc {typ}")
 
+    # mi50: the PM4 dispatch sets the private segment buffer, dispatch ptr, kernarg ptr and flat scratch init user SGPRs only; a kernel
+    # that also enables queue ptr, dispatch id or private segment size would read its arguments from the wrong SGPRs: refused before upload
+    props = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t.from_buffer_copy(bytes(image[rodata_entry:rodata_entry+
+                                                                         ctypes.sizeof(amdgpu_kd.llvm_amdhsa_kernel_descriptor_t)])).kernel_code_properties
+    if unset:=props & (hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_QUEUE_PTR | hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_DISPATCH_ID |
+                       hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_SIZE):
+      raise RuntimeError(f"{self.name}: kernel enables user SGPRs the dispatch does not set (kernel_code_properties {props:#x}, {unset:#x})")
+    if dev.target == (9,0,6) and props & amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32:
+      raise RuntimeError(f"{self.name}: gfx906 requires wave64; refusing a wave32 kernel")
     self.lib_gpu = self.dev.allocator.alloc(round_up(image.nbytes, 0x1000), buf_spec:=BufferSpec(nolru=True))
     self.dev.allocator._copyin(self.lib_gpu, image)
     self.dev.synchronize()
@@ -598,6 +616,7 @@ class AMDProgram(HCQProgram['AMDDevice']):
     # The packet is represented as a pointer and set up in SGPRs. Space for the packet is allocated as part of the kernel arguments.
     self.enable_dispatch_ptr: int = desc.kernel_code_properties & hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_DISPATCH_PTR
     self.enable_private_segment_sgpr: int = desc.kernel_code_properties & hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER
+    self.enable_flat_scratch_init: int = desc.kernel_code_properties & hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_FLAT_SCRATCH_INIT
     additional_alloc_sz = ctypes.sizeof(hsa.hsa_kernel_dispatch_packet_t) if self.enable_dispatch_ptr else 0
 
     if dev.sqtt_enabled: self.libhash: tuple[int, int] = struct.unpack('<Q', hashlib.md5(self.lib).digest()[:8])*2
@@ -894,8 +913,9 @@ class KFDIface:
   def is_wgp_active(self, xcc, se, sa, wgp) -> bool: return ((self.drm_dev_info.cu_bitmap[se % 4][sa + (se // 4) * 2] >> (2 * wgp)) & 0x3) == 0x3
 
 class PCIIface(PCIIfaceBase):
+  VENDOR, DEVICES, BASE_CLASS = 0x1002, ((0xffff, (0x74a1,0x744c,0x7480,0x7550,0x7551,0x7590,0x75a0,0x75a8,0x66a1)),), None
   def __init__(self, dev, dev_id):
-    super().__init__(dev, dev_id, vendor=0x1002, devices=((0xffff, (0x74a1,0x744c,0x7480,0x7550,0x7551,0x7590,0x75a0,0x75a8)),), vram_bar=0,
+    super().__init__(dev, dev_id, vendor=self.VENDOR, devices=self.DEVICES, vram_bar=0,
       va_start=AMMemoryManager.va_allocator.base, va_size=AMMemoryManager.va_allocator.size, dev_impl_t=AMDev)
     self._compute_props()
 
@@ -920,7 +940,7 @@ class PCIIface(PCIIfaceBase):
     self.props = {'cu_per_simd_array': cu_per_sa, 'simd_count': 2 * cu_per_sa * array_count, 'simd_per_cu': 2, 'array_count': array_count,
       'max_slots_scratch_cu': self.dev_impl.gc_info.gc_max_scratch_slots_per_cu, 'max_waves_per_simd': self.dev_impl.gc_info.gc_max_waves_per_simd,
       'simd_arrays_per_engine': max_sh_per_se, 'lds_size_in_kb': self.dev_impl.gc_info.gc_lds_size, 'num_xcc': self.dev_impl.gfx.xccs,
-      'gfx_target_version': {90403: 90402}.get(gfxver, gfxver)}
+      'gfx_target_version': {90403: 90402, 90400: 90006}.get(gfxver, gfxver)}
 
   def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
                    xcc_id=0, idx=0):
@@ -992,6 +1012,8 @@ def _mock(iface, name=None): return type(name or f"MOCK{iface.__name__}", (iface
 class AMDDevice(HCQCompiled):
   ifaces = [KFDIface, PCIIface, USBIface, _mock(KFDIface, "MOCKIface"), _mock(KFDIface), _mock(PCIIface), _mock(USBIface)]
 
+  def _renderer_name(self, r): return super()._renderer_name(getattr(r, "base_renderer", r))
+
   def is_am(self) -> bool: return isinstance(self.iface, (PCIIface, USBIface))
   def is_usb(self) -> bool: return isinstance(self.iface, USBIface)
 
@@ -1000,7 +1022,7 @@ class AMDDevice(HCQCompiled):
 
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
-    assert (self.target in ((9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
+    assert (self.target in ((9,0,6),(9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 
     self.xccs = self.iface.props.get('num_xcc', 1)
@@ -1039,8 +1061,16 @@ class AMDDevice(HCQCompiled):
     self.max_copy_size = 0x40000000 if self.iface.ip_versions[am.SDMA0_HWIP][0] >= 5 else 0x400000
     self.sdma_queues:dict = {}
     self.has_sdma_queue = self.sdma_queue(0) is not None
+    self.timestamp_mhz = getattr(getattr(self.iface, 'dev_impl', None), 'timestamp_mhz', 100)   # before super().__init__ makes the first signals
 
-    super().__init__(device, AMDAllocator(self), [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer], AMDProgram, AMDSignal,
+    renderers = [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer]
+    # This Mini's PCI-named Vega20 card. No hardware reads or setting changes here.
+    if (self.arch == "gfx906" and type(self.iface) is PCIIface
+        and getattr(self.iface.dev_impl, "is_vega20", False)
+        and self.iface.pci_dev.pcibus.lower() == "1002:66a1"):
+      from tinygrad.renderer.mi50 import MI50HIPRenderer, MI50LLVMRenderer, MI50HIPCCRenderer
+      renderers = [MI50HIPRenderer, MI50LLVMRenderer, MI50HIPCCRenderer]
+    super().__init__(device, AMDAllocator(self), renderers, AMDProgram, AMDSignal,
                      functools.partial(AMDComputeAQLQueue if self.is_aql else AMDComputeQueue, self),
                      functools.partial(AMDCopyQueue, self, max_copy_size=self.max_copy_size) if self.has_sdma_queue else None,
                      kernargs_size=(8 << 10) if self.is_usb() else (16 << 20), sigalloc_size=0x100 if self.is_usb() else 0x1000,

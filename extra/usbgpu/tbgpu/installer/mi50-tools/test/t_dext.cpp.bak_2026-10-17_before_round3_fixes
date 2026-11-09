@@ -1,0 +1,744 @@
+// t_dext.cpp - the TinyGPU driver's MI50 power-up path (TinyGPUDriver.cpp: StartMI50, the provider-chain link partner, TinyGPUDriver::Start
+// on the card) on the host. TinyGPUDriver.cpp is compiled unchanged, in this translation unit, against the stand-in headers in fake_driverkit/;
+// dk_card.hpp puts the virtual MI50 behind them and checks what DriverKit requires of a caller on the way: BAR5 accesses through BAR5's
+// memory index, dword aligned, inside the BAR; the uptime clock; IOFree with the IOMallocZero size; every retained OSObject released.
+// Build/run: see mi50-tools/build_and_test.sh.
+#include <algorithm>
+#include <array>
+#include <cstdarg>
+#include <functional>
+#include <memory>
+#include <zlib.h>   // crc32: the overdrive file's checksum as the control app's side computes it (link with -lz)
+#ifndef MI50_DRIVER_CPP   // build_and_test.sh also runs these cases on a copy generated with a built-in OverDrive table
+#define MI50_DRIVER_CPP "../../TinyGPUDriverExtension/TinyGPUDriver.cpp"
+#endif
+#include MI50_DRIVER_CPP
+#include "dk_card.hpp"
+
+using namespace vm;
+
+static int nfail = 0, nok = 0;
+static void check(bool c, const std::string &m) { printf("%s %s\n", c ? "ok  " : "FAIL", m.c_str()); if (c) nok++; else nfail++; }
+static LinuxFw FW;
+static std::vector<std::string> &LOG = g_logs;   // os_log lines
+
+static const int64_t GEN4_CAP = 0x00473904, GEN4_CAP2 = 0x1e;   // 16 GT/s x16: no override (t_mi50 L1) - on every entry that must not be the partner
+// the MI50 behind Thunderbolt: the driver, the card, its own AMD switch (downstream + upstream port), a PCI-looking entry without class-code,
+// the Thunderbolt downstream port (the partner), and further up a port that must not be used
+static std::vector<OSObject *> tb_chain(int64_t cap, int64_t cap2, OSDictionary *card = nullptr) {
+  return {other_entry(), card ? card : pci_entry(0x1002, 0x66a1, GEN4_CAP, GEN4_CAP2), other_entry(), pci_entry(0x1002, 0x14a1, GEN4_CAP, GEN4_CAP2),
+          other_entry(), pci_entry(0x1002, 0x14a0, GEN4_CAP, GEN4_CAP2), other_entry(), pci_entry(0x8086, 0x1111, GEN4_CAP, GEN4_CAP2, 4, false),
+          pci_entry(0x8086, 0x2222, cap, cap2), other_entry(), pci_entry(0x8086, 0x3333, GEN4_CAP, GEN4_CAP2)};
+}
+
+// ---- a card as IOPCIFamily + MI50BarFix leave it (t_mi50 make_from): REBAR 256 MiB, BAR0 placed above 4 GiB (or not), BAR2, BAR5 ----
+static std::unique_ptr<Card> card(bool bar0_placed = true) {
+  std::unique_ptr<Card> c(new Card(build_vbios().img, FW));
+  c->start();
+  c->cfg_wr(CFG_REBAR + 8, 8u << 8, 4);
+  c->cfg_wr(0x10, 0x50000000, 4); c->cfg_wr(0x14, bar0_placed ? 0x10 : 0, 4);
+  c->cfg_wr(0x18, 0x40000000, 4); c->cfg_wr(0x1c, 0, 4); c->cfg_wr(0x24, 0x40200000, 4);
+  c->cfg_writes.clear(); c->events.clear();
+  return c;
+}
+// clean: no contract violation, every IOMallocZero block back with its size, no OSObject left
+static bool clean(Card &c) {
+  return BAD.empty() && c.outstanding == 0 && fake_os_live == 0 && std::find(c.events.begin(), c.events.end(), "release_size_mismatch") == c.events.end() &&
+         std::find(c.events.begin(), c.events.end(), "release_unknown_pointer") == c.events.end() &&
+         std::find(c.events.begin(), c.events.end(), "mmio_past_bar5") == c.events.end();
+}
+static void reset_records(Card &c) {
+  CARD = &c; LOG.clear(); BAD.clear(); KEYS.clear(); ACCESSES = 0; fake_os_creates = 0;
+  KEXT_STATE = {{0, "placed"}}; STATE_ERR = 0; STATE_NO_CARD = STATE_NOT_STRING = false; STATE_QUERIES = 0; FIRST_CMDW_QUERIES = -1;
+}
+// StartMI50 as TinyGPUDriver::Start runs it, then StopMI50 as its Stop does; r = the bring-up succeeded (StartMI50 keeps the state of a
+// failed one: the service is registered and refuses everything but RESET, finding 15)
+struct Out { bool r; bool clean; std::vector<uint32_t> ov; };
+static Out start(Card &c) {
+  reset_records(c);
+  Out o;
+  { IOService svc; IOPCIDevice dev; mi50::Card *k = StartMI50(&svc, &dev); o.r = k && k->ok; if (k) StopMI50(k); }
+  set_chain({});
+  for (auto &m : c.smu_log) if (m.first == PPSMC_MSG_OverridePcieParameters) o.ov.push_back(m.second);
+  o.clean = clean(c);
+  return o;
+}
+static std::string logged(const std::string &s) { for (auto &l : LOG) if (l.find(s) != std::string::npos) return l; return ""; }
+static bool handed_over(Card &c) { return c.regs[GC_SCRATCH_REG7] == mi50::AM_VERSION && c.regs[GC_SCRATCH_REG6] == 0; }
+static std::string hx(uint64_t v) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v); return b; }
+static std::string ovs(const Out &o) { std::string s; for (auto x : o.ov) s += " " + hx(x); return s.empty() ? " none" : s; }
+static const std::vector<std::string> KEYS5 = {"vendor-id", "device-id", "class-code", "IOPCIExpressLinkCapabilities", "IOPCIExpressLinkCapabilities2"};
+// a full boot asks a second time, after the boot's OverDrive setup: the card's overdrive file property (MI50BarFix.kext publishes it)
+static const std::vector<std::string> ODKEYS = {"vendor-id", "device-id", "class-code", "MI50 Overdrive"};
+static std::vector<std::string> cat(std::vector<std::string> a, const std::vector<std::string> &b) { a.insert(a.end(), b.begin(), b.end()); return a; }
+
+// ---- the overdrive file (Leon 2026-10-16): "MI50OD01" + OverDriveTable_t (the power cap its OverDrivePct) + CRC-32 (zlib's crc32, the
+// control app's side) ----
+static std::vector<uint8_t> od_file(const OverDriveTable_t &t, bool good_crc = true) {
+  std::vector<uint8_t> b(44);
+  memcpy(b.data(), "MI50OD01", 8); memcpy(&b[8], &t, 32);
+  uint32_t crc = (uint32_t)crc32(0L, b.data(), 40) ^ (good_crc ? 0 : 1); memcpy(&b[40], &crc, 4);
+  return b;
+}
+// a tune inside every range: GPU 925..1900, flat curve 1000 mV at 925 / 1412 / 1900, memory 1100, fan 3000 RPM / 20 % (990 RPM), power +20 %;
+// FanTargetTemperature, MaxOpTemp, FanZeroRpmEnable and Padding set too: the driver takes those from the SMU instead
+static OverDriveTable_t tune() {
+  OverDriveTable_t t; memset(&t, 0, sizeof(t));
+  t.GfxclkFmin = 925; t.GfxclkFmax = 1900; t.GfxclkFreq1 = 925; t.GfxclkFreq2 = 1412; t.GfxclkFreq3 = 1900;
+  t.GfxclkVolt1 = t.GfxclkVolt2 = t.GfxclkVolt3 = 4 * 1000; t.UclkFmax = 1100;
+  t.OverDrivePct = 20; t.FanMaximumRpm = 3000; t.FanMinimumPwm = 20; t.FanTargetTemperature = 77; t.MaxOpTemp = 99; t.FanZeroRpmEnable = 1; t.Padding = 0x55;
+  return t;
+}
+static OSDictionary *card_with(const std::vector<uint8_t> *file) {
+  OSDictionary *d = pci_entry(0x1002, 0x66a1, 0x00473904, 0x1e);
+  if (file) { OSData *x = OSData::withBytes(file->data(), (uint32_t)file->size()); d->setObject("MI50 Overdrive", x); x->release(); }
+  return d;
+}
+static size_t count_msg(const Card &c, uint32_t msg, uint32_t p) { size_t n = 0; for (auto &m : c.smu_log) n += m.first == msg && m.second == p; return n; }
+static size_t count_any(const Card &c, uint32_t msg) { size_t n = 0; for (auto &m : c.smu_log) n += m.first == msg; return n; }
+
+int main(int argc, char **argv) {
+  if (argc != 3) { fprintf(stderr, "usage: t_dext <vega20 firmware dir> <V420.rom>\n"); return 2; }
+  FW = linux_fw(argv[1]);
+
+  // ================= D1: power-up behind Thunderbolt =================
+  std::unique_ptr<Card> c = card();
+  set_chain(tb_chain(0x00473903, 0x0e));   // the partner: 8 GT/s x16 (t_mi50 G)
+  Out o = start(*c);
+  check(o.r && handed_over(*c) && o.clean, "D1: StartMI50 = true, AM's hand-over state, no DriverKit contract violation, every buffer and OSObject released");
+  check(logged("tinygpu: mi50: BAR0 placed by MI50BarFix after ") != "", "D1: " + logged("BAR0"));
+  std::string l = logged("tinygpu: mi50: initialised in ");
+  char want[256];
+  snprintf(want, sizeof(want), "VRAM 32752 MiB, SMU 0x%x, features 0x%llx, PPT 178 W, POSTed", FW.smc_version, (unsigned long long)c->smu.enabled);
+  check(l.find(want) != std::string::npos, "D1: " + l);
+  check(KEYS == cat(KEYS5, ODKEYS), "D1: CopyProviderProperties asked for vendor-id, device-id, class-code, IOPCIExpressLinkCapabilities(2), then the overdrive file");
+  check(logged("tinygpu: mi50: link partner 8086:2222 lnkcap 0x473903 lnkcap2 0xe") != "" && o.ov == std::vector<uint32_t>{0x10206},
+        "D1: partner = the Thunderbolt port past the AMD switch and the class-code-less entry -> OverridePcieParameters" + ovs(o));
+  check(logged("tinygpu: mi50: ATOM: unimplemented!") != "" && std::count(c->us_delays.begin(), c->us_delays.end(), 77u) == 1 &&
+        std::count(c->ms_sleeps.begin(), c->ms_sleeps.end(), 3u) == 1, "D1: ASIC_Init's REPEAT, DELAY_US 77, DELAY_MS 3 reach os_log, IODelay, IOSleep");
+  check((c->cfg_rd(CFG_PCIE + 0x10, 2) & 3) == 0 && (c->cfg_rd(4, 2) & 4) && c->bar0() == (0x10ull << 32 | 0x50000000) &&
+        (c->cfg_rd(CFG_REBAR + 8, 4) >> 8 & 0x3f) == 8, "D1: through ConfigurationRead/Write: ASPM off, bus master on, BAR0 and REBAR as placed");
+
+  // ================= D6: the driver started again on the same card (finding 3, Leon 2026-10-17 "Driver start always boots"): a new driver
+  // instance trusts no hand-over - mode1 reset, POST and the full boot, the link partner and the overdrive file read again =================
+  { int m0 = c->mode1_count;
+    o = start(*c);
+    l = logged("tinygpu: mi50: initialised in ");
+    check(o.r && o.clean && handed_over(*c) && c->mode1_count == m0 + 1 && l.find("(start)") != std::string::npos && l.find("POSTed") != std::string::npos &&
+          logged("tinygpu: mi50: MI50: a hand-over this driver instance did not make (driver start): full reset and boot") != "" &&
+          KEYS == cat(KEYS5, ODKEYS),
+          "D6: second start on a handed-over card -> mode1 reset and full boot (no hand-over of an earlier driver instance trusted): " + l); }
+
+  // ================= D9: a session that never finalized (REG6 = 1) -> PSP mode1 reset, configuration saved and put back, re-POST =================
+  c->regs[GC_SCRATCH_REG6] = 1;
+  { int m9 = c->mode1_count, p9 = c->posted;   // D6 reset and POSTed the card already (finding 3): counted from here
+    o = start(*c);
+    l = logged("tinygpu: mi50: initialised in ");
+    check(o.r && o.clean && handed_over(*c) && c->mode1_count == m9 + 1 && c->posted == p9 + 1 && l.find(", POSTed") != std::string::npos &&
+          c->bar0() == (0x10ull << 32 | 0x50000000), "D9: mode1 reset through the driver, BAR0 back: " + l); }
+
+  // ================= D8: ASIC_Init resets REBAR and BAR0 -> put back with ConfigurationWrite32 =================
+  c = card(); c->post_resets_bar = 1;
+  o = start(*c);
+  check(o.r && o.clean && handed_over(*c) && c->bar0() == (0x10ull << 32 | 0x50000000) && (c->cfg_rd(CFG_REBAR + 8, 4) >> 8 & 0x3f) == 8,
+        "D8: POST reset REBAR + BAR0 -> both put back through the driver");
+
+  // ================= D11: the PowerPlay table the driver boots the card on = the V420 VBIOS's powerplayinfo, read here from V420.rom (Leon 2026-10-16) =================
+  { std::string v = slurp(argv[2]);
+    auto r16 = [&](uint32_t o) { return (uint32_t)(uint8_t)v[o] | (uint32_t)(uint8_t)v[o + 1] << 8; };
+    uint32_t hdr = r16(0x48), mdt = r16(hdr + 0x20), ppt = r16(mdt + 4 + (uint32_t)offsetof(struct atom_master_list_of_data_tables_v2_1, powerplayinfo)), n = r16(ppt);
+    check(n == sizeof(mi50::pp::V420_PPTABLE) && memcmp(v.data() + ppt, mi50::pp::V420_PPTABLE, n) == 0,
+          "D11: the driver's PowerPlay table = V420.rom's powerplayinfo at " + hx(ppt) + ", " + std::to_string(n) + " bytes, byte for byte"); }
+
+  // ================= D2/D3: no BAR5 aperture -> false before any device access =================
+  c = card(); BAR5.err = (kern_return_t)0xe00002c0;
+  o = start(*c);
+  l = logged("tinygpu: mi50: no BAR5 register aperture (GetBARInfo 0xe00002c0, size 0)");
+  check(!o.r && o.clean && ACCESSES == 0 && l != "", "D2: GetBARInfo(5) fails -> false, no access: " + l);
+  BAR5.err = 0; BAR5.size = 2;
+  o = start(*c);
+  l = logged("tinygpu: mi50: no BAR5 register aperture (GetBARInfo 0x0, size 2)");
+  check(!o.r && o.clean && ACCESSES == 0 && l != "", "D3: BAR5 smaller than a register -> false, no access: " + l);
+  BAR5.size = 512u << 10;
+
+  // ================= D4: no MI50BarFix (no state on the card) -> 5 s, then the bring-up goes on =================
+  c = card(false);
+  { reset_records(*c); KEXT_STATE = {};
+    IOService svc; IOPCIDevice dev; mi50::Card *k = StartMI50(&svc, &dev); o.r = k && k->ok; if (k) StopMI50(k); }
+  o.clean = clean(*c);
+  l = logged("tinygpu: mi50: no end reported by MI50BarFix in ");
+  unsigned long ms = l.empty() ? 0 : strtoul(l.c_str() + l.find(" in ") + 4, nullptr, 10);
+  check(o.r && o.clean && handed_over(*c) && ms >= 5000 && ms < 5100 && l.find("last state: none, no MI50BarFix?") != std::string::npos &&
+        logged("tinygpu: mi50: initialised in ") != "", "D4: " + l);
+  // ================= D4b / D4c / D4d / D4e: the kext reports a failure at once; still placing after 5 s (waited for, bug 3); "deferred" (bug 3); its
+  // state gone again (the kext stopped) -> each logged, the bring-up goes on =================
+  c = card();
+  { reset_records(*c); KEXT_STATE = {{0, "failed: no BAR2 record below 4 GiB on 1 MiB bounds, nothing placed"}};
+    IOService svc; IOPCIDevice dev; mi50::Card *k = StartMI50(&svc, &dev); o.r = k && k->ok; if (k) StopMI50(k); }
+  o.clean = clean(*c);
+  l = logged("tinygpu: mi50: MI50BarFix failed: no BAR2 record below 4 GiB on 1 MiB bounds, nothing placed after ");
+  check(o.r && o.clean && handed_over(*c) && l.find("BAR0 is not usable, the bring-up goes on") != std::string::npos && STATE_QUERIES == 1, "D4b: " + l);
+  c = card();
+  { reset_records(*c); KEXT_STATE = {{0, "placing"}, {c->now_ns() + 8000000000ull, "placed"}};
+    IOService svc; IOPCIDevice dev; mi50::Card *k = StartMI50(&svc, &dev); o.r = k && k->ok; if (k) StopMI50(k); }
+  o.clean = clean(*c);
+  l = logged("tinygpu: mi50: BAR0 placed by MI50BarFix after ");
+  ms = l.empty() ? 0 : strtoul(l.c_str() + l.find(" after ") + 7, nullptr, 10);
+  check(o.r && o.clean && handed_over(*c) && ms >= 8000 && ms < 8100 && FIRST_CMDW_QUERIES >= 800, "D4c: " + l);
+  c = card();
+  { reset_records(*c); KEXT_STATE = {{0, "deferred: the TinyGPU driver was attached before MI50BarFix started"}};
+    IOService svc; IOPCIDevice dev; mi50::Card *k = StartMI50(&svc, &dev); o.r = k && k->ok; if (k) StopMI50(k); }
+  o.clean = clean(*c);
+  l = logged("tinygpu: mi50: MI50BarFix deferred: the TinyGPU driver was attached before MI50BarFix started after ");
+  check(o.r && o.clean && handed_over(*c) && l.find("BAR0 is placed at the next BAR0 map, the bring-up goes on") != std::string::npos &&
+        STATE_QUERIES == 1, "D4d: " + l);
+  c = card();
+  { reset_records(*c); KEXT_STATE = {{0, "started"}, {c->now_ns() + 30000000, ""}};
+    IOService svc; IOPCIDevice dev; mi50::Card *k = StartMI50(&svc, &dev); o.r = k && k->ok; if (k) StopMI50(k); }
+  o.clean = clean(*c);
+  l = logged("tinygpu: mi50: no end reported by MI50BarFix in ");
+  ms = l.empty() ? 0 : strtoul(l.c_str() + l.find(" in ") + 4, nullptr, 10);
+  check(o.r && o.clean && handed_over(*c) && ms >= 30 && ms < 60 && l.find("last state: started") != std::string::npos, "D4e: " + l);
+
+  // ================= D5: the bring-up fails -> false with the reason =================
+  c = card(); c->fail_smu_msg = PPSMC_MSG_EnableAllSmuFeatures;
+  o = start(*c);
+  l = logged("tinygpu: mi50: INITIALISATION FAILED after ");
+  check(!o.r && o.clean && !handed_over(*c) && l.find("response 0xff") != std::string::npos && l.find(" - power the card down") != std::string::npos, "D5: " + l);
+
+  // ================= D7: a 256 KiB BAR5: the aperture is BAR5 size / 4 dwords, the rest through PCIE_INDEX2 =================
+  c = card(); c->mmio_size_dwords = (256u << 10) / 4; BAR5.size = 256u << 10;
+  o = start(*c);
+  check(o.r && o.clean && handed_over(*c) && c->indirect > 0, "D7: BAR5 256 KiB -> no access past it, " + std::to_string(c->indirect) + " registers through PCIE_INDEX2/DATA2");
+  BAR5.size = 512u << 10;
+
+  // ================= D12/D13: the TinyGPU driver's own Start on the card - the card is initialised by the driver before its service is
+  // registered, its command register written only after MI50BarFix's placement (finding 8); a card it cannot bring up is still registered,
+  // refuses everything but RESET, and keeps the device open (finding 15) =================
+  for (bool good : {true, false}) {
+    c = card(); if (!good) c->fail_smu_msg = PPSMC_MSG_EnableAllSmuFeatures;
+    set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0;
+    kern_return_t r; int closes, closes_after_stop; IOPCIDevice *after; bool refused;
+    { IOPCIDevice dev; TinyGPUDriver drv; bool in = drv.init(); r = in ? drv.Start_Impl(&dev) : kIOReturnError; closes = dev.closes; after = drv.GetPCI();
+      refused = drv.MI50Refused(); drv.Stop_Impl(&dev); closes_after_stop = dev.closes; drv.free(); }
+    set_chain({});
+    std::string done = logged(good ? "tinygpu: mi50: initialised in " : "tinygpu: mi50: INITIALISATION FAILED after ");
+    if (good)
+      check(r == 0 && g_registers == 1 && closes == 0 && after != nullptr && !refused && handed_over(*c) && clean(*c) && BARINFO5_OPENS == 1 &&
+            FIRST_CMDW_QUERIES >= 1 && (c->cfg_rd(4, 2) & 7) == 7 && closes_after_stop == 1 &&
+            logged("tinygpu: opened device ven=0x1002 dev=0x66a1") != "" && done != "",
+            "D12: TinyGPUDriver::Start on the MI50: command register written after the kext's state was read, the card brought up (IO, memory, bus "
+            "master on) before the service is registered; Stop closes it and frees the MI50's state: " + done);
+    else
+      check(r == 0 && g_registers == 1 && closes == 0 && after != nullptr && refused && !handed_over(*c) && clean(*c) && done != "" && closes_after_stop == 1,
+            "D13: TinyGPUDriver::Start on an MI50 the bring-up fails on -> registered, MI50Refused (only RESET served), device open until Stop: " + done);
+  }
+
+  // ================= L: the provider chain -> the link partner's caps (t_mi50 G/L7 expectations; default = no partner, 0x10106). Every outcome,
+  // failure or not, is one log line naming it; keys: how many CopyProviderProperties was asked for (0 = not called) =================
+  struct LC { const char *tag; std::function<void()> chain; int fail_at; const char *log; std::vector<uint32_t> ov; size_t keys; };
+  LC ls[] = {
+    {"L2 partner without IOPCIExpressLinkCapabilities", [] { set_chain(tb_chain(-1, -1)); }, 0,
+     "link partner 8086:2222 has no IOPCIExpressLinkCapabilities: default PCIe caps", {0x10106}, 5},
+    {"L3 CopyProviderProperties fails", [] { set_chain(tb_chain(0x00473903, 0x0e)); CHAIN_ERR = (kern_return_t)0xe00002c7; }, 0,
+     "link partner: provider chain unavailable (0xe00002c7): default PCIe caps", {0x10106}, 5},
+    {"L4 the card is not in the chain", [] { set_chain({other_entry(), pci_entry(0x1002, 0x14a1, GEN4_CAP, GEN4_CAP2), pci_entry(0x8086, 0x2222, 0x00473903, 0x0e)}); }, 0,
+     "link partner: the card (1002:66a1) is not in the provider chain: default PCIe caps", {0x10106}, 5},
+    {"L5 the card's vendor-id is 2 bytes -> not a PCI entry", [] { set_chain(tb_chain(0x00473903, 0x0e, pci_entry(0x1002, 0x66a1, GEN4_CAP, GEN4_CAP2, 2))); }, 0,
+     "link partner: the card (1002:66a1) is not in the provider chain: default PCIe caps", {0x10106}, 5},
+    {"L6 partner with LNKCAP only (8 GT/s) -> lnkcap2 0 -> GEN1..2", [] { set_chain(tb_chain(0x00473903, -1)); }, 0,
+     "link partner 8086:2222 lnkcap 0x473903 lnkcap2 0x0 (no IOPCIExpressLinkCapabilities2: speeds from LNKCAP)", {0x10106}, 5},
+    {"L7 non-dictionary entries in the chain are passed over", [] { auto v = tb_chain(0x00473903, 0x0e); OSString *s = OSString::withCString("x"); s->retain();
+       v.insert(v.begin() + 1, s); v.insert(v.begin() + 4, s); set_chain(v); }, 0, "link partner 8086:2222 lnkcap 0x473903 lnkcap2 0xe", {0x10206}, 5},
+    {"L8 CopyProviderProperties succeeds with no array", [] { set_chain({}); CHAIN_NULL = true; }, 0,
+     "link partner: provider chain unavailable (0x0): default PCIe caps", {0x10106}, 5},
+    {"L9 OSArray::withCapacity for the keys fails", [] { set_chain(tb_chain(0x00473903, 0x0e)); }, 1,
+     "link partner: no memory for the property keys: default PCIe caps", {0x10106}, 0},
+    {"L10 OSString for vendor-id fails", [] { set_chain(tb_chain(0x00473903, 0x0e)); }, 2,
+     "link partner: no memory for the key vendor-id: default PCIe caps", {0x10106}, 0},
+    {"L11 only the card's own switch above it", [] { set_chain({other_entry(), pci_entry(0x1002, 0x66a1), pci_entry(0x1002, 0x14a1, GEN4_CAP, GEN4_CAP2), other_entry()}); }, 0,
+     "link partner: no PCI device above the card's own switch: default PCIe caps", {0x10106}, 5},
+    {"L12 OSArray::setObject for vendor-id fails", [] { set_chain(tb_chain(0x00473903, 0x0e)); }, 3,
+     "link partner: no memory for the key vendor-id: default PCIe caps", {0x10106}, 0},
+    {"L13 OSArray::setObject for the last key fails", [] { set_chain(tb_chain(0x00473903, 0x0e)); }, 11,
+     "link partner: no memory for the key IOPCIExpressLinkCapabilities2: default PCIe caps", {0x10106}, 0},
+    {"L14 CopyProviderProperties fails and still returns an array (released)", [] { set_chain({}); CHAIN_ERR = (kern_return_t)0xe00002bc; CHAIN_ERR_ARRAY = true; },
+     0, "link partner: provider chain unavailable (0xe00002bc): default PCIe caps", {0x10106}, 5},
+    {"L15 vendor-id / device-id data with a non-zero upper half: the 16-bit IDs are the low half",
+     [] { set_chain({other_entry(), pci_entry(0xFFFF1002, 0xFFFF66A1), pci_entry(0x00011002, 0x000114A1, GEN4_CAP, GEN4_CAP2), pci_entry(0x00018086, 0xABCD2222, 0x00473903, 0x0e)}); },
+     0, "link partner 8086:2222 lnkcap 0x473903 lnkcap2 0xe", {0x10206}, 5}};
+  // fake_os_fail_at counts every factory call from the start; StartMI50's wait for the kext ("placed" at once) makes its own before the
+  // link partner's, so the link partner's n-th is wait_creates + n (measured here, on the same stand-ins)
+  int wait_creates, w;
+  { c = card(); reset_records(*c); IOService svc; char st[64]; fake_os_creates = 0;
+    w = mi50::MI50Device::wait_kext(&svc, 5000, st, sizeof(st)); wait_creates = fake_os_creates; }
+  check(w == 1 && wait_creates > 0 && fake_os_live == 0, "L0: the kext wait makes " + std::to_string(wait_creates) + " factory calls and releases them all");
+  for (auto &k : ls) {
+    c = card(); k.chain(); fake_os_fail_at = k.fail_at ? k.fail_at + wait_creates : 0;
+    o = start(*c);
+    std::string got = logged(std::string("tinygpu: mi50: ") + k.log);
+    int lines = 0; for (auto &x : LOG) lines += x.find("tinygpu: mi50: link partner") == 0;
+    check(o.r && o.clean && handed_over(*c) && got != "" && lines == 1 && o.ov == k.ov && KEYS.size() == k.keys + ODKEYS.size(),
+          std::string(k.tag) + ":" + ovs(o) + " - " + (got.empty() ? "no such log line" : got));
+    CHAIN_ERR = 0; CHAIN_NULL = CHAIN_ERR_ARRAY = false; fake_os_fail_at = 0;
+  }
+
+  // ================= F: the overdrive file (Leon 2026-10-16) - MI50BarFix.kext publishes it as the card's "MI50 Overdrive" property; the
+  // driver checks it and feeds it to the SMU after the boot's OverDrive setup (full boot only). Without a valid file: the built-in table
+  // (mi50::od) when the build has one recorded, else no SMU message from the file at all. build_and_test.sh runs these cases on the
+  // driver as generated (no table recorded yet) and on a copy generated with a TEST table. =================
+  const bool DEF = mi50::od::HAVE_DEFAULT;
+  OverDriveTable_t def_t; memcpy(&def_t, mi50::od::DEFAULT, 32);
+  const std::string KEEP = DEF ? ": the built-in OverDrive table written" : ": the SMU keeps its own OverDrive table";
+  check(DEF ? def_t.GfxclkFmin == 900 && def_t.GfxclkFmax == 1700 && def_t.UclkFmax == 950 && def_t.FanMaximumRpm == 3000 && def_t.GfxclkVolt3 == 0 : true,
+        DEF ? "F0: this build has the built-in TEST table (900..1700 MHz, memory 950 MHz, fan 3000 RPM), as mi50_gen generated it"
+            : "F0: this build has no built-in OverDrive table (mi50::od::HAVE_DEFAULT false): without a valid file the SMU keeps its own");
+  const uint32_t OD_IN = (uint32_t)TABLE_OVERDRIVE;
+  // what a boot without a valid file leaves: the built-in table written (one more read and write), else the SMU's own table untouched
+  auto kept = [&](Card &k) {
+    OverDriveTable_t g; memcpy(&g, k.smu.tables[OD_IN].data(), 32);
+    size_t w = count_msg(k, PPSMC_MSG_TransferTableDram2Smu, OD_IN), r = count_msg(k, PPSMC_MSG_TransferTableSmu2Dram, OD_IN);
+    return DEF ? w == 2 && r == 2 && memcmp(&g, &def_t, 32) == 0 : w == 1 && r == 1 && g.GfxclkFmax == 1725 && g.UclkFmax == 1000;
+  };
+  auto ends_keep = [&](const std::string &l) { return l.size() >= KEEP.size() && l.compare(l.size() - KEEP.size(), KEEP.size(), KEEP) == 0; };
+  { // F1: a valid file -> the table (4 fields from the SMU's own, the power cap the file's OverDrivePct), the gfx / mem DPM levels re-read,
+    // the PPT limit read back (GetPptLimit); no SetPptLimit
+    std::vector<uint8_t> f = od_file(tune());
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));
+    o = start(*c);
+    OverDriveTable_t want_t = tune(); want_t.FanTargetTemperature = 0; want_t.MaxOpTemp = 0; want_t.FanZeroRpmEnable = 0; want_t.Padding = 0;
+    auto &got = c->smu.tables[OD_IN];
+    size_t at = 0; for (size_t i = 0; i < c->smu_log.size(); i++) if (c->smu_log[i] == std::make_pair((uint32_t)PPSMC_MSG_TransferTableDram2Smu, OD_IN)) at = i;
+    std::vector<std::pair<uint32_t, uint32_t>> tail(c->smu_log.begin() + (long)at, c->smu_log.end()), want_tail = {{PPSMC_MSG_TransferTableDram2Smu, OD_IN}};
+    for (uint32_t clk : {(uint32_t)PPCLK_GFXCLK, (uint32_t)PPCLK_UCLK}) {
+      auto lv = c->levels(clk);
+      want_tail.push_back({PPSMC_MSG_GetDpmFreqByIndex, clk << 16 | 0xFF});
+      for (uint32_t i = 0; i < lv.size(); i++) want_tail.push_back({PPSMC_MSG_GetDpmFreqByIndex, clk << 16 | i});
+    }
+    want_tail.push_back({PPSMC_MSG_GetPptLimit, (uint32_t)POWER_SOURCE_AC << 16});
+    check(o.r && o.clean && handed_over(*c) && got.size() == 32 && memcmp(got.data(), &want_t, 32) == 0 && tail == want_tail &&
+          count_msg(*c, PPSMC_MSG_TransferTableDram2Smu, OD_IN) == 2 && count_any(*c, PPSMC_MSG_SetPptLimit) == 0,
+          "F1: valid file -> the SMU's OverDrive table = the file's, OverDrivePct +20 % included; FanTargetTemperature / MaxOpTemp / FanZeroRpmEnable / "
+          "Padding the SMU's own; then the GFX and memory DPM levels re-read and GetPptLimit, nothing after (no SetPptLimit, the built-in table not written)");
+    check(logged("tinygpu: mi50: overdrive file applied: GPU 925..1900 MHz, memory 1100 MHz, curve 925/1412/1900 MHz at 4000/4000/4000 (mV x 4), power +20 %") != "" &&
+          logged("tinygpu: mi50: overdrive file applied: fan max 3000 RPM, fan min 20 % PWM; the SMU now reports top levels GPU 1800 MHz, memory 1000 MHz, PPT 178 W") != "",
+          "F1: " + logged("overdrive file applied: GPU") + " / the virtual SMU models no OverDrivePct: it reports the boot 178 W");
+    // F2: the card brought up again within one driver instance (RESET; a wake reads it the same way) with the file still published -> already
+    // up: not read, not written. A new instance's start boots the card again instead (finding 3, Leon 2026-10-17: D6)
+    { reset_records(*c); set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));   // the chain start() cleared: the file still published
+      kern_return_t rr = kIOReturnError; bool wrote = false;
+      { IOService svc; IOPCIDevice dev; mi50::Card *k = StartMI50(&svc, &dev);
+        size_t n0 = c->smu_log.size(); KEYS.clear();
+        if (k) rr = ResetMI50(k);
+        for (size_t i = n0; i < c->smu_log.size(); i++) wrote |= c->smu_log[i].first == PPSMC_MSG_TransferTableDram2Smu || c->smu_log[i].first == PPSMC_MSG_SetPptLimit;
+        o.r = k && k->ok && rr == kIOReturnSuccess; if (k) StopMI50(k); }
+      set_chain({});
+      o.clean = clean(*c);   // as start() does: after the driver's objects and the chain are gone
+      const bool kept = memcmp(c->smu.tables[OD_IN].data(), &want_t, 32) == 0;
+      const std::string up = logged("tinygpu: mi50: already up: the overdrive file is not applied, the SMU keeps the OverDrive table it runs");
+      char seen[160];
+      snprintf(seen, sizeof(seen), " (bring-up %d, RESET %#x, clean %d, handed over %d, wrote %d, keys asked %zu, table kept %d, logged %d)", o.r, rr,
+               o.clean, handed_over(*c), wrote, KEYS.size(), kept, !up.empty());
+      check(o.r && o.clean && handed_over(*c) && !wrote && KEYS.empty() && kept && !up.empty(),
+            std::string("F2: RESET of an already-up card with the file published -> the property is not asked for, no table or power write, the SMU "
+            "keeps the applied table") + seen); }
+  }
+  // F3..: refused files, no file, a property that is not data, an unreadable chain -> logged, no SMU message from the file (the built-in
+  // table written when the build has one), no power change (PPT 178 W)
+  struct FC { const char *tag; std::function<std::vector<uint8_t>()> file; int how; const char *log; };   // how: 0 the file, 1 none, 2 a string, 3 no chain
+  auto with = [](std::function<void(OverDriveTable_t &)> e) { return [e] { OverDriveTable_t t = tune(); e(t); return od_file(t); }; };
+  auto none = [] { return std::vector<uint8_t>(); };
+  FC fcs[] = {
+    {"F3 no file (no property)", none, 1, "no overdrive file published on the card (MI50BarFix.kext publishes it)"},
+    {"F4 43 bytes", [] { auto b = od_file(tune()); b.pop_back(); return b; }, 0, "overdrive file refused: 43 bytes, not 44"},
+    {"F4b 46 bytes (the earlier frame with a watts field)", [] { auto b = od_file(tune()); b.push_back(0); b.push_back(0); return b; }, 0,
+     "overdrive file refused: 46 bytes, not 44"},
+    {"F5 bad magic", [] { auto b = od_file(tune()); b[7] = '2'; return b; }, 0, "overdrive file refused: no MI50OD01 magic"},
+    {"F6 bad CRC", [] { return od_file(tune(), false); }, 0, "overdrive file refused: CRC-32 0x"},
+    {"F7 GPU max above 2000", with([](OverDriveTable_t &t) { t.GfxclkFmax = 2001; }), 0, "overdrive file refused: GfxclkFmax 2001 MHz above 2000 MHz"},
+    {"F8 a curve frequency above 2000", with([](OverDriveTable_t &t) { t.GfxclkFreq2 = 2001; }), 0, "overdrive file refused: GfxclkFreq2 2001 MHz above 2000 MHz"},
+    {"F9 GPU min above 2000", with([](OverDriveTable_t &t) { t.GfxclkFmin = 2001; }), 0, "overdrive file refused: GfxclkFmin 2001 MHz above 2000 MHz"},
+    {"F10 memory above 1200", with([](OverDriveTable_t &t) { t.UclkFmax = 1201; }), 0, "overdrive file refused: UclkFmax 1201 MHz above 1200 MHz"},
+    {"F11 power below the stock limit (-1 %)", with([](OverDriveTable_t &t) { t.OverDrivePct = -1; }), 0,
+     "overdrive file refused: OverDrivePct -1 % outside 0..68 % (178 W stock, 300 W ceiling)"},
+    {"F12 power above the 300 W ceiling (+69 % = 300.82 W)", with([](OverDriveTable_t &t) { t.OverDrivePct = 69; }), 0,
+     "overdrive file refused: OverDrivePct 69 % outside 0..68 % (178 W stock, 300 W ceiling)"},
+    {"F14 a curve voltage below MinVoltageGfx", with([](OverDriveTable_t &t) { t.GfxclkVolt1 = 2949; }), 0,
+     "overdrive file refused: GfxclkVolt1 2949 outside MinVoltageGfx..MaxVoltageGfx 2950..4500 (mV x 4)"},
+    {"F15 a curve voltage above 1125 mV", with([](OverDriveTable_t &t) { t.GfxclkVolt3 = 4501; }), 0,
+     "overdrive file refused: GfxclkVolt3 4501 outside MinVoltageGfx..MaxVoltageGfx 2950..4500 (mV x 4)"},
+    {"F16 fan maximum below 400 RPM", with([](OverDriveTable_t &t) { t.FanMaximumRpm = 399; }), 0, "overdrive file refused: FanMaximumRpm 399 outside 400..4950 RPM"},
+    {"F17 fan maximum above 4950 RPM", with([](OverDriveTable_t &t) { t.FanMaximumRpm = 4951; }), 0, "overdrive file refused: FanMaximumRpm 4951 outside 400..4950 RPM"},
+    {"F18 fan minimum 8 % = 396 RPM", with([](OverDriveTable_t &t) { t.FanMinimumPwm = 8; }), 0, "overdrive file refused: FanMinimumPwm 8 (396 RPM) outside 400..4950 RPM"},
+    {"F19 fan minimum 101 % = 4999 RPM", with([](OverDriveTable_t &t) { t.FanMinimumPwm = 101; }), 0, "overdrive file refused: FanMinimumPwm 101 (4999 RPM) outside 400..4950 RPM"},
+    {"F27 (DK-04) GPU minimum above the maximum", with([](OverDriveTable_t &t) { t.GfxclkFmin = 1950; }), 0,
+     "overdrive file refused: GPU 1950..1900 MHz, curve 925/1412/1900 MHz out of order"},
+    {"F28 (DK-04) curve point 2 above point 3", with([](OverDriveTable_t &t) { t.GfxclkFreq2 = 1950; }), 0,
+     "overdrive file refused: GPU 925..1900 MHz, curve 925/1950/1900 MHz out of order"},
+    {"F23 the property is a string, not data", none, 2, "the card's \"MI50 Overdrive\" property is not data"},
+    {"F25 the provider chain cannot be read", none, 3, "the card's properties could not be read"}};
+  for (auto &k : fcs) {
+    std::vector<uint8_t> f = k.file();
+    OSDictionary *cd = card_with(k.how == 0 ? &f : nullptr);
+    if (k.how == 2) { OSString *s = OSString::withCString("MI50OD01"); cd->setObject("MI50 Overdrive", s); s->release(); }
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e, cd));
+    if (k.how == 3) CHAIN_ERR = (kern_return_t)0xe00002c7;
+    o = start(*c);
+    CHAIN_ERR = 0;
+    std::string got = logged(std::string("tinygpu: mi50: ") + k.log);
+    check(o.r && o.clean && handed_over(*c) && got != "" && ends_keep(got) && kept(*c) && count_any(*c, PPSMC_MSG_SetPptLimit) == 0 && c->smu.ppt == 178 &&
+          logged("tinygpu: mi50: initialised in ").find("PPT 178 W") != std::string::npos, std::string(k.tag) + " - " + (got.empty() ? "no such log line" : got));
+  }
+  // F20 / F26: a 0 field is unset (Leon 2026-10-16): accepted, and replaced by the same field of the table the driver would otherwise run -
+  // the built-in table (TEST: 900..1700 MHz, memory 950, fan 3000 RPM, OverDrivePct 0), else the SMU's own boot table (the virtual SMU's:
+  // 800..1725 MHz, memory 1000, fan 3850 RPM; curve, fan minimum and OverDrivePct 0)
+  const OverDriveTable_t base = DEF ? def_t : [] { OverDriveTable_t b; memset(&b, 0, sizeof(b)); b.GfxclkFmin = 800; b.GfxclkFmax = 1725; b.UclkFmax = 1000;
+                                                   b.FanMaximumRpm = 3850; return b; }();
+  { // F20: 0 in every curve voltage and both fan fields
+    OverDriveTable_t t = tune(); t.GfxclkVolt1 = t.GfxclkVolt2 = t.GfxclkVolt3 = 0; t.FanMaximumRpm = 0; t.FanMinimumPwm = 0;
+    std::vector<uint8_t> f = od_file(t);
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));
+    o = start(*c);
+    OverDriveTable_t g; memcpy(&g, c->smu.tables[OD_IN].data(), 32);
+    check(o.r && o.clean && handed_over(*c) && g.GfxclkVolt1 == base.GfxclkVolt1 && g.GfxclkVolt2 == base.GfxclkVolt2 && g.GfxclkVolt3 == base.GfxclkVolt3 &&
+          g.FanMaximumRpm == base.FanMaximumRpm && g.FanMinimumPwm == base.FanMinimumPwm && g.GfxclkFmax == 1900 && g.GfxclkFreq2 == 1412 &&
+          g.OverDrivePct == 20 && logged("tinygpu: mi50: overdrive file applied: GPU 925..1900 MHz") != "",
+          "F20: 0 curve voltages and fan fields replaced by the base table's (fan max " + std::to_string(g.FanMaximumRpm) + " RPM), the file's other fields kept");
+  }
+  { // F26: 0 GPU minimum, 0 memory maximum, 0 power cap
+    OverDriveTable_t t = tune(); t.GfxclkFmin = 0; t.UclkFmax = 0; t.OverDrivePct = 0;
+    std::vector<uint8_t> f = od_file(t);
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));
+    o = start(*c);
+    OverDriveTable_t g; memcpy(&g, c->smu.tables[OD_IN].data(), 32);
+    std::string l6 = logged("tinygpu: mi50: overdrive file applied: GPU ");
+    check(o.r && o.clean && handed_over(*c) && g.GfxclkFmin == base.GfxclkFmin && g.UclkFmax == base.UclkFmax && g.GfxclkFmax == 1900 &&
+          g.OverDrivePct == base.OverDrivePct && count_any(*c, PPSMC_MSG_SetPptLimit) == 0 && l6.find(", power +0 %") != std::string::npos,
+          "F26: 0 GPU minimum / memory maximum / power cap -> the base table's " + std::to_string(g.GfxclkFmin) + " / " + std::to_string(g.UclkFmax) +
+          " MHz / +" + std::to_string(g.OverDrivePct) + " %: " + l6);
+  }
+  { // F29 (DK-04): the file's own fields in order, but its 0 GPU maximum taken from the base table puts the minimum above it -> refused on the
+    // merged table (one OverDrive read more than a file refused by its own fields), nothing from the file written, the boot goes on
+    OverDriveTable_t t = tune(); t.GfxclkFmin = 1800; t.GfxclkFmax = 0;
+    std::vector<uint8_t> f = od_file(t);
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));
+    o = start(*c);
+    OverDriveTable_t g; memcpy(&g, c->smu.tables[OD_IN].data(), 32);
+    const std::string want = "tinygpu: mi50: overdrive file refused: GPU 1800.." + std::to_string(base.GfxclkFmax) + " MHz, curve 925/1412/1900 MHz out of order" + KEEP;
+    std::string got = logged("tinygpu: mi50: overdrive file refused: GPU 1800..");
+    check(o.r && o.clean && handed_over(*c) && got == want && g.GfxclkFmin != 1800 && count_any(*c, PPSMC_MSG_SetPptLimit) == 0 && c->smu.ppt == 178 &&
+          (DEF ? memcmp(&g, &def_t, 32) == 0 : g.GfxclkFmax == 1725),
+          "F29 (DK-04): minimum 1800 over the base maximum " + std::to_string(base.GfxclkFmax) + " after the merge -> refused, " + (DEF ? "the built-in table written" :
+          "the SMU's own table kept") + ": " + got);
+  }
+  { // F21: the SMU refuses the file's table (its TransferTableDram2Smu) -> the fallback (the built-in table, else the SMU's own) written back,
+    // the boot goes on. The virtual SMU's message ordinal of that transfer comes from a good run.
+    std::vector<uint8_t> f = od_file(tune());
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));
+    o = start(*c);
+    int nth = 0, seen = 0; for (size_t i = 0; i < c->smu_log.size(); i++) if (c->smu_log[i] == std::make_pair((uint32_t)PPSMC_MSG_TransferTableDram2Smu, OD_IN) && ++seen == 2) nth = (int)i + 1;
+    c = card(); c->fail_smu_nth = nth; set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));
+    o = start(*c);
+    OverDriveTable_t g; memcpy(&g, c->smu.tables[OD_IN].data(), 32);
+    const char *fb = DEF ? "the built-in OverDrive table" : "the SMU's own OverDrive table";
+    char w2[256];
+    snprintf(w2, sizeof(w2), "tinygpu: mi50: overdrive file refused by the SMU: SMU msg 0x%x param 0x%x -> response 0x%x: %s written",
+             PPSMC_MSG_TransferTableDram2Smu, OD_IN, PPSMC_Result_Failed, fb);
+    std::string l2 = logged(w2);
+    bool table = DEF ? memcmp(&g, &def_t, 32) == 0 : g.GfxclkFmax == 1725 && g.UclkFmax == 1000;
+    check(nth > 0 && o.r && o.clean && handed_over(*c) && table && count_msg(*c, PPSMC_MSG_TransferTableDram2Smu, OD_IN) == 3 && l2 != "",
+          std::string("F21: the file's table refused -> ") + fb + " written back, REG6 back to 0 at hand-over: " + l2);
+    // F22: and writing it back fails too (that transfer never answered: SetDriverDramAddrHigh / Low, then it) -> FAILED, not handed over
+    c = card(); c->fail_smu_nth = nth; c->hang_smu_nth = nth + 3; set_chain(tb_chain(0x00473903, 0x0e, card_with(&f)));
+    o = start(*c);
+    std::string l3 = logged("tinygpu: mi50: INITIALISATION FAILED after ");
+    char w3[256];
+    snprintf(w3, sizeof(w3), "overdrive file refused by the SMU: SMU msg 0x%x param 0x%x -> response 0x%x; writing %s failed too: SMU msg 0x%x timeout",
+             PPSMC_MSG_TransferTableDram2Smu, OD_IN, PPSMC_Result_Failed, fb, PPSMC_MSG_TransferTableDram2Smu);
+    check(!o.r && o.clean && !handed_over(*c) && l3.find(w3) != std::string::npos, "F22: the write-back never answered -> FAILED: " + l3);
+  }
+
+  // ================= R / W / M: the MI50's driver state over the driver's lifetime - RESET as the in-place reboot (finding 6), the wake
+  // (finding 7), the MI50 selector (finding 2), a failed bring-up refusing all but RESET (finding 15) =================
+  {
+    const int64_t NONE = mi50::MI50Device::OverDrive::NONE;
+    auto call = [](TinyGPUDriver &d, uint32_t op, std::vector<int64_t> a = {}, const void *raw = nullptr, kern_return_t *kr = nullptr) {
+      mi50::Mi50Req q = {}; q.op = op; for (size_t i = 0; i < a.size() && i < 4; i++) q.a[i] = a[i];
+      if (raw) { memcpy(q.raw, raw, 32); q.raw_len = 32; }
+      OSData *in = OSData::withBytes(&q, sizeof(q)), *out = nullptr;
+      kern_return_t e = d.MI50Call(in, &out); in->release();
+      mi50::Mi50Resp p = {}; if (out) { memcpy(&p, out->getBytesNoCopy(), sizeof(p)); out->release(); }
+      if (kr) *kr = e;
+      return p;
+    };
+    auto od_now = [&](Card &k) { OverDriveTable_t g; memcpy(&g, k.smu.tables[TABLE_OVERDRIVE].data(), 32); return g; };
+    std::vector<uint8_t> fa = od_file(tune());
+    OverDriveTable_t tb = tune(); tb.GfxclkFmax = 1850; tb.GfxclkFreq3 = 1850; tb.OverDrivePct = 10;
+    std::vector<uint8_t> fb = od_file(tb);
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e, card_with(&fa))); reset_records(*c); g_registers = 0;
+    {
+      IOPCIDevice dev; TinyGPUDriver drv; drv.init();
+      kern_return_t r = drv.Start_Impl(&dev);
+      check(r == 0 && handed_over(*c) && !drv.MI50Refused() && od_now(*c).GfxclkFmax == 1900, "R0: started on file A (GPU max 1900), handed over");
+      // R1: RESET on a handed-over card: init() reads it, nothing is booted
+      int m0 = c->mode1_count, p0 = c->posted; LOG.clear();
+      r = drv.ResetDevice();
+      check(r == 0 && c->mode1_count == m0 && c->posted == p0 && logged("tinygpu: mi50: already initialised in ").find("(reset)") != std::string::npos,
+            "R1: RESET on a card in the hand-over state -> read, not booted: " + logged("already initialised"));
+      // R2: a session that did not end cleanly (REG6 = 1), file B published by the client's BAR0 map -> RESET reboots in place with file B
+      c->regs[GC_SCRATCH_REG6] = 1; set_chain(tb_chain(0x00473903, 0x0e, card_with(&fb))); LOG.clear();
+      r = drv.ResetDevice();
+      OverDriveTable_t g = od_now(*c);
+      check(r == 0 && handed_over(*c) && c->mode1_count == m0 + 1 && g.GfxclkFmax == 1850 && g.OverDrivePct == 10 &&
+            logged("tinygpu: mi50: initialised in ").find("(reset)") != std::string::npos,
+            "R2: REG6 = 1 -> RESET = mode1 reset + the driver's boot on the file as published now (GPU max 1850, +10 %), handed over again");
+      // M: the MI50 selector on the driver's state
+      mi50::Mi50Resp p = call(drv, mi50::OP_SMU_VERSION);
+      check(p.status == 0 && (uint32_t)p.v[0] == FW.smc_version, "M1: OP_SMU_VERSION = the SMU's version " + hx((uint64_t)p.v[0]));
+      p = call(drv, mi50::OP_CONTROLS);
+      check(p.status == 0 && (p.v[0] & mi50::MI50Device::CTL_PERF), "M2: OP_CONTROLS " + hx((uint64_t)p.v[0]));
+      p = call(drv, mi50::OP_GFXCLK, {NONE, 1800});
+      check(p.status == 2 && strstr(p.err, "not open"), std::string("M3: an OverDrive edit before OP_OD_OPEN -> status 2: ") + p.err);
+      p = call(drv, mi50::OP_OD_OPEN);
+      check(p.status == 0, std::string("M4: OP_OD_OPEN, boot table ") + (p.raw_len == 32 ? "known" : "not known") + ", v0 " + std::to_string(p.v[0]));
+      p = call(drv, mi50::OP_GFXCLK, {NONE, 1800}); mi50::Mi50Resp p2 = call(drv, mi50::OP_COMMIT); mi50::Mi50Resp p3 = call(drv, mi50::OP_OD_TABLE);
+      OverDriveTable_t t3; memcpy(&t3, p3.raw, 32);
+      check(p.status == 0 && p2.status == 0 && od_now(*c).GfxclkFmax == 1800 && p3.raw_len == 32 && t3.GfxclkFmax == 1800,
+            "M5: OP_GFXCLK max 1800 + OP_COMMIT -> the SMU runs GPU max 1800; OP_OD_TABLE hands back that table");
+      p = call(drv, mi50::OP_GFXCLK, {NONE, 2001});
+      check(p.status == 1 && strstr(p.err, "2001"), std::string("M6: GPU max 2001 above the 2000 MHz ceiling -> refused: ") + p.err);
+      call(drv, mi50::OP_UCLK, {NONE, 1150}); call(drv, mi50::OP_DISCARD); p2 = call(drv, mi50::OP_COMMIT);
+      check(p2.status == 0 && od_now(*c).UclkFmax == g.UclkFmax && od_now(*c).GfxclkFmax == 1800, "M7: an edit then OP_DISCARD -> the commit writes the table as it ran");
+      p = call(drv, mi50::OP_FAN);
+      check(p.status == 1 && strstr(p.err, "not available"), std::string("M8: OP_FAN -> refused: ") + p.err);
+      p = call(drv, 99); p2 = call(drv, 0);
+      check(p.status == 1 && p2.status == 1 && strstr(p.err, "unknown MI50 operation"), "M9: unknown operations 99 and 0 -> refused");
+      kern_return_t kr = 0;
+      { OSData *in = OSData::withBytes("x", 1), *out = nullptr; kr = drv.MI50Call(in, &out); in->release(); }
+      check(kr == kIOReturnBadArgument, "M10: a request of the wrong size -> kIOReturnBadArgument");
+      p = call(drv, mi50::OP_LIMITS);
+      check(p.status == 0 && p.v[0] != 0 && p.v[11] == 178, "M11: OP_LIMITS: controls " + hx((uint64_t)p.v[0]) + ", stock power " + std::to_string(p.v[11]) + " W");
+      p = call(drv, mi50::OP_FAN_TABLE);
+      ATOM_Vega20_POWERPLAYTABLE v4; memcpy(&v4, mi50::pp::V420_PPTABLE, sizeof(v4)); const PPTable_t &pt = v4.smcPPTable;
+      const int64_t fan[10] = {pt.FanMaximumRpm, pt.FanPwmMin, pt.FanAcousticLimitRpm, pt.FanThrottlingRpm, pt.FanTargetTemperature, pt.FanStartTemp,
+                               pt.FanStopTemp, pt.FanZeroRpmEnable, pt.FanTachEdgePerRev, pt.MGpuFanBoostLimitRpm};
+      check(p.status == 0 && !memcmp(p.v, fan, sizeof(fan)), "M12: OP_FAN_TABLE = the V420 table's 10 fan values (FanMaximumRpm " + std::to_string(p.v[0]) + ")");
+      p = call(drv, mi50::OP_METRICS);
+      check(p.status == 0, std::string("M13: OP_METRICS answered") + (p.status ? std::string(": ") + p.err : ""));
+      // M14 (bug 2): OP_BOOT_PPTABLE at offsets 0 and 1024 = the boot table byte for byte: the V420's with this card's own shutdown temperature,
+      // Tedge and Thotspot limits and fan control off (build_boot_pptable); its size in raw; an offset past the table refused
+      { ATOM_Vega20_POWERPLAYTABLE want, own; memcpy(&want, mi50::pp::V420_PPTABLE, sizeof(want)); memcpy(&own, build_vbios().img.data() + PPT, sizeof(own));
+        want.usSoftwareShutdownTemp = own.usSoftwareShutdownTemp; want.smcPPTable.TedgeLimit = own.smcPPTable.TedgeLimit;
+        want.smcPPTable.ThotspotLimit = own.smcPPTable.ThotspotLimit; want.smcPPTable.FeaturesToRun[0] &= ~(1u << FEATURE_FAN_CONTROL_BIT);
+        std::vector<uint8_t> got; uint32_t size = 0; bool sized = true;
+        for (int64_t off : {(int64_t)0, (int64_t)1024}) {
+          p = call(drv, mi50::OP_BOOT_PPTABLE, {off});
+          uint32_t n = 0; memcpy(&n, p.raw, 4); if (p.status || p.raw_len != 4) sized = false; size = n;
+          const uint8_t *b = (const uint8_t *)p.v; got.insert(got.end(), b, b + (n > off ? std::min<uint32_t>(1024, n - (uint32_t)off) : 0));
+        }
+        mi50::Mi50Resp past = call(drv, mi50::OP_BOOT_PPTABLE, {(int64_t)sizeof(want)});
+        check(sized && size == sizeof(want) && got.size() == sizeof(want) && !memcmp(got.data(), &want, sizeof(want)) && past.status == 1 &&
+              want.usSoftwareShutdownTemp != ((const ATOM_Vega20_POWERPLAYTABLE *)mi50::pp::V420_PPTABLE)->usSoftwareShutdownTemp,
+              "M14: OP_BOOT_PPTABLE x2 = the boot table, " + std::to_string(got.size()) + " of " + std::to_string(size) + " bytes, V420 + this card's limits, " +
+              "fan off; offset " + std::to_string(sizeof(want)) + " -> " + (past.status ? std::string("refused: ") + past.err : "served")); }
+      // M15 (bug 5, Leon 2026-10-16: 60 CUs): OP_CU_INFO = the driver's count from the fuses - the test card: CU 15 off in each of 4 arrays
+      p = call(drv, mi50::OP_CU_INFO);
+      check(p.status == 0 && p.v[0] == 60 && p.v[1] == 4 && p.v[2] == 0x7fff && p.v[3] == 0x7fff && p.v[4] == 0x7fff && p.v[5] == 0x7fff,
+            "M15 (bug 5): OP_CU_INFO = " + std::to_string(p.v[0]) + " active CUs in " + std::to_string(p.v[1]) + " shader arrays, each array's bitmap");
+      // R3: a reboot drops the OverDrive: the next edit says open it again
+      r = drv.ResetDevice();
+      p = call(drv, mi50::OP_GFXCLK, {NONE, 1800});
+      check(r == 0 && p.status == 2, "R3: after a RESET the OverDrive is gone -> status 2 (open it again)");
+      // W1: sleep and wake with the state kept -> read only; W2: on while on -> nothing
+      m0 = c->mode1_count; p0 = c->posted; LOG.clear();
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOff);
+      uint64_t acc_off = ACCESSES; mi50::Mi50Resp down = call(drv, mi50::OP_SMU_VERSION); acc_off = ACCESSES - acc_off;   // bug 4
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOn);
+      check(c->mode1_count == m0 && c->posted == p0 && logged("tinygpu: mi50: already initialised in ").find("(wake)") != std::string::npos,
+            "W1: sleep / wake, the card kept its state -> read, not booted");
+      p = call(drv, mi50::OP_SMU_VERSION);
+      check(down.status == 3 && acc_off == 0 && !strcmp(down.err, "the MI50 is powered down (SetPowerState off), its bring-up runs when it is powered on again") &&
+            p.status == 0, std::string("W1b (bug 4): the MI50 selector while powered down -> status 3, no card access: ") + down.err + "; after the wake -> " +
+            std::to_string(p.status));
+      LOG.clear(); drv.SetPowerState_Impl(kIOServicePowerCapabilityOn);
+      check(logged("tinygpu: mi50: ") == "", "W2: on while on -> no bring-up");
+      // W3: the card lost power during sleep -> booted again on wake, handed over
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOff); c->power_on(true); LOG.clear();
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOn);
+      check(handed_over(*c) && logged("tinygpu: mi50: initialised in ").find("(wake)") != std::string::npos &&
+            logged("tinygpu: mi50: initialised in ").find("POSTed") != std::string::npos, "W3: power lost at sleep -> POST and the driver's boot on wake");
+      // R4 / R5: a bring-up that fails -> refused (status 1, MI50Refused) until a RESET succeeds
+      c->regs[GC_SCRATCH_REG6] = 1; c->fail_smu_msg = PPSMC_MSG_EnableAllSmuFeatures;
+      r = drv.ResetDevice();
+      p = call(drv, mi50::OP_SMU_VERSION);
+      check(r == kIOReturnNotReady && drv.MI50Refused() && !handed_over(*c) && p.status == 1, std::string("R4: RESET fails -> NotReady, refused: ") + p.err);
+      c->fail_smu_msg = 0;
+      r = drv.ResetDevice();
+      check(r == 0 && !drv.MI50Refused() && handed_over(*c), "R5: RESET again on a working card -> brought up, served again");
+      drv.Stop_Impl(&dev); drv.free();
+    }
+    set_chain({});
+    check(clean(*c) && g_lock_takes > 0 && g_lock_allocs == g_lock_frees, "R/W/M: every buffer, OSObject and lock released (" + std::to_string(g_lock_allocs) + " locks)");
+  }
+
+  // ================= Q (DK-02 / DK-01): the bring-ups on the MI50's own queue; SetPowerState's acknowledgement (fake queue in manual mode) ======
+  {
+    static mi50::Card *K = nullptr; static bool on_at_ack = false; static size_t queued_at_ack = 0;
+    auto on = [](mi50::Card *k) { return __atomic_load_n(&k->on, __ATOMIC_ACQUIRE); };
+    auto call = [&](TinyGPUDriver &d, uint32_t op) {
+      mi50::Mi50Req q = {}; q.op = op;
+      OSData *in = OSData::withBytes(&q, sizeof(q)), *out = nullptr; d.MI50Call(in, &out); in->release();
+      mi50::Mi50Resp r = {}; if (out) { memcpy(&r, out->getBytesNoCopy(), sizeof(r)); out->release(); }
+      return r;
+    };
+    g_queue_manual = true;
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0;
+    {
+      IOPCIDevice dev; TinyGPUDriver drv; drv.init();
+      kern_return_t r = drv.Start_Impl(&dev);
+      mi50::Card *k = drv.ivars->mi50; K = k;
+      check(r == 0 && k && g_registers == 0 && !handed_over(*c) && c->posted == 0 && k->q->queued() == 1 && !on(k),
+            "Q1 (DK-02): Start returns with the bring-up queued: nothing registered, the card not POSTed or booted");
+      k->q->drain();
+      check(handed_over(*c) && g_registers == 1 && on(k) && !drv.MI50Refused() && logged("tinygpu: mi50: will register service after the bring-up") != "",
+            "Q2: the MI50's queue runs it: POSTed and booted, handed over, registered once, on");
+      // A-03: a RESET that only reads the card keeps the boot table the start recorded
+      mi50::Mi50Resp o0 = call(drv, mi50::OP_OD_OPEN); OverDriveTable_t b0; memcpy(&b0, o0.raw, 32);
+      int m0 = c->mode1_count;
+      r = drv.ResetDevice();
+      mi50::Mi50Resp o1 = call(drv, mi50::OP_OD_OPEN); OverDriveTable_t b1; memcpy(&b1, o1.raw, 32);
+      mi50::Mi50Resp rs = call(drv, mi50::OP_RESET_OD);
+      check(r == 0 && c->mode1_count == m0 && o0.raw_len == 32 && o1.raw_len == 32 && !memcmp(&b0, &b1, 32) && rs.status == 0 &&
+            logged("tinygpu: mi50: already initialised in ").find("(reset)") != std::string::npos,
+            std::string("Q3 (A-03): RESET on the handed-over card reads it; its OverDrive still knows the start's boot table, Reset works: ") + rs.err);
+      // F-02: an SMU failure in a session is marked again when the session ends, after tinygrad's fini wrote REG6 = 0
+      c->fail_smu_msg = PPSMC_MSG_GetCurrentRpm;
+      mi50::Mi50Resp mt = call(drv, mi50::OP_METRICS);
+      c->fail_smu_msg = 0; c->regs[GC_SCRATCH_REG6] = 0;
+      drv.MI50SessionEnd();
+      check(mt.status == 1 && c->regs[GC_SCRATCH_REG6] == 1 && logged("tinygpu: mi50: MI50: an SMU message failed in this session") != "",
+            std::string("Q4 (F-02): metrics refused by the SMU, fini's REG6 = 0, the session's end -> REG6 = 1 again: ") + mt.err);
+      r = drv.ResetDevice();   // REG6 = 1: the full boot; its new state has no failure
+      c->regs[GC_SCRATCH_REG6] = 0; drv.MI50SessionEnd();
+      check(r == 0 && handed_over(*c) && c->regs[GC_SCRATCH_REG6] == 0, "Q4b: after the RESET a session's end leaves REG6 = 0");
+      // DK-01: power-off: off at the acknowledgement, without the lock an operation in flight holds (the fake lock aborts on a second take)
+      g_on_power_ack = [](uint32_t) { on_at_ack = __atomic_load_n(&K->on, __ATOMIC_ACQUIRE); queued_at_ack = K->q->queued(); };
+      on_at_ack = true;
+      IOLockLock(k->lock);
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOff);
+      IOLockUnlock(k->lock);
+      mi50::Mi50Resp dn = call(drv, mi50::OP_SMU_VERSION);
+      check(!on_at_ack && !on(k) && dn.status == 3, "Q5 (DK-01): power-off -> the card off at the acknowledgement, the held lock not taken, calls refused (3)");
+      // DK-02: power-on: acknowledged first, the wake's bring-up queued; the queue reads the card (it kept its state)
+      int p0 = c->posted; LOG.clear();
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOn);
+      bool off_then = !on_at_ack && queued_at_ack == 0 && k->q->queued() == 1 && !on(k);
+      k->q->drain();
+      check(off_then && on(k) && c->posted == p0 && logged("tinygpu: mi50: already initialised in ").find("(wake)") != std::string::npos,
+            "Q6 (DK-02): power-on -> acknowledged before the wake's bring-up, which is queued and then reads the card: on");
+      // a power-off after the power-on, before the wake ran: the card stays off; the next power-on brings it up
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOff); drv.SetPowerState_Impl(kIOServicePowerCapabilityOn); drv.SetPowerState_Impl(kIOServicePowerCapabilityOff);
+      k->q->drain();
+      bool stayed = !on(k);
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOn); k->q->drain();
+      check(stayed && on(k), "Q7: off, on, off before the wake ran -> stays off; the next power-on -> on");
+      g_on_power_ack = nullptr;
+      drv.Stop_Impl(&dev); drv.free();
+    }
+    set_chain({});
+    check(clean(*c) && g_lock_allocs == g_lock_frees, "Q1-Q7: every buffer, OSObject (queue included) and lock released");
+    // Stop with the start's bring-up still queued: it never runs, nothing registered
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0;
+    { kern_return_t r;
+      { IOPCIDevice dev; TinyGPUDriver drv; drv.init(); r = drv.Start_Impl(&dev); drv.Stop_Impl(&dev); drv.free(); }
+      set_chain({});
+      check(r == 0 && g_registers == 0 && c->posted == 0 && !handed_over(*c) && clean(*c), "Q8 (DK-02): Stop before the queued bring-up ran -> it never runs, "
+            "nothing registered, the card untouched, everything released"); }
+    // R2-01: a power-off before the start's bring-up ran -> the bring-up is not run on the card being powered down; registered, off; the
+    // power-on's block boots it (R2-02: a full boot - this instance has made no hand-over yet)
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0;
+    { IOPCIDevice dev; TinyGPUDriver drv; drv.init(); drv.Start_Impl(&dev); mi50::Card *k = drv.ivars->mi50;
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOff); k->q->drain();
+      mi50::Mi50Resp dn = call(drv, mi50::OP_SMU_VERSION);
+      bool off = !handed_over(*c) && c->posted == 0 && g_registers == 1 && !on(k) && dn.status == 3 &&
+                 logged("tinygpu: mi50: powered down before the start's bring-up ran") != "";
+      LOG.clear();
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOn); k->q->drain();
+      mi50::Mi50Resp up = call(drv, mi50::OP_SMU_VERSION);
+      std::string w = logged("tinygpu: mi50: initialised in ");
+      check(off && on(k) && up.status == 0 && handed_over(*c) && w.find("(wake)") != std::string::npos && w.find("POSTed") != std::string::npos,
+            "Q9 (R2-01): power-off before the start's bring-up ran -> not run, registered, off (3); power-on -> the full boot at the wake: " + w);
+      drv.Stop_Impl(&dev); drv.free(); }
+    set_chain({});
+    // R2-03: a power-off in the middle of an operation (the SMU hangs on GetCurrentRpm; the power-off comes 40 clock reads into its wait) ->
+    // the wait ends at once, nothing more reaches the card (REG6 not written), the operation refused with the reason; the wake reads the card
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0;
+    { IOPCIDevice dev; TinyGPUDriver drv; drv.init(); drv.Start_Impl(&dev); mi50::Card *k = drv.ivars->mi50; K = k; k->q->drain();
+      static int TICKS; static int SMU_AT_OFF; TICKS = 0; SMU_AT_OFF = -1;
+      c->hang_smu_msg = PPSMC_MSG_GetCurrentRpm;
+      static Card *CC; CC = c.get();
+      static const std::string HANG = "smu_hang:" + std::to_string(PPSMC_MSG_GetCurrentRpm);   // the model logs a hung message on its timeline
+      g_tick = [] { if (!CC->timeline.empty() && CC->timeline.back() == HANG && ++TICKS == 40) { PowerOffMI50(K); SMU_AT_OFF = CC->smu_count; } };
+      uint64_t clk0 = c->clock;
+      mi50::Mi50Resp mt = call(drv, mi50::OP_METRICS);
+      g_tick = nullptr; c->hang_smu_msg = 0;
+      uint64_t ms = (c->clock - clk0) / 1000000;
+      check(SMU_AT_OFF >= 0 && mt.status == 1 && strstr(mt.err, "powered down or its driver stops") && c->smu_count == SMU_AT_OFF && c->regs[GC_SCRATCH_REG6] == 0 &&
+            ms < 2000 && !on(k), std::string("Q12 (R2-03): power-off inside a hung SMU wait -> the wait ends (") + std::to_string(ms) + " ms model time), no "
+            "message or register write after it (REG6 still 0), refused: " + mt.err);
+      LOG.clear();
+      drv.SetPowerState_Impl(kIOServicePowerCapabilityOn); k->q->drain();
+      mi50::Mi50Resp up = call(drv, mi50::OP_SMU_VERSION);
+      check(on(k) && up.status == 0 && logged("tinygpu: mi50: already initialised in ").find("(wake)") != std::string::npos,
+            "Q12b: the wake reads the card that kept its state (this instance's hand-over): served");
+      drv.Stop_Impl(&dev); drv.free(); }
+    set_chain({});
+    // R2-03: Stop in the middle of the start's bring-up (its flag set 300 clock reads in) -> the bring-up ends at once, no SMU / PSP message after,
+    // the service is not registered; Stop finishes; everything released
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0;
+    { static int T2, SMU2, PSP2; T2 = 0; SMU2 = PSP2 = -1; static Card *C2; C2 = c.get();
+      { IOPCIDevice dev; TinyGPUDriver drv; drv.init(); drv.Start_Impl(&dev); mi50::Card *k = drv.ivars->mi50; K = k;
+        g_tick = [] { if (++T2 == 300) { __atomic_store_n(&K->stopping, true, __ATOMIC_RELEASE); SMU2 = C2->smu_count; PSP2 = C2->psp_count; } };
+        k->q->drain();
+        g_tick = nullptr;
+        drv.Stop_Impl(&dev); drv.free(); }
+      set_chain({});
+      std::string f = logged("tinygpu: mi50: INITIALISATION FAILED");
+      check(SMU2 >= 0 && c->smu_count == SMU2 && c->psp_count == PSP2 && g_registers == 0 && f.find("powered down or its driver stops") != std::string::npos &&
+            clean(*c), "Q13 (R2-03): Stop inside the start's bring-up -> it ends, no SMU or PSP message after the flag, not registered, released: " + f); }
+    // R2-02: a new driver instance whose start's bring-up failed without touching the card, on a card handed over by an earlier instance ->
+    // a RESET boots it (mode1 reset + POST), it does not trust that hand-over (finding 3's rule)
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0;
+    { { IOPCIDevice dev; TinyGPUDriver drv; drv.init(); drv.Start_Impl(&dev); drv.ivars->mi50->q->drain(); drv.Stop_Impl(&dev); drv.free(); }   // instance 1
+      bool h1 = handed_over(*c);
+      IOPCIDevice dev; TinyGPUDriver drv; drv.init(); drv.Start_Impl(&dev); mi50::Card *k = drv.ivars->mi50;
+      int g0 = g_alloc_fail_at, a0 = g_allocs;
+      (void)a0; c->fail_alloc_nth = c->allocs + 1;   // instance 2: the bring-up's first IOMallocZero (its MI50Device) fails, nothing touches the card
+      k->q->drain();
+      c->fail_alloc_nth = 0; g_alloc_fail_at = g0;
+      bool refused = drv.MI50Refused() && handed_over(*c);
+      int m0 = c->mode1_count; LOG.clear();
+      kern_return_t r = drv.ResetDevice();
+      std::string w = logged("tinygpu: mi50: initialised in ");
+      check(h1 && refused && r == 0 && c->mode1_count == m0 + 1 && w.find("(reset)") != std::string::npos && handed_over(*c),
+            "Q14 (R2-02): instance 2's start failed (no memory), the card still in instance 1's hand-over -> RESET = mode1 reset + full boot, not trusted: " + w);
+      drv.Stop_Impl(&dev); drv.free(); }
+    set_chain({});
+
+    // wait_kext with Stop's flag: ends at once
+    { IOService svc; char st[200]; bool stop = true; reset_records(*c); KEXT_STATE = {{0, "started"}};
+      int w = mi50::MI50Device::wait_kext(&svc, 5000, st, sizeof(st), &stop);
+      check(w == -1 && STATE_QUERIES == 0, "Q10 (DK-02): wait_kext with the stop flag set -> -1 before asking for the kext's state"); }
+    // no queue -> the card is not usable at all: Start fails, the device closed, nothing left
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e)); reset_records(*c); g_registers = 0; g_queue_fail_create = 1;
+    { kern_return_t r; int closes;
+      { IOPCIDevice dev; TinyGPUDriver drv; drv.init(); r = drv.Start_Impl(&dev); closes = dev.closes; drv.free(); }
+      g_queue_fail_create = 0; set_chain({});
+      check(r == kIOReturnNotReady && closes == 1 && g_registers == 0 && clean(*c) && logged("tinygpu: mi50: no dispatch queue") != "",
+            "Q11: IODispatchQueue::Create fails -> Start NotReady, the device closed, nothing registered, nothing left"); }
+    g_queue_manual = false;
+  }
+
+  printf("\n%d ok, %d FAIL\n", nok, nfail);
+  return nfail ? 1 : 0;
+}

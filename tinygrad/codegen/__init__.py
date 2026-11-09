@@ -2,6 +2,7 @@ from dataclasses import replace, dataclass
 import itertools, functools
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
 from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, TracingKey, Context, panic
+from tinygrad.helpers import GFX906_DOT2, MI50_PREFETCH
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_index_dtype, pm_commit_weak, pm_cast_weak
 from tinygrad.uop.render import pyrender
@@ -266,7 +267,7 @@ def add_raw_barrier(after:UOp):
   if not any(_is_local_store(x) for x in deps): return None
   return after.src[0].after(UOp(Ops.BARRIER, src=after.src[1:]))
 
-def add_war_barrier(end:UOp):
+def add_war_barrier(ctx:Renderer, end:UOp):
   # a LOCAL buffer stored and loaded in the same loop needs a barrier at the end of the loop body
   rngs = [r for r in end.src[1:] if r.op is Ops.RANGE and r.arg[1] in (AxisType.REDUCE, AxisType.WEAK, AxisType.LOOP) and r.vmax > 0]
   if not rngs or end.src[0].op is Ops.BARRIER: return None
@@ -275,7 +276,9 @@ def add_war_barrier(end:UOp):
   store_bufs = {x.buf_uop for x in sl if _is_local_store(x) and any(r in x.ranges for r in rngs)}
   # a load whose buffer matches a local store's buffer is necessarily a local load
   if not (loads:=[x for x in sl if x.op is Ops.LOAD and x.src[0].buf_uop in store_bufs]): return None
-  return end.replace(src=(UOp(Ops.BARRIER, src=(end.src[0], *loads)),)+end.src[1:])
+  # The completed body already depends on the loads; do not reopen its closed inner ranges.
+  deps = (end.src[0],) if ctx.target.arch.split(":", 1)[0] == "gfx906" else (end.src[0], *loads)
+  return end.replace(src=(UOp(Ops.BARRIER, src=deps),)+end.src[1:])
 
 pm_implicit_barriers = PatternMatcher([
   (UPat(Ops.AFTER, name="after"), add_raw_barrier),
@@ -383,7 +386,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   sink = graph_rewrite(sink, pm_casted_consts, name="casted consts", walk=True)
 
   # add implicit barriers (stores/loads through LOCAL memory ordered by AFTER or across loop iterations need workgroup barriers)
-  sink = graph_rewrite(sink, pm_implicit_barriers, name="add implicit barriers")
+  sink = graph_rewrite(sink, pm_implicit_barriers, ctx=ren, name="add implicit barriers")
 
   # this was the linearizer
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
@@ -434,7 +437,9 @@ def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
 
 def do_estimates(prg:UOp, sink:UOp, lin:UOp) -> UOp|None:
   if sink.arg.estimates is not None: return None
-  return prg.replace(src=(sink.replace(arg=replace(sink.arg, estimates=Estimates.from_uops(lin.src, ignore_indexing=True))),)+prg.src[1:])
+  estimates = Estimates.from_uops(lin.src, ignore_indexing=True)
+  if sink.arg.useful_ops is not None: estimates = replace(estimates, ops=sink.arg.useful_ops)
+  return prg.replace(src=(sink.replace(arg=replace(sink.arg, estimates=estimates)),)+prg.src[1:])
 
 def do_assemble(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
   src = "\n".join(str(u.arg) for u in lin.src)
@@ -491,10 +496,12 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
 
 # config affects generated programs and cache keys; context also carries compile-only behavior to workers
 to_program_config = (NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL, ALLOW_TF32,
-                     DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT)
-to_program_context = (*to_program_config, SPEC, DEBUG)
+                     DEFAULT_FLOAT, DEFAULT_INT, NUM_CPU_THREADS, TC_SELECT, TC_OPT, GFX906_DOT2)
+mi50_program_config = (MI50_PREFETCH,)
+to_program_context = (*to_program_config, *mi50_program_config, SPEC, DEBUG)
 def to_program_key(ast:UOp, renderer:Renderer) -> tuple:
-  return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config])
+  key = (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config])
+  return key + (tuple(x.value for x in mi50_program_config) if getattr(renderer, "mi50_tuning", False) else ())
 
 to_program_cache: dict[tuple, UOp] = {}
 def to_program(ast:UOp, renderer:Renderer) -> UOp:

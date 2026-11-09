@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, collections, dataclasses, functools, hashlib, array
+import ctypes, collections, dataclasses, functools, hashlib, array, struct
 from tinygrad.helpers import mv_address, getenv, DEBUG, lo32, hi32, fetch_fw, to_mv
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.autogen.am import am, fw
@@ -7,8 +7,10 @@ from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
+from tinygrad.runtime.support.am import vbios, atom
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
+VEGA20_PCI_ID = 0x66a11002 # mi50: PCI 1002:66a1, AMD Instinct MI50 (Vega 20)
 
 @dataclasses.dataclass
 class AMRegister(AMDReg):
@@ -25,6 +27,9 @@ class AMFirmware:
   def __init__(self, adev):
     self.adev = adev
     def fmt_ver(hwip): return '_'.join(map(str, adev.ip_ver[hwip]))
+
+    # mi50: the TinyGPU driver loads the MI50's firmware; tinygrad only takes the card with a partial boot, which loads none
+    if adev.ip_ver[am.MP0_HWIP] == (11,0,2): return
 
     # Load SOS firmware
     self.sos_fw = {}
@@ -161,6 +166,10 @@ class AMDev:
 
     self._run_discovery()
     self._build_regs()
+    # mi50 (review finding 12): the MI50's power cap is the OverDrive table's OverDrivePct, applied by the TinyGPU driver from the overdrive file;
+    # AM_POWER_LIMIT's SetPptLimit would be a second power setting beside it
+    if getattr(self, "is_vega20", False) and getenv("AM_POWER_LIMIT", 0.0) > 0:
+      raise RuntimeError("AM_POWER_LIMIT is not used on the MI50: its power cap is OverDrivePct in the overdrive file, applied by the TinyGPU driver")
 
     # AM boot Process:
     # The GPU being passed can be in one of several states: 1. Not initialized. 2. Initialized by amdgpu. 3. Initialized by AM.
@@ -180,6 +189,16 @@ class AMDev:
       if DEBUG >= 2: print(f"am {self.devfmt}: Malformed state. Issuing a full reset.")
       self.partial_boot = False
 
+    # mi50 (review finding 6, Leon 2026-10-16 "In-place reboot, re-read"): the TinyGPU driver boots the MI50 (the V420 table, the overdrive file as
+    # MI50BarFix published it at this open's BAR0 map above). A card that is not in its hand-over state goes to the driver's RESET, which boots it in
+    # place; tinygrad then takes it with its partial boot, and never boots it itself
+    if not self.partial_boot and getattr(self, "is_vega20", False):
+      if DEBUG >= 2: print(f"am {self.devfmt}: MI50 not handed over. The TinyGPU driver reboots it (RESET).")
+      self.pci_dev.reset()
+      self.partial_boot = self.reg("regSCRATCH_REG7").read() == AMDev.Version and self.reg("regSCRATCH_REG6").read() == 0 and \
+                          self.reg(self.gmc.pf_status_reg("GC")).read() == 0
+      if not self.partial_boot: raise RuntimeError(f"am {self.devfmt}: the TinyGPU driver's reboot did not hand the MI50 over (its log says why)")
+
     # aqua (gc 9.5.0): full boot over live state can kill the fabric (power cycle recovers); partial boot+reset_mec is the deepest safe reset
     if self.ip_ver[am.GC_HWIP] == (9,5,0) and self.reg("regSCRATCH_REG7").read() == AMDev.Version: self.partial_boot = True
 
@@ -193,6 +212,10 @@ class AMDev:
         self.smu.mode1_reset()
       self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
       self.init_hw(self.soc, self.gmc, self.ih, self.psp, self.smu)
+    else:
+      # mi50: the TinyGPU server clears bus master when a session ends (a killed model's queues must stop DMA before its host memory is
+      # released), so a partial boot enables it again as the full boot above does; idempotent when it is still set
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
 
     # Booting done
     self.is_booting = False
@@ -276,10 +299,20 @@ class AMDev:
     self.reg(f"{reg_base}{hi_suffix}").write(hi32(val), inst=inst)
 
   def indirect_rreg(self, reg:int) -> int:
+    if self.ip_ver[am.NBIO_HWIP] == (7,4,0): # mi50: amdgpu_device_indirect_rreg through PCIE_INDEX2/DATA2
+      self.regBIF_BX0_PCIE_INDEX2.write(reg * 4)
+      self.regBIF_BX0_PCIE_INDEX2.read()
+      return self.regBIF_BX0_PCIE_DATA2.read()
     self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
     return self.reg("regBIF_BX_PF0_RSMU_DATA").read()
 
   def indirect_wreg(self, reg:int, val:int):
+    if self.ip_ver[am.NBIO_HWIP] == (7,4,0): # mi50: amdgpu_device_indirect_wreg through PCIE_INDEX2/DATA2
+      self.regBIF_BX0_PCIE_INDEX2.write(reg * 4)
+      self.regBIF_BX0_PCIE_INDEX2.read()
+      self.regBIF_BX0_PCIE_DATA2.write(val)
+      self.regBIF_BX0_PCIE_DATA2.read()
+      return
     self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
     self.reg("regBIF_BX_PF0_RSMU_DATA").write(val)
 
@@ -300,6 +333,7 @@ class AMDev:
     return bytes(array.array('I', res))
 
   def _run_discovery(self):
+    if self.pci_dev.read_config(0, 4) == VEGA20_PCI_ID: return self._vega20_discovery()
     # NOTE: Fixed register to query memory size without known ip bases to find the discovery table.
     #       The table is located at the end of VRAM - 64KB and is 10KB in size.
     mmRCC_CONFIG_MEMSIZE = 0xde3
@@ -342,6 +376,123 @@ class AMDev:
     self.gc_info = getattr(am, f"struct_gc_info_v{gc_info.header.version_major}_{gc_info.header.version_minor}").from_address(gc_addr)
     self.reserved_vram_size = (384 << 20) if self.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else (64 << 20)
 
+  def _vega20_discovery(self):
+    # mi50: Vega 20 has no discovery table: AMD's fixed CHIP_VEGA20 tables, then POST before any other card access, then memsize and gc_info
+    self._static_vega20()
+    self._build_regs()
+    self._vega20_post()
+    self.vram_size = self.rreg(0xde3) << 20 # mmRCC_CONFIG_MEMSIZE, as below
+    if self.vram_size in (0, 0xffffffff << 20): raise RuntimeError("MI50: RCC_CONFIG_MEMSIZE unreadable after POST")   # review R4-05
+    self.large_bar = self.vram.nbytes >= self.vram_size
+    self._vega20_vbios()
+    self.timestamp_mhz = self.vbios.core_refclk_10khz() / 100   # the CP's timestamp clock (soc15_get_xclk): ops_amd's AMDSignal divider
+
+  def _static_vega20(self):
+    """Design v2 B3: the CHIP_VEGA20 tables Linux hard-codes instead of a discovery walk. ip_ver = L/amdgpu/amdgpu_discovery.c:3207-3224 (17
+    entries, SDMA1/UVD/VCE/DCI included) + NBIF (7,4,0) because ops_amd builds AMDIP('nbio', ip_versions[NBIF_HWIP]) (T/runtime/ops_amd.py:1027-1028).
+    regs_offset = the 20 blocks of vega20_reg_base_init (L/amdgpu/vega20_reg_init.c:34-53, NBIF = NBIO bases :49) from L/include/vega20_ip_offset.h as
+    shipped in autogen/am/vega_offsets.py (INST0 only: every INST1 base in that header is 0 except UVD seg1, kept as instance 1 like Linux).
+    SDMA: regs_offset[SDMA0_HWIP] = {0: SDMA0 bases, 1: SDMA1 bases} because _build_regs iterates its keys and AMRegister.addr[inst] indexes bases by
+    instance (amdev.py AMRegister / support/amd.py:8) - what Linux sdma_v4_0_get_reg_offset does with the sdma0 header for both engines."""
+    from tinygrad.runtime.autogen.am import vega_offsets as vo
+    self.is_vega20 = True
+    self.ip_ver = {am.MMHUB_HWIP: (9,4,0), am.ATHUB_HWIP: (9,4,0), am.OSSSYS_HWIP: (4,2,0), am.HDP_HWIP: (4,2,0), am.SDMA0_HWIP: (4,2,0),
+      am.SDMA1_HWIP: (4,2,0), am.DF_HWIP: (3,6,0), am.NBIO_HWIP: (7,4,0), am.UMC_HWIP: (6,1,1), am.MP0_HWIP: (11,0,2), am.MP1_HWIP: (11,0,2),
+      am.THM_HWIP: (11,0,2), am.SMUIO_HWIP: (11,0,2), am.GC_HWIP: (9,4,0), am.UVD_HWIP: (7,2,0), am.VCE_HWIP: (4,1,0), am.DCI_HWIP: (12,1,0),
+      am.NBIF_HWIP: (7,4,0)}
+    def bases(blk:str, inst:int=0) -> tuple[int, ...]: return tuple(getattr(vo, f"{blk}_BASE__INST{inst}_SEG{s}") for s in range(6))
+    self.regs_offset = collections.defaultdict(dict, {hwip: {0: bases(blk)} for hwip, blk in [(am.GC_HWIP, "GC"), (am.HDP_HWIP, "HDP"),
+      (am.MMHUB_HWIP, "MMHUB"), (am.ATHUB_HWIP, "ATHUB"), (am.NBIO_HWIP, "NBIO"), (am.MP0_HWIP, "MP0"), (am.MP1_HWIP, "MP1"), (am.VCE_HWIP, "VCE"),
+      (am.DF_HWIP, "DF"), (am.DCE_HWIP, "DCE"), (am.OSSSYS_HWIP, "OSSSYS"), (am.SDMA1_HWIP, "SDMA1"), (am.SMUIO_HWIP, "SMUIO"),
+      (am.NBIF_HWIP, "NBIO"), (am.THM_HWIP, "THM"), (am.CLK_HWIP, "CLK"), (am.UMC_HWIP, "UMC"), (am.RSMU_HWIP, "RSMU")]})
+    self.regs_offset[am.UVD_HWIP] = {0: bases("UVD", 0), 1: bases("UVD", 1)}
+    self.regs_offset[am.SDMA0_HWIP] = {0: bases("SDMA0"), 1: bases("SDMA1")}
+    self.harvested = collections.defaultdict(set)   # what discovery builds (above); a plain {} raises KeyError in _build_regs and ip.py:253
+    self.aids = [0]   # _build_regs recomputes the same from the SDMA instance keys {0,1} (max_aid 0); set explicitly per design B3
+
+  def _vega20_post(self):
+    """The VBIOS before anything else (amdgpu_device_init order: amdgpu_get_bios -> amdgpu_atombios_init = amdgpu_atom_parse +
+    amdgpu_atomfirmware_scratch_regs_init + amdgpu_atomfirmware_allocate_fb_scratch, amdgpu_atombios.c:1909-1946), then the POST bit. Card
+    accesses: the ROM read (ROM_INDEX/ROM_DATA) and the POST bit. The TinyGPU driver POSTs the MI50: an unPOSTed card goes to its RESET."""
+    self.vbios = vbios.VBIOS(vbios.read_rom(self.rreg, self.wreg, self.regROM_INDEX.addr[0], self.regROM_DATA.addr[0]))
+    # amdgpu_atomfirmware_scratch_regs_init (amdgpu_atomfirmware.c:88-103): bios_scratch_reg_offset = firmware_info.bios_scratch_reg_startaddr
+    self.bios_scratch_reg_offset = self.vbios.firmwareinfo().bios_scratch_reg_startaddr
+    self.atom = atom.AtomContext(atom.CardInfo(self.rreg, self.wreg), self.vbios.img, self._vega20_atom_scratch_bytes())
+    # the card ROM's tables are checked here, before any other card access: gfx_info (read later as gc_info), powerplay (the card's own; the
+    # SMU runs the driver's boot table, ip.py _vega20_live_state) and smc_dpm_info (appended to the SMC table, ip.py _vega20_pptable_init)
+    self.vbios.gfx_info(), self.vbios.powerplay(), self.vbios.smc_dpm_info()
+    if not self.vega20_is_posted():
+      self.pci_dev.reset()
+      if not self.vega20_is_posted(): raise RuntimeError(f"am {self.devfmt}: the MI50 is not POSTed and the TinyGPU driver's RESET did not POST it (its log says why)")
+    self.vega20_posted = True
+
+  def _vega20_vbios(self):
+    """After POST: the VBIOS data tables Linux reads (gfx_info -> gc config, powerplayinfo -> the SMC PPTable) and the VRAM reservation (none)."""
+    if not getattr(self, 'vega20_posted', False): self._vega20_post()   # hand-built AMDevs (offline checks) call this directly
+    fwi = self.vbios.firmwareinfo()
+    self.gc_info = self.vbios.gc_info_v2_0()
+    # bug 5 (Leon 2026-10-16): the ROM's gfx_info lists the die's 16 CUs per array; 4 are cut in hardware. The CUs per array are the driver's
+    # count over the ROM's arrays, so ops_amd's cu_cnt (_compute_props) and everything it sizes reads the MI50's 60
+    cus, arrays = self._vega20_driver_cu_info()
+    if arrays != self.gc_info.gc_num_se * self.gc_info.gc_num_sh_per_se or not 0 < cus <= arrays * self.gc_info.gc_num_cu_per_sh or cus % arrays:
+      raise RuntimeError(f"am {self.devfmt}: the driver's {cus} active CUs in {arrays} arrays do not fit gfx_info's "
+                         f"{self.gc_info.gc_num_se}x{self.gc_info.gc_num_sh_per_se} arrays of {self.gc_info.gc_num_cu_per_sh} CUs evenly")
+    self.gc_info.gc_num_cu_per_sh = cus // arrays
+    # Linux reserves nothing at the top of VRAM for CHIP_VEGA20 on bare metal: amdgpu_ttm_init_fw_resv_region (amdgpu_ttm.c:1741-1772) returns at
+    # :1745 (reserve_tmr is set only when the discovery binary is read from VRAM, amdgpu_discovery.c:407-410; CHIP_VEGA20 has none) and
+    # vram_usagebyfirmware is acted on only under SR-IOV (amdgpu_atomfirmware.c:119-125, :151-157).
+    self.reserved_vram_size = 0
+    if DEBUG >= 2: print(f"am {self.devfmt}: MI50 VBIOS ok, gc_info se={self.gc_info.gc_num_se} cu/sh={self.gc_info.gc_num_cu_per_sh} "
+                         f"reserved_vram={self.reserved_vram_size >> 20} MiB bootup sclk={fwi.bootup_sclk_in10khz / 100} MHz")
+
+  def _vega20_atom_scratch_bytes(self) -> int:
+    """amdgpu_atomfirmware_allocate_fb_scratch (L/amdgpu/amdgpu_atomfirmware.c:173-200): v2_1 asks for used_by_driver_in_kb unless start_address
+    carries ATOM_VRAM_BLOCK_SRIOV_MSG_SHARE_RESERVATION (0x2 << ATOM_VRAM_OPERATION_FLAGS_SHIFT 30, atombios.h:4298-4302; :105-131), v2_2 always 0
+    on bare metal (:134-171); 0 -> 20 KiB (AtomContext). Host memory, never VRAM."""
+    vu = self.vbios.vram_usagebyfirmware()
+    if isinstance(vu, vbios.vram_usagebyfirmware_v2_1):
+      return 0 if (vu.start_address_in_kb & vbios.ATOM_VRAM_OPERATION_FLAGS_MASK) == (0x2 << 30) else vu.used_by_driver_in_kb << 10
+    return 0
+
+  def vega20_is_posted(self) -> bool:
+    """POST state = amdgpu_atombios_scratch_need_asic_init (L/amdgpu/amdgpu_atombios.c:1634-1642): RREG32(bios_scratch_reg_offset + 7) &
+    ATOM_S7_ASIC_INIT_COMPLETE_MASK (0x200, L/include/atombios.h:7075); scratch 7 = mmBIOS_SCRATCH_7 0x3f BASE_IDX 1 (nbio_7_4_offset.h:2494-2495) ->
+    dword 0x53."""
+    return bool(self.rreg(self.bios_scratch_reg_offset + 7) & vbios.ATOM_S7_ASIC_INIT_COMPLETE_MASK)
+
+  def _vega20_driver_pptable(self) -> bytes:
+    """mi50 (bug 2, Leon 2026-10-16): the PowerPlay table the SMU runs - the TinyGPU driver's boot table (the V420's with Leon's settings) -
+    from the driver's MI50 operation 20 (TinyGPUDriver.cpp OP_BOOT_PPTABLE) over this card's TinyGPU connection (server.c CMD_MI50 = 128):
+    up to 1024 bytes per call from the byte offset in a0, the table's size in the reply's raw field. Wire format mi50::Mi50Req '<II4q32s',
+    mi50::Mi50Resp '<iI504s32s128q'."""
+    pd = self.pci_dev
+    if not hasattr(pd, "sock"): raise RuntimeError(f"am {self.devfmt}: the MI50's PowerPlay table comes from the TinyGPU driver")
+    req, resp = struct.Struct('<II4q32s'), struct.Struct('<iI504s32s128q')
+    out, size = b"", None
+    while size is None or len(out) < size:
+      _, _, r, _ = pd._rpc(pd.sock, pd.dev_id, 128, req.size, payload=req.pack(20, 0, len(out), 0, 0, 0, b""), readout_size=resp.size)
+      status, _, err, raw, *v = resp.unpack(r)
+      if status:
+        why = err.split(b"\0")[0].decode()
+        raise RuntimeError(f"am {self.devfmt}: the TinyGPU driver gave no PowerPlay table: {why}")
+      size = int.from_bytes(raw[:4], "little")
+      out += struct.pack('<128q', *v)[:min(1024, size - len(out))]
+    return out
+
+  def _vega20_driver_cu_info(self) -> tuple[int, int]:
+    """mi50 (bug 5, Leon 2026-10-16: "do 60CU", the count written everywhere for the card): (active CUs, shader arrays) as the TinyGPU driver
+    counted them from the CU fuse registers at its bring-up (TinyGPUDriver.cpp read_cu_info, Linux gfx_v9_0_get_cu_info), from the driver's MI50
+    operation 21 (OP_CU_INFO: v0 = active CUs, v1 = shader arrays) over the same connection and wire format as _vega20_driver_pptable."""
+    pd = self.pci_dev
+    if not hasattr(pd, "sock"): raise RuntimeError(f"am {self.devfmt}: the MI50's CU count comes from the TinyGPU driver")
+    req, resp = struct.Struct('<II4q32s'), struct.Struct('<iI504s32s128q')
+    _, _, r, _ = pd._rpc(pd.sock, pd.dev_id, 128, req.size, payload=req.pack(21, 0, 0, 0, 0, 0, b""), readout_size=resp.size)
+    status, _, err, _, *v = resp.unpack(r)
+    if status:
+      why = err.split(b"\0")[0].decode()
+      raise RuntimeError(f"am {self.devfmt}: the TinyGPU driver gave no CU count: {why}")
+    return v[0], v[1]
+
   @functools.cached_property
   def hwid_names(self) -> dict[int, str]: return {v:k.removesuffix('_HWID') for k,v in vars(am).items() if k.endswith('_HWID') and isinstance(v, int)}
 
@@ -350,11 +501,16 @@ class AMDev:
   def _build_regs(self):
     mods = [("mp", am.MP0_HWIP), ("hdp", am.HDP_HWIP), ("gc", am.GC_HWIP), ("mmhub", am.MMHUB_HWIP), ("osssys", am.OSSSYS_HWIP),
       ("nbio" if self.ip_ver[am.GC_HWIP] < (12,0,0) else "nbif", am.NBIO_HWIP)]
-    if self.ip_ver[am.SDMA0_HWIP] in {(4,4,2), (4,4,4)}: mods += [("sdma", am.SDMA0_HWIP)]
+    if self.ip_ver[am.SDMA0_HWIP] in {(4,4,2), (4,4,4), (4,2,0)}: mods += [("sdma", am.SDMA0_HWIP)]
+    if self.ip_ver.get(am.SMUIO_HWIP) == (11,0,2): mods += [("smuio", am.SMUIO_HWIP)] # mi50: ROM_INDEX/ROM_DATA for the VBIOS
+    if self.ip_ver.get(am.THM_HWIP) == (11,0,2): mods += [("thm", am.THM_HWIP)] # mi50: thermal interrupt setup (powerplay port)
 
     for prefix, hwip in mods:
       self.__dict__.update(import_asic_regs(prefix, self.ip_ver[hwip], cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[hwip])))
-    self.__dict__.update(import_asic_regs('mp', (11, 0, 0), cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[am.MP1_HWIP])))
+    # mi50: only the stock 'mm' names come from this MP1 import; mp_11_0_0 now also carries the MI50's regMP0_* PSP aliases, which must keep the MP0
+    # bases the per-IP loop above gave them (on the 7600 XT they would otherwise be rebound onto MP1)
+    self.__dict__.update({k: v for k, v in import_asic_regs('mp', (11, 0, 0), cls=functools.partial(AMRegister, adev=self,
+                          bases=self.regs_offset[am.MP1_HWIP])).items() if k.startswith('mm')})
 
     # Live AIDs like the kernel: 4 SDMAs per AID; the AID lives iff its group's alive-mask is 0xf/0x3/0xc.
     # Dead AIDs must never be touched via the indirect window: writes poison the whole fabric.

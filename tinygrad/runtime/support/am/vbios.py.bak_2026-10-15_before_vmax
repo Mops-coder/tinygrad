@@ -1,0 +1,332 @@
+"""mi50 fork: Vega 20 (MI50, PCI 1002:66a1) VBIOS access for AM - design v2 B4 / §6 (egpu/mi50/notes/Vega20 Port Design v2.md).
+
+Vega 20 has no discovery binary the driver needs and macOS never runs the option ROM, so the ATOM data tables Linux reads for
+CHIP_VEGA20 (gfx_info -> gc_info, vram_usagebyfirmware -> VRAM reservation, firmwareinfo -> scratch base + bootup clocks,
+powerplayinfo -> §6 limits / OverDrive8 ranges / the SMU pptable blob) come from the ROM image read through SMUIO ROM_INDEX/ROM_DATA.
+Every struct here is a byte-for-byte port of the cited Linux line (L/ = drivers/gpu/drm/amd of the pinned Linux tree); all tables are
+#pragma pack(1) (L/include/atomfirmware.h:214, L/pm/powerplay/hwmgr/vega20_pptable.h:26). Nothing here touches hardware except
+read_rom(), and that only through the two register accessors it is given.
+"""
+import ctypes
+from tinygrad.runtime.autogen.am import am, smu_11_0_2
+
+u8, u16, u32 = ctypes.c_uint8, ctypes.c_uint16, ctypes.c_uint32
+
+# L/amdgpu/amdgpu_bios.c:41-46
+AMD_VBIOS_SIGNATURE, AMD_VBIOS_SIGNATURE_OFFSET = b" 761295520", 0x30
+AMD_VBIOS_SIGNATURE_END = AMD_VBIOS_SIGNATURE_OFFSET + len(AMD_VBIOS_SIGNATURE) + 1   # SIGNATURE_SIZE = sizeof(" 761295520") incl. NUL (:43-44)
+# L/amdgpu/atom.h:35,38,43
+ATOM_ROM_TABLE_PTR, ATOM_ROM_MAGIC_PTR, ATOM_ROM_DATA_PTR = 0x48, 4, 0x20
+# L/include/atombios.h:7075 (BIOS_SCRATCH_7 bit 9) and :4298 (vram_usagebyfirmware start_address_in_kb flag bits)
+ATOM_S7_ASIC_INIT_COMPLETE_MASK, ATOM_VRAM_OPERATION_FLAGS_MASK = 0x00000200, 0xC0000000
+
+class _P(ctypes.Structure): _pack_ = 1
+
+class atom_common_table_header(_P):   # atomfirmware.h:233-238
+  _fields_ = [("structuresize", u16), ("format_revision", u8), ("content_revision", u8)]
+
+class atom_rom_header_v2_2(_P):   # atomfirmware.h:243-262
+  _fields_ = [("table_header", atom_common_table_header), ("atom_bios_string", u8 * 4), ("bios_segment_address", u16), ("protectedmodeoffset", u16),
+    ("configfilenameoffset", u16), ("crc_block_offset", u16), ("vbios_bootupmessageoffset", u16), ("int10_offset", u16), ("pcibusdevinitcode", u16),
+    ("iobaseaddress", u16), ("subsystem_vendor_id", u16), ("subsystem_id", u16), ("pci_info_offset", u16), ("masterhwfunction_offset", u16),
+    ("masterdatatable_offset", u16), ("reserved", u16), ("pspdirtableoffset", u32)]
+assert atom_rom_header_v2_2.masterdatatable_offset.offset == ATOM_ROM_DATA_PTR   # atom.c:1624 reads CU16(base + 0x20): the same field
+
+class atom_master_list_of_data_tables_v2_1(_P):   # atomfirmware.h:390-426, 35 x uint16 in header order
+  _fields_ = [(n, u16) for n in ("utilitypipeline", "multimedia_info", "smc_dpm_info", "sw_datatable3", "firmwareinfo", "sw_datatable5", "lcd_info",
+    "sw_datatable7", "smu_info", "sw_datatable9", "sw_datatable10", "vram_usagebyfirmware", "gpio_pin_lut", "sw_datatable13", "gfx_info",
+    "powerplayinfo", "sw_datatable16", "sw_datatable17", "sw_datatable18", "sw_datatable19", "sw_datatable20", "sw_datatable21", "displayobjectinfo",
+    "indirectioaccess", "umc_info", "sw_datatable25", "sw_datatable26", "dce_info", "vram_info", "sw_datatable29", "integratedsysteminfo",
+    "asic_profiling_info", "voltageobject_info", "sw_datatable33", "sw_datatable34")]
+
+class atom_master_data_table_v2_1(_P):   # atomfirmware.h:429-433
+  _fields_ = [("table_header", atom_common_table_header), ("listOfdatatables", atom_master_list_of_data_tables_v2_1)]
+
+def master_index(name:str) -> int:   # get_index_into_master_table, L/amdgpu/amdgpu_atomfirmware.h:27: offsetof(list, name) / sizeof(uint16_t)
+  return getattr(atom_master_list_of_data_tables_v2_1, name).offset // 2
+
+class atom_firmware_info_v3_1(_P):   # atomfirmware.h:479-498
+  _fields_ = [("table_header", atom_common_table_header), ("firmware_revision", u32), ("bootup_sclk_in10khz", u32), ("bootup_mclk_in10khz", u32),
+    ("firmware_capability", u32), ("main_call_parser_entry", u32), ("bios_scratch_reg_startaddr", u32), ("bootup_vddc_mv", u16),
+    ("bootup_vddci_mv", u16), ("bootup_mvddc_mv", u16), ("bootup_vddgfx_mv", u16), ("mem_module_id", u8), ("coolingsolution_id", u8),
+    ("reserved1", u8 * 2), ("mc_baseaddr_high", u32), ("mc_baseaddr_low", u32), ("reserved2", u32 * 6)]
+
+class atom_firmware_info_v3_2(_P):   # atomfirmware.h:519-544
+  _fields_ = [("table_header", atom_common_table_header), ("firmware_revision", u32), ("bootup_sclk_in10khz", u32), ("bootup_mclk_in10khz", u32),
+    ("firmware_capability", u32), ("main_call_parser_entry", u32), ("bios_scratch_reg_startaddr", u32), ("bootup_vddc_mv", u16),
+    ("bootup_vddci_mv", u16), ("bootup_mvddc_mv", u16), ("bootup_vddgfx_mv", u16), ("mem_module_id", u8), ("coolingsolution_id", u8),
+    ("reserved1", u8 * 2), ("mc_baseaddr_high", u32), ("mc_baseaddr_low", u32), ("board_i2c_feature_id", u8), ("board_i2c_feature_gpio_id", u8),
+    ("board_i2c_feature_slave_addr", u8), ("reserved3", u8), ("bootup_mvddq_mv", u16), ("bootup_mvpp_mv", u16), ("zfbstartaddrin16mb", u32),
+    ("reserved2", u32 * 3)]
+
+class atom_gfx_info_v2_4(_P):   # atomfirmware.h:1838-1872
+  _fields_ = [("table_header", atom_common_table_header), ("gfxip_min_ver", u8), ("gfxip_max_ver", u8), ("max_shader_engines", u8), ("reserved", u8),
+    ("max_cu_per_sh", u8), ("max_sh_per_se", u8), ("max_backends_per_se", u8), ("max_texture_channel_caches", u8), ("regaddr_cp_dma_src_addr", u32),
+    ("regaddr_cp_dma_src_addr_hi", u32), ("regaddr_cp_dma_dst_addr", u32), ("regaddr_cp_dma_dst_addr_hi", u32), ("regaddr_cp_dma_command", u32),
+    ("regaddr_cp_status", u32), ("regaddr_rlc_gpu_clock_32", u32), ("rlc_gpu_timer_refclk", u32), ("active_cu_per_sh", u8), ("active_rb_per_se", u8),
+    ("gcgoldenoffset", u16), ("gc_num_gprs", u16), ("gc_gsprim_buff_depth", u16), ("gc_parameter_cache_depth", u16), ("gc_wave_size", u16),
+    ("gc_max_waves_per_simd", u16), ("gc_lds_size", u16), ("gc_num_max_gs_thds", u8), ("gc_gs_table_depth", u8), ("gc_double_offchip_lds_buffer", u8),
+    ("gc_max_scratch_slots_per_cu", u8), ("sram_rm_fuses_val", u32), ("sram_custom_rm_fuses_val", u32)]
+
+class vram_usagebyfirmware_v2_1(_P):   # atomfirmware.h:784-790
+  _fields_ = [("table_header", atom_common_table_header), ("start_address_in_kb", u32), ("used_by_firmware_in_kb", u16),
+    ("used_by_driver_in_kb", u16)]
+
+class vram_usagebyfirmware_v2_2(_P):   # atomfirmware.h:792-800
+  _fields_ = [("table_header", atom_common_table_header), ("fw_region_start_address_in_kb", u32), ("used_by_firmware_in_kb", u16), ("reserved", u16),
+    ("driver_region0_start_address_in_kb", u32), ("used_by_driver_region0_in_kb", u32), ("reserved32", u32 * 7)]
+
+# vega20_pptable.h (ULONG/USHORT/UCHAR = uint32/16/8: L/include/atom-types.h:30-32, reached via hwmgr_ppt.h)
+ATOM_VEGA20_TABLE_REVISION_VEGA20, ATOM_VEGA20_PPCLOCK_MAX_COUNT = 11, 16   # :38, :41
+ATOM_VEGA20_ODFEATURE_MAX_COUNT, ATOM_VEGA20_ODSETTING_MAX_COUNT = 32, 32   # :39-40
+ATOM_VEGA20_ODFEATURE = ("GFXCLK_LIMITS", "GFXCLK_CURVE", "UCLK_MAX", "POWER_LIMIT", "FAN_ACOUSTIC_LIMIT", "FAN_SPEED_MIN", "TEMPERATURE_FAN",
+  "TEMPERATURE_SYSTEM", "MEMORY_TIMING_TUNE", "FAN_ZERO_RPM_CONTROL")   # :43-55, COUNT = 10
+ATOM_VEGA20_ODSETTING = ("GFXCLKFMAX", "GFXCLKFMIN", "VDDGFXCURVEFREQ_P1", "VDDGFXCURVEVOLTAGEOFFSET_P1", "VDDGFXCURVEFREQ_P2",
+  "VDDGFXCURVEVOLTAGEOFFSET_P2", "VDDGFXCURVEFREQ_P3", "VDDGFXCURVEVOLTAGEOFFSET_P3", "UCLKFMAX", "POWERPERCENTAGE", "FANRPMMIN",
+  "FANRPMACOUSTICLIMIT", "FANTARGETTEMPERATURE", "OPERATINGTEMPMAX")   # :57-73, COUNT = 14
+PPTABLE_V20_SMU_VERSION = 3   # L/pm/powerplay/inc/smu11_driver_if.h:34
+
+class smudpm_i2ccontrollerconfig_t(_P):   # atomfirmware.h:2403-2411
+  _fields_ = [(n, u32) for n in ("enabled", "slaveaddress", "controllerport", "controllername", "thermalthrottler", "i2cprotocol", "i2cspeed")]
+
+class atom_smc_dpm_info_v4_4(_P):   # atomfirmware.h:2413-2484 (read by append_vbios_pptable, vega20_processpptables.c:126-196)
+  _fields_ = [("table_header", atom_common_table_header), ("i2c_padding", u32 * 3), ("maxvoltagestepgfx", u16), ("maxvoltagestepsoc", u16),
+    ("vddgfxvrmapping", u8), ("vddsocvrmapping", u8), ("vddmem0vrmapping", u8), ("vddmem1vrmapping", u8),
+    ("gfxulvphasesheddingmask", u8), ("soculvphasesheddingmask", u8), ("externalsensorpresent", u8), ("padding8_v", u8),
+    ("gfxmaxcurrent", u16), ("gfxoffset", u8), ("padding_telemetrygfx", u8), ("socmaxcurrent", u16), ("socoffset", u8), ("padding_telemetrysoc", u8),
+    ("mem0maxcurrent", u16), ("mem0offset", u8), ("padding_telemetrymem0", u8), ("mem1maxcurrent", u16), ("mem1offset", u8),
+    ("padding_telemetrymem1", u8), ("acdcgpio", u8), ("acdcpolarity", u8), ("vr0hotgpio", u8), ("vr0hotpolarity", u8), ("vr1hotgpio", u8),
+    ("vr1hotpolarity", u8), ("padding1", u8), ("padding2", u8), ("ledpin0", u8), ("ledpin1", u8), ("ledpin2", u8), ("padding8_4", u8),
+    ("pllgfxclkspreadenabled", u8), ("pllgfxclkspreadpercent", u8), ("pllgfxclkspreadfreq", u16), ("uclkspreadenabled", u8),
+    ("uclkspreadpercent", u8), ("uclkspreadfreq", u16), ("fclkspreadenabled", u8), ("fclkspreadpercent", u8), ("fclkspreadfreq", u16),
+    ("fllgfxclkspreadenabled", u8), ("fllgfxclkspreadpercent", u8), ("fllgfxclkspreadfreq", u16),
+    ("i2ccontrollers", smudpm_i2ccontrollerconfig_t * 7), ("boardreserved", u32 * 10)]
+
+class ATOM_VEGA20_OVERDRIVE8_RECORD(_P):   # vega20_pptable.h:76-83
+  _fields_ = [("ucODTableRevision", u8), ("ODFeatureCount", u32), ("ODFeatureCapabilities", u8 * ATOM_VEGA20_ODFEATURE_MAX_COUNT),
+    ("ODSettingCount", u32), ("ODSettingsMax", u32 * ATOM_VEGA20_ODSETTING_MAX_COUNT), ("ODSettingsMin", u32 * ATOM_VEGA20_ODSETTING_MAX_COUNT)]
+
+class ATOM_VEGA20_POWER_SAVING_CLOCK_RECORD(_P):   # vega20_pptable.h:101-106
+  _fields_ = [("ucTableRevision", u8), ("PowerSavingClockCount", u32), ("PowerSavingClockMax", u32 * ATOM_VEGA20_PPCLOCK_MAX_COUNT),
+    ("PowerSavingClockMin", u32 * ATOM_VEGA20_PPCLOCK_MAX_COUNT)]
+
+class ATOM_Vega20_POWERPLAYTABLE(_P):   # vega20_pptable.h:108-135; smcPPTable = PPTable_t (smu11_driver_if.h:361-..., autogen smu_11_0_2)
+  _fields_ = [("sHeader", atom_common_table_header), ("ucTableRevision", u8), ("usTableSize", u16), ("ulGoldenPPID", u32), ("ulGoldenRevision", u32),
+    ("usFormatID", u16), ("ulPlatformCaps", u32), ("ucThermalControllerType", u8), ("usSmallPowerLimit1", u16), ("usSmallPowerLimit2", u16),
+    ("usBoostPowerLimit", u16), ("usODTurboPowerLimit", u16), ("usODPowerSavePowerLimit", u16), ("usSoftwareShutdownTemp", u16),
+    ("PowerSavingClockTable", ATOM_VEGA20_POWER_SAVING_CLOCK_RECORD), ("OverDrive8Table", ATOM_VEGA20_OVERDRIVE8_RECORD), ("usReserve", u16 * 5),
+    ("smcPPTable", smu_11_0_2.PPTable_t)]
+
+ATOM_VEGA20_PPCLOCK_GFXCLK = 0   # vega20_pptable.h:86
+
+def vega20_soft_pptable(table:bytes, power_w:int|None=None, gfxclk_max:int|None=None, uclk_max:int|None=None) -> bytes:
+  """mi50 (Leon 2026-10-15): a soft PowerPlay table for pp_table (amd_powerplay.c pp_dpm_set_pp_table :660-686) = `table` (an
+  ATOM_Vega20_POWERPLAYTABLE) with a power / GFXCLK max / UCLK max tune. The fields changed are exactly those the MI50 32 GB VBIOS gist
+  (gist.github.com/evilJazz/14a4c82a67f2c52a6bb5f9cea02f5e13, upp on V420.rom, run at 300 W / 2000 MHz / 1180 MHz) changes: power ->
+  SmallPowerLimit1/2, BoostPowerLimit, smcPPTable.SocketPowerLimitAc0/Dc; GFXCLK max -> the top FreqTableGfx level, DcModeMaxFreq[GFXCLK],
+  GfxclkDsMaxFreq, PowerSavingClockMax[GFXCLK]; UCLK max -> the FreqTableUclk levels at the table's maximum. Every other byte is kept. The
+  levels stay ascending: a new maximum must lie above the level below it."""
+  n = ctypes.sizeof(ATOM_Vega20_POWERPLAYTABLE)
+  if len(table) < n: raise ValueError(f"VBIOS: Invalid PowerPlay Table! {len(table)} < {n}")
+  pp = ATOM_Vega20_POWERPLAYTABLE.from_buffer_copy(table)
+  t = pp.smcPPTable
+  def chk(name:str, v:int):
+    if not isinstance(v, int) or not 0 < v <= 0xFFFF: raise ValueError(f"soft PowerPlay table: {name} {v!r} outside 1..65535")
+  if power_w is not None:
+    chk("power", power_w)
+    pp.usSmallPowerLimit1 = pp.usSmallPowerLimit2 = pp.usBoostPowerLimit = power_w
+    t.SocketPowerLimitAc0 = t.SocketPowerLimitDc = power_w
+  if gfxclk_max is not None:
+    chk("GFXCLK max", gfxclk_max)
+    lv = [i for i in range(len(t.FreqTableGfx)) if t.FreqTableGfx[i]]
+    if not lv: raise ValueError("soft PowerPlay table: no GFXCLK DPM level in this table")
+    top = lv[-1]
+    if top and gfxclk_max <= t.FreqTableGfx[top - 1]:
+      raise ValueError(f"soft PowerPlay table: GFXCLK max {gfxclk_max} MHz not above level {top - 1} ({t.FreqTableGfx[top - 1]} MHz)")
+    t.FreqTableGfx[top] = t.DcModeMaxFreq[smu_11_0_2.PPCLK_GFXCLK] = t.GfxclkDsMaxFreq = gfxclk_max
+    pp.PowerSavingClockTable.PowerSavingClockMax[ATOM_VEGA20_PPCLOCK_GFXCLK] = gfxclk_max
+  if uclk_max is not None:
+    chk("UCLK max", uclk_max)
+    old = max(t.FreqTableUclk)
+    if old == 0: raise ValueError("soft PowerPlay table: no UCLK DPM level in this table")
+    if (below:=[x for x in t.FreqTableUclk if 0 < x < old]) and uclk_max <= max(below):
+      raise ValueError(f"soft PowerPlay table: UCLK max {uclk_max} MHz not above the level below it ({max(below)} MHz)")
+    for i in range(len(t.FreqTableUclk)):
+      if t.FreqTableUclk[i] == old: t.FreqTableUclk[i] = uclk_max
+  return bytes(pp) + bytes(table[n:])
+
+def read_rom(rreg, wreg, rom_index:int, rom_data:int) -> bytes:
+  """amdgpu_read_bios_from_rom (L/amdgpu/amdgpu_bios.c:183-215) over amdgpu_soc15_read_bios_from_rom (:595-639): WREG32(rom_index, rom_offset)
+  with rom_offset = 0 because nbio_v7_4_funcs has no get_rom_offset (:624-630), then one RREG32(rom_data) per dword (:633-636). First the
+  AMD_VBIOS_SIGNATURE_END+1 header bytes (:185), 55 AA and " 761295520" at 0x30 (:196-200), length = bios[2] << 9 (:46,203) aligned to 4 (:204),
+  then the whole image (:213). rom_index/rom_data are dword addresses: SMUIO mmROM_INDEX 0xe4 / mmROM_DATA 0xe5 BASE_IDX 0
+  (L/include/asic_reg/smuio/smuio_11_0_0_offset.h:230-233, L/amdgpu/smuio_v11_0.c:28-36) + SMUIO seg0 0x16800 = 0x168e4 / 0x168e5."""
+  def dump(nbytes:int) -> bytes:
+    wreg(rom_index, 0)
+    return b"".join(rreg(rom_data).to_bytes(4, 'little') for _ in range((nbytes + 3) // 4))
+  hdr = dump(AMD_VBIOS_SIGNATURE_END + 1)
+  if hdr[0] != 0x55 or hdr[1] != 0xAA or hdr[AMD_VBIOS_SIGNATURE_OFFSET:AMD_VBIOS_SIGNATURE_OFFSET + len(AMD_VBIOS_SIGNATURE)] != AMD_VBIOS_SIGNATURE:
+    raise RuntimeError(f"VBIOS: no AMD ROM through ROM_INDEX/ROM_DATA: header {hdr[:4].hex()} sig@0x30 {hdr[0x30:0x3a]!r}")
+  length = hdr[2] << 9
+  return dump((length + 3) & ~3)
+
+class VBIOS:
+  def __init__(self, img:bytes):
+    self.img = bytes(img)
+    # check_atom_bios (amdgpu_bios.c:51-85)
+    if len(img) < 0x49: raise ValueError("VBIOS mem is null or mem size is wrong")
+    if img[0] != 0x55 or img[1] != 0xAA: raise ValueError(f"VBIOS signature incorrect {img[0]:x} {img[1]:x}")
+    if (hdr:=self.u16(ATOM_ROM_TABLE_PTR)) == 0: raise ValueError("Can't locate VBIOS header")
+    if len(img) < hdr + ATOM_ROM_MAGIC_PTR: raise ValueError("VBIOS header is broken")
+    if img[hdr + ATOM_ROM_MAGIC_PTR:hdr + ATOM_ROM_MAGIC_PTR + 4] not in (b"ATOM", b"MOTA"): raise ValueError("VBIOS: no ATOM/MOTA")
+    self.rom_header = self._at(atom_rom_header_v2_2, hdr)
+    self.data_table = self.u16(hdr + ATOM_ROM_DATA_PTR)   # amdgpu_atom_parse, L/amdgpu/atom.c:1624
+    self.soft_pp_table: bytes|None = None   # mi50: Linux hwmgr->soft_pp_table (pp_dpm_set_pp_table); None = the ROM's powerplayinfo table
+
+  def u8(self, off:int) -> int: return self.img[off]
+  def u16(self, off:int) -> int: return int.from_bytes(self.img[off:off+2], 'little')
+  def _at(self, t:type, off:int):
+    if off + ctypes.sizeof(t) > len(self.img):
+      raise ValueError(f"VBIOS: {t.__name__} at {off:#x} ({ctypes.sizeof(t)} B) past the image ({len(self.img)} B)")
+    return t.from_buffer_copy(self.img, off)
+
+  def data_header(self, name:str) -> tuple[int, int, int, int]|None:
+    """amdgpu_atom_parse_data_header (L/amdgpu/atom.c:1683-1702): entry = CU16(data_table + index*2 + 4), 0 = table absent (:1688-1692);
+    size = CU16(entry), frev = CU8(entry+2), crev = CU8(entry+3) (:1694-1699). Returns (offset, size, frev, crev)."""
+    if (idx:=self.u16(self.data_table + master_index(name) * 2 + 4)) == 0: return None
+    if idx + 4 > len(self.img): raise ValueError(f"VBIOS: {name} entry {idx:#x} past the image")
+    return idx, self.u16(idx), self.u8(idx + 2), self.u8(idx + 3)
+
+  def firmwareinfo(self) -> atom_firmware_info_v3_1|atom_firmware_info_v3_2:
+    """bios_scratch_reg_startaddr (amdgpu_atomfirmware_scratch_regs_init, L/amdgpu/amdgpu_atomfirmware.c:88-103) and the bootup clocks/voltages
+    (pp_atomfwctrl_get_vbios_bootup_values, L/pm/powerplay/hwmgr/ppatomfwctrl.c:513-545: v3.2 or v3.1 only, anything else is -EINVAL)."""
+    if (h:=self.data_header("firmwareinfo")) is None: raise ValueError("VBIOS: no firmwareinfo table")
+    off, _, frev, crev = h
+    if (t:={(3, 1): atom_firmware_info_v3_1, (3, 2): atom_firmware_info_v3_2}.get((frev, crev))) is None:
+      raise ValueError(f"VBIOS: firmwareinfo v{frev}.{crev}: Linux ppatomfwctrl.c:531-541 accepts only 3.1/3.2")
+    return self._at(t, off)
+
+  def gfx_info(self) -> atom_gfx_info_v2_4:
+    """amdgpu_atomfirmware_get_gfx_info (L/amdgpu/amdgpu_atomfirmware.c:927-959); gfx_v9_0.c:2057-2059 fails without it. v2.4 ported; Linux also
+    accepts v2.7 (:960-975) - not ported until a dump shows it (design v2 §8 U-V2)."""
+    if (h:=self.data_header("gfx_info")) is None: raise ValueError("VBIOS: no gfx_info table (gfx_v9_0.c:2057-2059 fails without it)")
+    off, _, frev, crev = h
+    if (frev, crev) != (2, 4): raise ValueError(f"VBIOS: gfx_info v{frev}.{crev}: only v2.4 is ported (Linux: 2.4 and 2.7)")
+    return self._at(atom_gfx_info_v2_4, off)
+
+  def vram_usagebyfirmware(self) -> vram_usagebyfirmware_v2_1|vram_usagebyfirmware_v2_2|None:
+    """amdgpu_atomfirmware_allocate_fb_scratch (L/amdgpu/amdgpu_atomfirmware.c:173-200): frev 2 crev 1 -> v2_1, frev >= 2 and crev >= 2 -> v2_2."""
+    if (h:=self.data_header("vram_usagebyfirmware")) is None: return None
+    off, _, frev, crev = h
+    if (frev, crev) == (2, 1): return self._at(vram_usagebyfirmware_v2_1, off)
+    if frev >= 2 and crev >= 2: return self._at(vram_usagebyfirmware_v2_2, off)
+    return None   # review R4-07: amdgpu_atomfirmware.c:186-205 has no else branch: other revisions -> usage 0 -> 20 KiB scratch
+
+  def fw_vram_region(self) -> tuple[int, int]|None:
+    """(start, size) in bytes of the VBIOS/PSP firmware VRAM region, or None when the table is absent or reports no firmware size.
+    v2_1: start_address_in_kb with the two operation-flag bits masked off, used_by_firmware_in_kb (amdgpu_atomfirmware.c:110-125);
+    v2_2: fw_region_start_address_in_kb likewise, used_by_firmware_in_kb (:139-157). Both << 10 (:124-125, :156-157)."""
+    if (vu:=self.vram_usagebyfirmware()) is None: return None
+    start_kb = vu.start_address_in_kb if isinstance(vu, vram_usagebyfirmware_v2_1) else vu.fw_region_start_address_in_kb
+    if vu.used_by_firmware_in_kb == 0: return None
+    return (start_kb & ~ATOM_VRAM_OPERATION_FLAGS_MASK) << 10, vu.used_by_firmware_in_kb << 10
+
+  def powerplay_rom(self) -> bytes:
+    """The ROM's powerplayinfo table: smu_atom_get_data_table's address and size (get_powerplay_table, vega20_processpptables.c:45-63)."""
+    if (h:=self.data_header("powerplayinfo")) is None: raise ValueError("VBIOS: no powerplayinfo table (vega20_processpptables.c:45-63)")
+    off, size, _, _ = h
+    if off + size > len(self.img): raise ValueError(f"VBIOS: powerplayinfo at {off:#x} ({size} B) past the image ({len(self.img)} B)")
+    return self.img[off:off + size]
+
+  def powerplay(self) -> ATOM_Vega20_POWERPLAYTABLE:
+    """get_powerplay_table + check_powerplay_tables (L/pm/powerplay/hwmgr/vega20_processpptables.c:45-91): the soft table when one is set
+    (hwmgr->soft_pp_table, :51-61), else the ROM's; size >= offsetofend(smcPPTable) (:69-74), format_revision >= 11 (:76-78),
+    structuresize > 0 (:79-80), smcPPTable.Version == PPTABLE_V20_SMU_VERSION (:82-88)."""
+    table = self.soft_pp_table if self.soft_pp_table is not None else self.powerplay_rom()
+    if len(table) < ctypes.sizeof(ATOM_Vega20_POWERPLAYTABLE):
+      raise ValueError(f"VBIOS: Invalid PowerPlay Table! {len(table)} < {ctypes.sizeof(ATOM_Vega20_POWERPLAYTABLE)}")
+    pp = ATOM_Vega20_POWERPLAYTABLE.from_buffer_copy(table)
+    if pp.sHeader.format_revision < ATOM_VEGA20_TABLE_REVISION_VEGA20:
+      raise ValueError(f"VBIOS: Unsupported PPTable format! revision {pp.sHeader.format_revision} < {ATOM_VEGA20_TABLE_REVISION_VEGA20}")
+    if pp.sHeader.structuresize == 0: raise ValueError("VBIOS: Invalid PowerPlay Table! structuresize 0")
+    if pp.smcPPTable.Version != PPTABLE_V20_SMU_VERSION:
+      raise ValueError(f"VBIOS: Unmatch PPTable version: V{pp.smcPPTable.Version} vs driver V{PPTABLE_V20_SMU_VERSION}")
+    return pp
+
+  def powerplay_limits(self) -> dict:
+    """Design v2 §6 'Power limit' / 'Thermal limits / shutdown temp' / 'Overdrive' inputs, read the way init_powerplay_table_information does
+    (vega20_processpptables.c:268-302): OD8 only with ucODTableRevision == 1, counts clamped to the enum COUNTs, limits in the table's units."""
+    pp, od = self.powerplay(), self.powerplay().OverDrive8Table
+    ret = {k: getattr(pp, "us" + k) for k in ("SmallPowerLimit1", "SmallPowerLimit2", "BoostPowerLimit", "ODTurboPowerLimit", "ODPowerSavePowerLimit",
+                                                "SoftwareShutdownTemp")}   # :294-300
+    ret["od8"] = None
+    if od.ucODTableRevision == 1:   # :268-291
+      nf, ns = min(od.ODFeatureCount, len(ATOM_VEGA20_ODFEATURE)), min(od.ODSettingCount, len(ATOM_VEGA20_ODSETTING))
+      ret["od8"] = {"features": {ATOM_VEGA20_ODFEATURE[i]: od.ODFeatureCapabilities[i] for i in range(nf)},
+                    "settings": {ATOM_VEGA20_ODSETTING[i]: (od.ODSettingsMin[i], od.ODSettingsMax[i]) for i in range(ns)}}
+    ret["tdp_od_limit"] = od.ODSettingsMax[ATOM_VEGA20_ODSETTING.index("POWERPERCENTAGE")]   # :302
+    ret["smc_pptable"] = bytes(pp.smcPPTable)   # the PPTable_t blob for a later DPM-enable step (design v2 B13, §8 U-S1)
+    return ret
+
+  def smc_dpm_info(self) -> atom_smc_dpm_info_v4_4:
+    """append_vbios_pptable (vega20_processpptables.c:148-157): smu_atom_get_data_table(smc_dpm_info) cast to atom_smc_dpm_info_v4_4; Linux
+    fails init_powerplay_table_information when the table is missing ("Failed to retrieve Smc Dpm Table from VBIOS!")."""
+    if (h:=self.data_header("smc_dpm_info")) is None: raise ValueError("VBIOS: [appendVbiosPPTable] Failed to retrieve Smc Dpm Table from VBIOS!")
+    return self._at(atom_smc_dpm_info_v4_4, h[0])
+
+  # ---- mi50: AMD's RAS inputs from the VBIOS (amdgpu_atomfirmware.c, atom.c); field offsets measured with clang against atomfirmware.h ----
+  def firmware_capability(self) -> int:
+    # amdgpu_atomfirmware_query_firmware_capability: firmware_info v3.1+ firmware_capability (u32 at +16), else 0
+    if (h:=self.data_header("firmwareinfo")) is None: return 0
+    off, _, frev, crev = h
+    return int.from_bytes(self.img[off+16:off+20], "little") if (frev == 3 and crev >= 1) or frev > 3 else 0
+
+  def mem_ecc(self) -> tuple[bool, bool]:
+    # amdgpu_atomfirmware_mem_ecc_supported -> (mem ecc, ras_default_ecc_enabled); umc_config is a u8 at +27, umc_config1 a u32 at +52
+    if (h:=self.data_header("umc_info")) is None: return False, False
+    off, _, frev, crev = h
+    cfg = self.img[off+27]
+    def cfg1() -> int: return int.from_bytes(self.img[off+52:off+56], "little")
+    if frev == 3 and crev in (1, 2): return bool(cfg & 0x2), False   # UMC_CONFIG__DEFAULT_MEM_ECC_ENABLE
+    if frev == 3 and crev == 3: return bool(cfg & 0x2 or cfg1() & 0x10000), bool(cfg & 0x2)   # UMC_CONFIG1__ENABLE_ECC_CAPABLE
+    if frev == 4 and crev == 0: return bool(cfg1() & 0x10000), bool(cfg & 0x2)
+    return False, False
+
+  def vram_type(self, module_id:int) -> int:
+    # amdgpu_atomfirmware_get_vram_info memory type + convert_atom_mem_type_to_vram_type (dGPU); AMDGPU_VRAM_TYPE_UNKNOWN when absent
+    if (h:=self.data_header("vram_info")) is None: return 0
+    off, _, frev, crev = h
+    if frev == 3 and crev == 0: mem_type = self.img[off+24]
+    elif frev == 2 and crev in (3, 4, 5, 6):
+      if module_id > self.img[off+20]: module_id = 0
+      m, (size_at, type_at) = off + 24, ((10, 13) if crev == 5 else (20, 23))   # vram_module v11 for v2.5, v9/v10 otherwise
+      for _ in range(module_id): m += int.from_bytes(self.img[m+size_at:m+size_at+2], "little")
+      mem_type = self.img[m+type_at]
+    else: return 0
+    # ATOM_DGPU_VRAM_TYPE_GDDR5/HBM2/HBM2E/HBM3/GDDR6/HBM3E -> AMDGPU_VRAM_TYPE_GDDR5 5 / HBM 6 / GDDR6 9 / HBM3E 13
+    return {0x50: 5, 0x60: 6, 0x61: 6, 0x80: 6, 0x70: 9, 0x81: 13}.get(mem_type, 0)
+
+  def vbios_pn(self) -> bytes:
+    # atom_get_vbios_pn: string start at 0x6e when the string count at 0x2f is non-zero, else the part number at 0x80; an empty string falls
+    # back to the "ATOMBIOS" search over 3..1024 (atom_find_str_in_rom); a failed search reads through NULL in C, here it gives b""
+    p = int.from_bytes(self.img[0x6e:0x70], "little") if self.img[0x2f] != 0 else 0x80
+    if self.img[p] == 0:
+      if (p:=next((i for i in range(3, 1025) if self.img[i:i+8] == b"ATOMBIOS"), None)) is None: return b""
+    if self.img[p] == 0: p += 1
+    n = 0
+    while n < 43 and 0x20 <= self.img[p+n] <= ord("z"): n += 1   # BIOS_STRING_LENGTH
+    return bytes(self.img[p:p+n])
+
+  def gc_info_v2_0(self) -> am.struct_gc_info_v2_0:
+    """gfx_info v2.4 -> discovery-shaped gc_info v2.0, paired through the adev->gfx.config / cu_info fields both Linux paths fill:
+    amdgpu_atomfirmware.c:943-958 (atom v2.4 -> config) and amdgpu_discovery.c:2063-2076 (gc_info v2 -> config). Fields with no v2.4 source
+    stay 0: gc_parameter_cache_depth (neither path copies it), gc_num_sc_per_se / gc_num_packer_per_sc (not in atom_gfx_info_v2_4)."""
+    g = self.gfx_info()
+    gc = am.struct_gc_info_v2_0(gc_num_se=g.max_shader_engines, gc_num_cu_per_sh=g.max_cu_per_sh, gc_num_sh_per_se=g.max_sh_per_se,
+      gc_num_rb_per_se=g.max_backends_per_se, gc_num_tccs=g.max_texture_channel_caches, gc_num_gprs=g.gc_num_gprs,
+      gc_num_max_gs_thds=g.gc_num_max_gs_thds, gc_gs_table_depth=g.gc_gs_table_depth, gc_gsprim_buff_depth=g.gc_gsprim_buff_depth,
+      gc_double_offchip_lds_buffer=g.gc_double_offchip_lds_buffer, gc_wave_size=g.gc_wave_size, gc_max_waves_per_simd=g.gc_max_waves_per_simd,
+      gc_max_scratch_slots_per_cu=g.gc_max_scratch_slots_per_cu, gc_lds_size=g.gc_lds_size)
+    # ops_amd.py:912 keys on header.version_major == 2
+    gc.header = am.struct_gpu_info_header(table_id=am.GC, version_major=2, version_minor=0, size=am.struct_gc_info_v2_0.SIZE)
+    return gc

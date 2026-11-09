@@ -1,0 +1,89 @@
+// Stand-ins for the DriverKit / PCIDriverKit declarations MI50/MI50Dext.cpp uses, with the DriverKit25.5 SDK's signatures and documented
+// semantics (retained results, setObject retains, getObject does not), so test/t_dext.cpp compiles the glue unchanged on the host. The IOLib
+// calls, os_log, IOService::CopyProviderProperties and the IOPCIDevice methods are declared here and defined by t_dext.cpp over the virtual MI50.
+// DriverKit/OSCollections.h and PCIDriverKit/PCIDriverKit.h include this file.
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>   // before the clock_gettime_nsec_np macro below
+#include <map>
+#include <string>
+#include <vector>
+
+typedef int kern_return_t;
+
+void IODelay(uint64_t us);
+void IOSleep(uint64_t ms);
+void *IOMallocZero(size_t length);
+void IOFree(void *address, size_t length);
+
+uint64_t fake_uptime_ns(clockid_t clock);
+#define clock_gettime_nsec_np(c) fake_uptime_ns(c)
+
+#define OS_LOG_DEFAULT ((void *)0)
+void fake_os_log(void *log, const char *fmt, ...) __attribute__((format(os_log, 2, 3)));
+#define os_log(log, fmt, ...) fake_os_log(log, fmt, ##__VA_ARGS__)
+
+// ---- OSObject and the collections: reference counted; live = objects not yet freed ----
+inline long fake_os_live = 0;
+inline int fake_os_creates = 0, fake_os_fail_at = 0;   // the fake_os_fail_at-th (1-based) factory call returns NULL (0 = never)
+inline bool fake_os_create_ok() { return ++fake_os_creates != fake_os_fail_at; }
+
+struct OSObject {
+  OSObject() { fake_os_live++; }
+  virtual ~OSObject() { fake_os_live--; }
+  void retain() const { rc_++; }
+  void release() const { if (--rc_ == 0) delete this; }
+private:
+  mutable int rc_ = 1;
+};
+typedef OSObject OSMetaClassBase;
+#define OSDynamicCast(type, inst) dynamic_cast<type *>(inst)
+
+struct OSString : OSObject {
+  std::string s;
+  static OSString *withCString(const char *c) { if (!fake_os_create_ok()) return nullptr; auto *o = new OSString; o->s = c; return o; }
+};
+struct OSData : OSObject {
+  std::vector<uint8_t> b;
+  static OSData *withBytes(const void *p, uint32_t n) { auto *o = new OSData; o->b.assign((const uint8_t *)p, (const uint8_t *)p + n); return o; }
+  uint32_t getLength() const { return (uint32_t)b.size(); }
+  const void *getBytesNoCopy() const { return b.empty() ? nullptr : b.data(); }
+};
+struct OSNumber : OSObject {
+  uint64_t v = 0;
+  static OSNumber *withNumber(uint64_t value, uint32_t bits) { auto *o = new OSNumber; o->v = bits < 64 ? value & ((1ull << bits) - 1) : value; return o; }
+  uint32_t unsigned32BitValue() const { return (uint32_t)v; }
+};
+struct OSArray : OSObject {
+  std::vector<const OSObject *> m;
+  ~OSArray() override { for (auto *o : m) o->release(); }
+  static OSArray *withCapacity(uint32_t) { return fake_os_create_ok() ? new OSArray : nullptr; }
+  bool setObject(const OSMetaClassBase *o) { if (!o) return false; o->retain(); m.push_back(o); return true; }
+  uint32_t getCount() const { return (uint32_t)m.size(); }
+  OSObject *getObject(uint32_t i) const { return i < m.size() ? const_cast<OSObject *>(m[i]) : nullptr; }
+};
+struct OSDictionary : OSObject {
+  std::map<std::string, const OSObject *> m;
+  ~OSDictionary() override { for (auto &kv : m) kv.second->release(); }
+  static OSDictionary *withCapacity(uint32_t) { return new OSDictionary; }
+  bool setObject(const char *k, const OSMetaClassBase *o) { if (!o) return false; o->retain(); auto it = m.find(k); if (it != m.end()) it->second->release(); m[k] = o; return true; }
+  OSObject *getObject(const char *k) const { auto it = m.find(k); return it == m.end() ? nullptr : const_cast<OSObject *>(it->second); }
+};
+
+// ---- IOService / IOPCIDevice: only what the glue calls ----
+struct IOService : OSObject {
+  virtual kern_return_t CopyProviderProperties(OSArray *propertyKeys, OSArray **properties);
+};
+struct IOPCIDevice : IOService {
+  virtual kern_return_t GetBARInfo(uint8_t barIndex, uint8_t *memoryIndex, uint64_t *barSize = 0, uint8_t *barType = 0);
+  void MemoryRead32(uint8_t memoryIndex, uint64_t offset, uint32_t *readData);
+  void MemoryWrite32(uint8_t memoryIndex, uint64_t offset, uint32_t data);
+  void ConfigurationRead8(uint64_t offset, uint8_t *readData);
+  void ConfigurationRead16(uint64_t offset, uint16_t *readData);
+  void ConfigurationRead32(uint64_t offset, uint32_t *readData);
+  void ConfigurationWrite8(uint64_t offset, uint8_t data);
+  void ConfigurationWrite16(uint64_t offset, uint16_t data);
+  void ConfigurationWrite32(uint64_t offset, uint32_t data);
+};

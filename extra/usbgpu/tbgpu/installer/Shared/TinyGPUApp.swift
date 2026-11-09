@@ -30,7 +30,8 @@ struct TinyGPUApp: App {
     let bundlePath = Bundle.main.bundlePath
     guard bundlePath.hasPrefix("/Applications/") else {
       var error: NSDictionary?
-      NSAppleScript(source: "do shell script \"mv '\(bundlePath)' '/Applications/'\" with administrator privileges")?.executeAndReturnError(&error)
+      let esc = bundlePath.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")   // mi50: no quote breaks out
+      NSAppleScript(source: "do shell script \"mv \" & quoted form of \"\(esc)\" & \" /Applications/\" with administrator privileges")?.executeAndReturnError(&error)
       text = error == nil ? "Moved! Please reopen from /Applications/\n" : "Move TinyGPU to /Applications first.\n"
       return
     }

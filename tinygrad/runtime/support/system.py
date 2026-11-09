@@ -82,9 +82,33 @@ class _System:
     if getenv("REMOTE", ""): return [(functools.partial(RemotePCIDevice,sock=s), x) for s,x in RemotePCIDevice.remote_list(vendor,devices,base_class)]
     return [(APLRemotePCIDevice if OSX else PCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
 
+  def pci_device(self, pci:str) -> str:
+    """The tinygrad device of the card with PCI ID `pci` ("vvvv:dddd", the IDs tinygrad reads from the card), e.g. "AMD:1": the backend whose
+    vendor ID and device masks (PCIIface.VENDOR/DEVICES/BASE_CLASS) list the card, the index its position in the list pci_probe_device opens from."""
+    from tinygrad.runtime import ops_amd, ops_nv
+    want = tuple(int(x, 16) for x in pci.split(":"))
+    for name, iface in (("AMD", ops_amd.PCIIface), ("NV", ops_nv.PCIIface)):
+      for i, (_, pcibus) in enumerate(hcq_filter_visible_devices(self.list_devices(iface.VENDOR, iface.DEVICES, iface.BASE_CLASS), name)):
+        # ponytail: macOS bus strings are "vvvv:dddd"; Linux lists bus addresses, which never match (read sysfs vendor/device if needed there)
+        if pcibus.count(":") == 1 and tuple(int(x, 16) for x in pcibus.split(":")) == want:
+          self.pci_named[(name, i)] = pci
+          return f"{name}:{i}"
+    raise RuntimeError(f"no connected card with PCI ID {pci}")
+
+  @functools.cached_property
+  def pci_named(self) -> dict[tuple[str, int], str]: return {}   # mi50: (backend, list index) -> the PCI ID the card was named by
+
   def pci_probe_device(self, device:str, dev_id:int, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
-    try: cl, pcibus = (ds:=hcq_filter_visible_devices(self.list_devices(vendor, devices, base_class), device))[dev_id]
+    ds = hcq_filter_visible_devices(self.list_devices(vendor, devices, base_class), device)
+    # mi50: a card opens only when named by its PCI ID, Device["1002:66a1"]; "AMD" / "AMD:1" is a position in the list, not a card
+    if (device, dev_id) not in self.pci_named:
+      raise RuntimeError(f"{device}:{dev_id} is not a card ID, name the card by its PCI ID (vendor:device), connected: {', '.join(b for _, b in ds) or 'none'}")
+    try: cl, pcibus = ds[dev_id]
     except IndexError: raise RuntimeError(f"{device}:{dev_id} does not exist ({pluralize('device', len(ds))} available)")
+    # mi50: the card at that position must still be the card that was named (the DEV visibility filter can reorder the list after naming)
+    named = self.pci_named[(device, dev_id)]
+    if pcibus.count(":") != 1 or tuple(int(x, 16) for x in pcibus.split(":")) != tuple(int(x, 16) for x in named.split(":")):
+      raise RuntimeError(f"{device}:{dev_id} was named by PCI ID {named}, but that position now holds {pcibus}")
     return cl(device[:2], pcibus)
 
   def pci_setup_usb_bars(self, usb:CustomASM24Controller, gpu_bus:int, mem_base:int, pref_mem_base:int) -> dict[int, tuple[int, int]]:
@@ -140,14 +164,17 @@ class _System:
   def flock_acquire(self, name:str) -> int:
     import fcntl # to support windows
 
-    os.umask(0) # Set umask to 0 to allow creating files with 0666 permissions
-
-    # Avoid O_CREAT because we don’t want to re-create/replace an existing file (triggers extra perms checks) when opening as non-owner.
-    if os.path.exists(lock_name:=temp(name)): self.lock_fd = os.open(lock_name, os.O_RDWR)
-    else: self.lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
+    old_umask = os.umask(0) # Set umask to 0 to allow creating files with 0666 permissions
+    try:
+      # Avoid O_CREAT because we don’t want to re-create/replace an existing file (triggers extra perms checks) when opening as non-owner.
+      if os.path.exists(lock_name:=temp(name)): self.lock_fd = os.open(lock_name, os.O_RDWR)
+      else: self.lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
+    finally: os.umask(old_umask) # mi50: only the lock file needs it; left at 0 every later file, dir and spawned server socket was world-writable
 
     try: fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError: raise RuntimeError(f"Failed to acquire lock file {name}. `sudo lsof {lock_name}` may help identify the process holding the lock.")
+    except OSError:
+      os.close(self.lock_fd)   # mi50: a lost lock left its descriptor open; a model retrying the open leaked one per attempt
+      raise RuntimeError(f"Failed to acquire lock file {name}. `sudo lsof {lock_name}` may help identify the process holding the lock.")
 
     return self.lock_fd
 
@@ -257,9 +284,18 @@ class PCIIfaceBase:
   def __init__(self, dev, dev_id, vendor, devices:tuple[tuple[int, tuple[int, ...]], ...], vram_bar, va_start, va_size,
                dev_impl_t, base_class:int|None=None):
     self.pci_dev = System.pci_probe_device(dn:=dev.__class__.__name__[:-6], dev_id, vendor, devices, base_class=base_class)
-    if self.is_local(): System.reserve_va(va_start, va_size)
-    with contextlib.suppress(Exception): self.pci_dev.resize_bar(vram_bar)
-    self.dev_impl = dev_impl_t(self.pci_dev)
+    # mi50: the opened card must carry the PCI ID it is listed under (TinyGPU's server opens its first card for an ID it does not know)
+    try:
+      if (bus:=getattr(self.pci_dev, "pcibus", "")).count(":") == 1 and \
+         (got:=(self.pci_dev.read_config(0, 2), self.pci_dev.read_config(2, 2))) != tuple(int(x, 16) for x in bus.split(":")):
+        raise RuntimeError(f"{dn}:{dev_id}: asked for the card with PCI ID {bus}, the opened card is {got[0]:04x}:{got[1]:04x}")
+      if self.is_local(): System.reserve_va(va_start, va_size)
+      with contextlib.suppress(Exception): self.pci_dev.resize_bar(vram_bar)
+      self.dev_impl = dev_impl_t(self.pci_dev)
+    except BaseException:   # mi50: refused, unreadable or a failed init: free the card's TinyGPU server and lock file before raising
+      if isinstance(self.pci_dev, APLRemotePCIDevice): self.pci_dev.sock.close()   # (a REMOTE TCP socket is shared through remote_sock's cache)
+      if (fd:=getattr(self.pci_dev, "lock_fd", None)) is not None: os.close(fd)
+      raise
     self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False, **kwargs) -> HCQBuffer:
@@ -282,6 +318,13 @@ class PCIIfaceBase:
     if b.owner != self.dev: self.dev.iface.dev_impl.mm.unmap_range(b.va_addr, round_up(b.size, 0x1000))
     if b.owner == self.dev and b.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(b.meta.mapping)
     if b.owner == self.dev and self.is_local() and b.meta.has_cpu_mapping: FileIOInterface.munmap(b.va_addr, b.size)
+    # mi50: a TinyGPU host buffer: its GPU mapping and address range go, then its server slot (they were never returned: a long-running model ran out)
+    # (the MI50 only: every other card keeps TinyGPU's behaviour, its host buffers stay mapped until the session ends)
+    if b.owner == self.dev and b.meta.mapping.aspace is AddrSpace.SYS and isinstance(self.pci_dev, APLRemotePCIDevice) and \
+       getattr(self.dev_impl, "is_vega20", False) and b.meta.hMemory in self.pci_dev.sysmem_slots:
+      self.dev_impl.mm.unmap_range(b.va_addr, b.meta.mapping.size)
+      self.dev_impl.mm.va_allocator.free(b.va_addr)
+      self.pci_dev.free_sysmem(b.meta.hMemory)
 
   def p2p_paddrs(self, paddrs:list[tuple[int,int]]) -> tuple[list[tuple[int,int]], AddrSpace]:
     return [(p + self.pci_dev.bar_info(self.vram_bar)[0], sz) for p, sz in paddrs], AddrSpace.SYS
@@ -308,6 +351,7 @@ class PCIIfaceBase:
 
 class RemoteCmd(enum.IntEnum):
   PROBE,MAP_BAR,MAP_SYSMEM_FD,CFG_READ,CFG_WRITE,RESET,MMIO_READ,MMIO_WRITE,MAP_SYSMEM,SYSMEM_READ,SYSMEM_WRITE,RESIZE_BAR,PING = range(13)
+  LOAD_PROG,EXEC_PROG,UNMAP_SYSMEM = range(13, 16)   # mi50: numbering as upstream tinygrad; the TinyGPU server implements UNMAP_SYSMEM
 
 class RemoteMMIOInterface(MMIOInterface):
   def __init__(self, dev:RemotePCIDevice, residx:int, nbytes:int, fmt='B', off=0, rd_cmd=RemoteCmd.MMIO_READ, wr_cmd=RemoteCmd.MMIO_WRITE):
@@ -372,29 +416,41 @@ class RemotePCIDevice(PCIDevice):
 
   @staticmethod
   def _rpc(sock:socket.socket, dev_id:int, cmd:int, *args:int, bar:int=0, readout_size:int=0, payload:bytes=b'', has_fd=False):
-    sock.sendall(struct.pack('<BIIQQQ', cmd, dev_id, bar, *(*args, 0, 0, 0)[:3]) + payload)
-    if has_fd:
-      msg, anc, _, _ = sock.recvmsg(17, socket.CMSG_LEN(4))
-      fd = struct.unpack('<i', anc[0][2][:4])[0]
-    else: msg, fd = RemotePCIDevice._recvall(sock, 17), None
-    if (resp:=struct.unpack('<BQQ', msg))[0] != 0:
-      raise RuntimeError(f"RPC failed: {RemotePCIDevice._recvall(sock, resp[1]).decode('utf-8') if resp[1] > 0 else 'unknown error'}")
+    # mi50: the whole exchange is read before any error is raised; an exception in between (Ctrl-C in a long wait) closes the connection, so a
+    # late reply is never taken as the next request's and the card is not finalised on misattributed reads
+    try:
+      sock.sendall(struct.pack('<BIIQQQ', cmd, dev_id, bar, *(*args, 0, 0, 0)[:3]) + payload)
+      if has_fd:
+        msg, anc, _, _ = sock.recvmsg(17, socket.CMSG_LEN(4))
+        fd = struct.unpack('<i', anc[0][2][:4])[0] if anc else None   # a refused request carries no descriptor
+      else: msg, fd = RemotePCIDevice._recvall(sock, 17), None
+      resp = struct.unpack('<BQQ', msg)
+      err = (RemotePCIDevice._recvall(sock, resp[1]).decode('utf-8') if resp[1] > 0 else 'unknown error') if resp[0] != 0 else None
+      readout = RemotePCIDevice._recvall(sock, readout_size) if resp[0] == 0 and readout_size > 0 else None
+    except BaseException:
+      sock.close()
+      raise
+    if err is not None: raise RuntimeError(f"RPC failed: {err}")
     RemotePCIDevice._rpc_count += 1
-    return (resp[1], resp[2]) + ((RemotePCIDevice._recvall(sock, readout_size) if readout_size > 0 else None),) + (fd,)
+    return (resp[1], resp[2]) + (readout,) + (fd,)
 
   def __init__(self, devpref:str, pcibus:str, sock:socket.socket):
-    self.sock, self.pcibus, self.dev_id = sock, pcibus, int(pcibus.split(':')[-1]) if ':' in pcibus else 0
+    # mi50: "vvvv:dddd" (macOS bus string) names the card as vendor<<16|device so the TinyGPU server opens that card; other forms unchanged
+    parts = pcibus.split(':')
+    self.sock, self.pcibus = sock, pcibus
+    self.dev_id = (int(parts[0], 16) << 16 | int(parts[1], 16)) if len(parts) == 2 else (int(parts[-1]) if len(parts) > 2 else 0)
     self.peer_group = sock.getpeername()[0]
     for buft in [socket.SO_SNDBUF, socket.SO_RCVBUF]: self.sock.setsockopt(socket.SOL_SOCKET, buft, 64 << 20)
 
-    self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
+    if getattr(self, "lock_fd", None) is None: self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")   # mi50: APL locks first
 
   def _bulk_read(self, cmd:int, idx:int, offset:int, size:int) -> bytes:
     RemotePCIDevice._bulk_recv += size
     return unwrap(self._rpc(self.sock, self.dev_id, cmd, offset, size, bar=idx, readout_size=size)[2])
   def _bulk_write(self, cmd:int, idx:int, offset:int, data:bytes):
     RemotePCIDevice._bulk_sent += len(data)
-    self.sock.sendall(struct.pack('<BIIQQQ', cmd, self.dev_id, idx, offset, len(data), 0) + data)
+    try: self.sock.sendall(struct.pack('<BIIQQQ', cmd, self.dev_id, idx, offset, len(data), 0) + data)
+    except BaseException: self.sock.close(); raise   # mi50: a partly sent request desyncs the server (see _rpc)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     paddrs_len, handle, _, _ = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM, size, int(contiguous))
@@ -416,30 +472,66 @@ class APLRemotePCIDevice(RemotePCIDevice):
 
   @classmethod
   def ensure_app(cls):
-    commit = "c0d024f9ff0e1dc8fdf217f255da7101d91e8323"
-    app_name = f"TinyGPU_{commit}.zip"
-    if (_ensure_downloads_dir() / app_name).is_file() and os.path.exists(cls.APP_PATH): return
-    print("Downloading TinyGPU.app...")
-    with contextlib.suppress(RuntimeError): system("pkill -f TinyGPU")
-    system(f"ditto -xk {fetch(f'https://github.com/tinygrad/tinygpu_releases/raw/{commit}/TinyGPU.zip', name=app_name)} /Applications")
-    print(system(f"{cls.APP_PATH} install"))
+    # mi50: this tree's TinyGPU.app (per-card servers, MI50 BAR0, access checks) is installed by its own build. Stock downloaded and installed
+    # the stock release here whenever its zip was missing from the download cache: `pkill -f TinyGPU` killed every running card server (the
+    # other card's model with it) and the stock app and dext replaced this build. A model start never installs anything: missing app -> refuse.
+    if not os.path.exists(cls.APP_PATH): raise RuntimeError(f"{cls.APP_PATH} is missing: install the TinyGPU build of this tree")
 
   def __init__(self, devpref:str, pcibus:str):
     self.ensure_app()
-    sock_path, sock = getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    for i in range(100):
-      with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
-        sock.connect(sock_path)
-        break
-      if i == 0: subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-      time.sleep(0.05)
-    else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
-    super().__init__(devpref, "usb4", sock=sock)
+    # mi50: one TinyGPU server per card. A server serves one client at a time (Shared/server.c run_server), so a second card behind the same
+    # socket waited forever; the card's "vvvv:dddd" is appended to the configured base path (APL_REMOTE_SOCK still chooses the base)
+    sock_path = f"{getenv('APL_REMOTE_SOCK', temp('tinygpu.sock'))}.{pcibus.replace(':', '')}"
+    # mi50: the card's lock comes first: a process that loses it never occupies the single-client server, and never spawns a second one.
+    # It sits next to the socket, not in TMPDIR: every client of this server shares the path, whatever its TMPDIR (the app and ssh differ)
+    try: self.lock_fd = os.open(lock_path:=f"{sock_path}.client.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e: raise RuntimeError(f"card {pcibus}: cannot open its lock {sock_path}.client.lock: {e}") from None
+    import fcntl
+    try:
+      if (st:=os.fstat(self.lock_fd)).st_mode & 0o170000 != 0o100000 or st.st_uid != os.getuid(): raise RuntimeError(f"{lock_path} is not a file of this user: refused")
+      try: fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      except OSError: raise RuntimeError(f"card {pcibus} is in use by another process (lock {lock_path})") from None
+    except BaseException:
+      os.close(self.lock_fd)
+      raise
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+      for i in range(100):
+        with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
+          # mi50: only this user's own server: the socket base may sit in a shared directory (/tmp), where another account could squat it
+          if (st:=os.lstat(sock_path)).st_mode & 0o170000 != 0o140000 or st.st_uid != os.getuid():
+            raise RuntimeError(f"{sock_path} is not a socket of this user: refused")
+          sock.connect(sock_path)
+          break
+        # mi50: own session, so a Ctrl-C or hangup of the model's terminal does not kill the card's server under the model's atexit fini
+        if i == 0: subprocess.Popen([self.APP_PATH, "server", sock_path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+        time.sleep(0.05)
+      else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+      super().__init__(devpref, pcibus, sock=sock) # mi50: the real "vvvv:dddd", not "usb4"
+    except BaseException:
+      sock.close(); os.close(self.lock_fd)
+      raise
+    self.peer_group = f"APL_{pcibus}"   # mi50: one server, one DMA mapping space per card (the socket path's first character put every card in '/')
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
-    mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
+    mapped_size, slot, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
     memview = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt='B')
 
     # paddrs are returned as (paddr, size) pairs until a (paddr=0, size=0) terminator in the beginning of the mapping.
     paddrs_raw = list(itertools.takewhile(lambda p: p[1] != 0, zip(memview.view(fmt='Q')[0::2], memview.view(fmt='Q')[1::2])))
-    return memview, [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+    paddrs = [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+    self.sysmem_slots[paddrs[0]] = (slot, memview.addr, mapped_size)   # mi50: the server slot behind this buffer, keyed by its first DMA address
+    return memview, paddrs
+
+  @functools.cached_property
+  def sysmem_slots(self) -> dict[int, tuple[int, int, int]]: return {}
+
+  def free_sysmem(self, paddr:int):
+    """mi50: the buffer allocated by alloc_sysmem whose first DMA address is `paddr`: the CPU view goes, the server frees its slot and the
+    card's DMA mapping (UNMAP_SYSMEM). Called after the GPU is done with it (HCQAllocator._free synchronizes every device that mapped it)."""
+    if (s:=self.sysmem_slots.pop(paddr, None)) is None: return
+    slot, addr, size = s
+    FileIOInterface.munmap(addr, size)
+    # a server without UNMAP_SYSMEM (or a dext without ReleaseDMA) refuses: the slot then stays used, as every slot did before
+    with contextlib.suppress(RuntimeError): self._rpc(self.sock, self.dev_id, RemoteCmd.UNMAP_SYSMEM, slot)

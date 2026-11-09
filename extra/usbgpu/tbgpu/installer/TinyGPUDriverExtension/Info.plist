@@ -13,7 +13,7 @@
 			<key>IOMatchCategory</key>
 			<string>TinyGPUDriver</string>
 			<key>IOPCIClassMatch</key>
-			<string>0x03000000</string>
+			<string>0x03000000&amp;0xff000000</string>
 			<key>IOPCITunnelCompatible</key>
 			<true/>
 			<key>IOProviderClass</key>

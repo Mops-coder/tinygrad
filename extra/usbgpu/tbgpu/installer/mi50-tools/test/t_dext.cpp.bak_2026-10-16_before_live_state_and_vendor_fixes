@@ -1,0 +1,253 @@
+// t_dext.cpp - the TinyGPU dext's MI50 glue (MI50/MI50Dext.cpp: mi50::Hw over the IOPCIDevice, the provider-chain link partner, StartMI50) on
+// the host. MI50Dext.cpp is compiled unchanged, as its own translation unit, against the stand-in headers in fake_driverkit/; this file defines
+// what they declare (IOLib, os_log, IOService::CopyProviderProperties, IOPCIDevice) over the virtual MI50 and checks what DriverKit requires
+// of a caller on the way: BAR5 accesses through BAR5's memory index, dword aligned, inside the BAR; the uptime clock; IOFree with the
+// IOMallocZero size; every retained OSObject released. Build/run: see mi50-tools/build_and_test.sh.
+#include <algorithm>
+#include <array>
+#include <cstdarg>
+#include <functional>
+#include <memory>
+#include "vmi50.hpp"
+#include "../../TinyGPUDriverExtension/MI50/MI50Device.h"   // AM_VERSION
+#include <DriverKit/IOLib.h>
+#include <DriverKit/OSCollections.h>
+#include <PCIDriverKit/PCIDriverKit.h>
+
+using namespace vm;
+bool StartMI50(IOService *svc, IOPCIDevice *pci);   // MI50Dext.cpp
+
+static int nfail = 0, nok = 0;
+static void check(bool c, const std::string &m) { printf("%s %s\n", c ? "ok  " : "FAIL", m.c_str()); if (c) nok++; else nfail++; }
+static LinuxFw FW;
+
+// ---- the stand-ins' backing ----
+static Card *CARD;                              // time, memory and the device behind the IOPCIDevice
+static std::vector<std::string> LOG, BAD, KEYS; // os_log lines; DriverKit contract violations; the keys CopyProviderProperties was asked for
+static int ACCESSES;                            // IOPCIDevice register / configuration accesses
+// every register / configuration access as mi50::Hw sees it: (op, offset or dword index, size, value), op 0 cfg read, 1 cfg write, 2 mmio read,
+// 3 mmio write - recorded by the stand-in IOPCIDevice and by Rec below, so a run through the glue and a direct run compare 1:1
+using Trace = std::vector<std::array<uint32_t, 4>>;
+static Trace TRACE;
+static struct { kern_return_t err = 0; uint8_t idx = 3; uint64_t size = 512u << 10; } BAR5;   // GetBARInfo(5)'s answer (TEST values)
+static kern_return_t CHAIN_ERR; static bool CHAIN_NULL; static std::vector<OSObject *> CHAIN;    // the provider chain, this service first
+
+void IODelay(uint64_t us) { CARD->delay_us((uint32_t)us); }
+void IOSleep(uint64_t ms) { CARD->sleep_ms((uint32_t)ms); }
+void *IOMallocZero(size_t n) { return CARD->alloc(n); }
+void IOFree(void *p, size_t n) { CARD->release(p, n); }
+uint64_t fake_uptime_ns(clockid_t c) { if (c != CLOCK_UPTIME_RAW) BAD.push_back("clock " + std::to_string(c)); return CARD->now_ns(); }
+void fake_os_log(void *, const char *fmt, ...) {
+  std::string f = fmt; for (size_t i; (i = f.find("{public}")) != std::string::npos;) f.erase(i, 8);
+  char b[1024]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), f.c_str(), ap); va_end(ap);
+  LOG.push_back(b);
+}
+kern_return_t IOService::CopyProviderProperties(OSArray *keys, OSArray **props) {
+  for (uint32_t i = 0; keys && i < keys->getCount(); i++) { OSString *s = OSDynamicCast(OSString, keys->getObject(i)); KEYS.push_back(s ? s->s : "?"); }
+  if (CHAIN_ERR) return CHAIN_ERR;
+  if (CHAIN_NULL) { *props = nullptr; return 0; }
+  OSArray *a = OSArray::withCapacity((uint32_t)CHAIN.size());
+  for (OSObject *o : CHAIN) {   // each dictionary cut down to the requested keys
+    OSDictionary *d = OSDynamicCast(OSDictionary, o);
+    if (!d) { a->setObject(o); continue; }
+    OSDictionary *f = OSDictionary::withCapacity(5);
+    for (auto &k : KEYS) if (OSObject *v = d->getObject(k.c_str())) f->setObject(k.c_str(), v);
+    a->setObject(f); f->release();
+  }
+  *props = a;
+  return 0;
+}
+static bool bar5(uint8_t i, uint64_t off) {
+  ACCESSES++;
+  bool ok = i == BAR5.idx && off % 4 == 0 && off + 4 <= BAR5.size;
+  if (!ok) BAD.push_back("BAR5 access idx " + std::to_string(i) + " offset " + std::to_string(off));
+  return ok;
+}
+kern_return_t IOPCIDevice::GetBARInfo(uint8_t bar, uint8_t *idx, uint64_t *size, uint8_t *type) {
+  if (bar != 5) BAD.push_back("GetBARInfo(" + std::to_string(bar) + ")");
+  if (BAR5.err) return BAR5.err;
+  *idx = BAR5.idx; if (size) *size = BAR5.size; if (type) *type = 0;
+  return 0;
+}
+void IOPCIDevice::MemoryRead32(uint8_t i, uint64_t off, uint32_t *v) { if (bar5(i, off)) *v = CARD->mmio_rd((uint32_t)(off / 4)); TRACE.push_back({2, (uint32_t)(off / 4), 4, *v}); }
+void IOPCIDevice::MemoryWrite32(uint8_t i, uint64_t off, uint32_t v) { TRACE.push_back({3, (uint32_t)(off / 4), 4, v}); if (bar5(i, off)) CARD->mmio_wr((uint32_t)(off / 4), v); }
+void IOPCIDevice::ConfigurationRead8(uint64_t o, uint8_t *v) { ACCESSES++; *v = (uint8_t)CARD->cfg_rd((uint32_t)o, 1); TRACE.push_back({0, (uint32_t)o, 1, *v}); }
+void IOPCIDevice::ConfigurationRead16(uint64_t o, uint16_t *v) { ACCESSES++; *v = (uint16_t)CARD->cfg_rd((uint32_t)o, 2); TRACE.push_back({0, (uint32_t)o, 2, *v}); }
+void IOPCIDevice::ConfigurationRead32(uint64_t o, uint32_t *v) { ACCESSES++; *v = CARD->cfg_rd((uint32_t)o, 4); TRACE.push_back({0, (uint32_t)o, 4, *v}); }
+void IOPCIDevice::ConfigurationWrite8(uint64_t o, uint8_t v) { ACCESSES++; TRACE.push_back({1, (uint32_t)o, 1, v}); CARD->cfg_wr((uint32_t)o, v, 1); }
+void IOPCIDevice::ConfigurationWrite16(uint64_t o, uint16_t v) { ACCESSES++; TRACE.push_back({1, (uint32_t)o, 2, v}); CARD->cfg_wr((uint32_t)o, v, 2); }
+void IOPCIDevice::ConfigurationWrite32(uint64_t o, uint32_t v) { ACCESSES++; TRACE.push_back({1, (uint32_t)o, 4, v}); CARD->cfg_wr((uint32_t)o, v, 4); }
+
+// ---- provider-chain entries: a PCI device nub (vendor-id / device-id / class-code as 4-byte data, link caps as numbers) or a non-PCI one
+// (the driver itself, a bridge driver). IDs other than the card's and caps are TEST values. ----
+static OSDictionary *pci(uint32_t ven, uint32_t dev, int64_t cap = -1, int64_t cap2 = -1, uint32_t ven_len = 4, bool cls = true) {
+  OSDictionary *d = OSDictionary::withCapacity(5);
+  auto put = [&](const char *k, OSObject *o) { d->setObject(k, o); o->release(); };
+  uint32_t cc = 0x060400;
+  put("vendor-id", OSData::withBytes(&ven, ven_len)); put("device-id", OSData::withBytes(&dev, 4));
+  if (cls) put("class-code", OSData::withBytes(&cc, 4));
+  if (cap >= 0) put("IOPCIExpressLinkCapabilities", OSNumber::withNumber((uint64_t)cap, 32));
+  if (cap2 >= 0) put("IOPCIExpressLinkCapabilities2", OSNumber::withNumber((uint64_t)cap2, 32));
+  return d;
+}
+static OSDictionary *other() { OSDictionary *d = OSDictionary::withCapacity(1); OSNumber *n = OSNumber::withNumber(1, 32); d->setObject("IOProbeScore", n); n->release(); return d; }
+static const int64_t GEN4_CAP = 0x00473904, GEN4_CAP2 = 0x1e;   // 16 GT/s x16: no override (t_mi50 L1) - on every entry that must not be the partner
+// the MI50 behind Thunderbolt: the driver, the card, its own AMD switch (downstream + upstream port), a PCI-looking entry without class-code,
+// the Thunderbolt downstream port (the partner), and further up a port that must not be used
+static std::vector<OSObject *> tb_chain(int64_t cap, int64_t cap2, OSDictionary *card = nullptr) {
+  return {other(), card ? card : pci(0x1002, 0x66a1, GEN4_CAP, GEN4_CAP2), other(), pci(0x1002, 0x14a1, GEN4_CAP, GEN4_CAP2), other(),
+          pci(0x1002, 0x14a0, GEN4_CAP, GEN4_CAP2), other(), pci(0x8086, 0x1111, GEN4_CAP, GEN4_CAP2, 4, false),
+          pci(0x8086, 0x2222, cap, cap2), other(), pci(0x8086, 0x3333, GEN4_CAP, GEN4_CAP2)};
+}
+static void set_chain(std::vector<OSObject *> v) { for (OSObject *o : CHAIN) o->release(); CHAIN = v; }
+
+// ---- a card as IOPCIFamily + MI50BarFix leave it (t_mi50 make_from): REBAR 256 MiB, BAR0 placed above 4 GiB (or not), BAR2, BAR5 ----
+struct Rec : Card {   // the card recording MI50Device's own accesses when t is set
+  using Card::Card;
+  Trace *t = nullptr;
+  uint32_t cfg_rd(uint32_t o, unsigned s) override { uint32_t v = Card::cfg_rd(o, s); if (t) t->push_back({0, o, s, v}); return v; }
+  void cfg_wr(uint32_t o, uint32_t v, unsigned s) override { if (t) t->push_back({1, o, s, v}); Card::cfg_wr(o, v, s); }
+  uint32_t mmio_rd(uint32_t i) override { uint32_t v = Card::mmio_rd(i); if (t) t->push_back({2, i, 4, v}); return v; }
+  void mmio_wr(uint32_t i, uint32_t v) override { if (t) t->push_back({3, i, 4, v}); Card::mmio_wr(i, v); }
+};
+static std::unique_ptr<Rec> card(bool bar0_placed = true) {
+  std::unique_ptr<Rec> c(new Rec(build_vbios().img, FW));
+  c->start();
+  c->cfg_wr(CFG_REBAR + 8, 8u << 8, 4);
+  c->cfg_wr(0x10, 0x50000000, 4); c->cfg_wr(0x14, bar0_placed ? 0x10 : 0, 4);
+  c->cfg_wr(0x18, 0x40000000, 4); c->cfg_wr(0x1c, 0, 4); c->cfg_wr(0x24, 0x40200000, 4);
+  c->cfg_writes.clear(); c->events.clear();
+  return c;
+}
+// StartMI50 as TinyGPUDriver::Start runs it; clean: no contract violation, every IOMallocZero block back with its size, no OSObject left
+struct Out { bool r; bool clean; std::vector<uint32_t> ov; };
+static Out start(Card &c) {
+  CARD = &c; LOG.clear(); BAD.clear(); KEYS.clear(); TRACE.clear(); ACCESSES = 0; fake_os_creates = 0;
+  Out o;
+  { IOService svc; IOPCIDevice dev; o.r = StartMI50(&svc, &dev); }
+  set_chain({});
+  for (auto &m : c.smu_log) if (m.first == PPSMC_MSG_OverridePcieParameters) o.ov.push_back(m.second);
+  o.clean = BAD.empty() && c.outstanding == 0 && fake_os_live == 0 && std::find(c.events.begin(), c.events.end(), "release_size_mismatch") == c.events.end() &&
+            std::find(c.events.begin(), c.events.end(), "release_unknown_pointer") == c.events.end() &&
+            std::find(c.events.begin(), c.events.end(), "mmio_past_bar5") == c.events.end();
+  return o;
+}
+static std::string logged(const std::string &s) { for (auto &l : LOG) if (l.find(s) != std::string::npos) return l; return ""; }
+static bool handed_over(Card &c) { return c.regs[GC_SCRATCH_REG7] == mi50::AM_VERSION && c.regs[GC_SCRATCH_REG6] == 0; }
+static std::string hx(uint64_t v) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v); return b; }
+static std::string ovs(const Out &o) { std::string s; for (auto x : o.ov) s += " " + hx(x); return s.empty() ? " none" : s; }
+static const std::vector<std::string> KEYS5 = {"vendor-id", "device-id", "class-code", "IOPCIExpressLinkCapabilities", "IOPCIExpressLinkCapabilities2"};
+
+int main(int argc, char **argv) {
+  if (argc != 2) { fprintf(stderr, "usage: t_dext <vega20 firmware dir>\n"); return 2; }
+  FW = linux_fw(argv[1]);
+
+  // ================= D1: power-up behind Thunderbolt =================
+  std::unique_ptr<Card> c = card();
+  set_chain(tb_chain(0x00473903, 0x0e));   // the partner: 8 GT/s x16 (t_mi50 G)
+  Out o = start(*c);
+  check(o.r && handed_over(*c) && o.clean, "D1: StartMI50 = true, AM's hand-over state, no DriverKit contract violation, every buffer and OSObject released");
+  check(logged("tinygpu: mi50: BAR0 placed by MI50BarFix after ") != "", "D1: " + logged("BAR0"));
+  std::string l = logged("tinygpu: mi50: initialised in ");
+  char want[256];
+  snprintf(want, sizeof(want), "VRAM 32752 MiB, SMU 0x%x, features 0x%llx, PPT 250 W, POSTed", FW.smc_version, (unsigned long long)c->smu.enabled);
+  check(l.find(want) != std::string::npos, "D1: " + l);
+  check(KEYS == KEYS5, "D1: CopyProviderProperties asked for vendor-id, device-id, class-code, IOPCIExpressLinkCapabilities(2)");
+  check(logged("tinygpu: mi50: link partner found lnkcap 0x473903 lnkcap2 0xe") != "" && o.ov == std::vector<uint32_t>{0x10206},
+        "D1: partner = the Thunderbolt port past the AMD switch and the class-code-less entry -> OverridePcieParameters" + ovs(o));
+  check(logged("tinygpu: mi50: ATOM: unimplemented!") != "" && std::count(c->us_delays.begin(), c->us_delays.end(), 77u) == 1 &&
+        std::count(c->ms_sleeps.begin(), c->ms_sleeps.end(), 3u) == 1, "D1: ASIC_Init's REPEAT, DELAY_US 77, DELAY_MS 3 reach os_log, IODelay, IOSleep");
+  check((c->cfg_rd(CFG_PCIE + 0x10, 2) & 3) == 0 && (c->cfg_rd(4, 2) & 4) && c->bar0() == (0x10ull << 32 | 0x50000000) &&
+        (c->cfg_rd(CFG_REBAR + 8, 4) >> 8 & 0x3f) == 8, "D1: through ConfigurationRead/Write: ASPM off, bus master on, BAR0 and REBAR as placed");
+
+  // ================= D6: the driver started again on the same card =================
+  o = start(*c);
+  l = logged("tinygpu: mi50: already initialised in ");
+  check(o.r && o.clean && l != "" && l.find("POSTed") == std::string::npos && KEYS.empty(), "D6: second start = true, nothing done: " + l);
+
+  // ================= D9: a session that never finalized (REG6 = 1) -> PSP mode1 reset, configuration saved and put back, re-POST =================
+  c->regs[GC_SCRATCH_REG6] = 1;
+  o = start(*c);
+  l = logged("tinygpu: mi50: initialised in ");
+  check(o.r && o.clean && handed_over(*c) && c->mode1_count == 1 && c->posted == 2 && l.find(", POSTed") != std::string::npos &&
+        c->bar0() == (0x10ull << 32 | 0x50000000), "D9: mode1 reset through the glue, BAR0 back: " + l);
+
+  // ================= D8: ASIC_Init resets REBAR and BAR0 -> put back with ConfigurationWrite32 =================
+  c = card(); c->post_resets_bar = 1;
+  o = start(*c);
+  check(o.r && o.clean && handed_over(*c) && c->bar0() == (0x10ull << 32 | 0x50000000) && (c->cfg_rd(CFG_REBAR + 8, 4) >> 8 & 0x3f) == 8,
+        "D8: POST reset REBAR + BAR0 -> both put back through the glue");
+
+  // ================= D10: every access goes through as MI50Device makes it (offset, size, value), the BAR0 wait included =================
+  { std::unique_ptr<Rec> direct = card(); Trace want; direct->t = &want;
+    direct->have_partner = true; direct->partner_cap = 0x00473903; direct->partner_cap2 = 0x0e;
+    direct->now_ns(); mi50::wait_bar0_placed(*direct, 5000); direct->now_ns(); direct->now_ns();   // StartMI50's own clock reads around the wait and init
+    { mi50::MI50Device d(*direct); d.init(); }
+    c = card(); set_chain(tb_chain(0x00473903, 0x0e));
+    o = start(*c);
+    size_t k = 0; while (k < want.size() && k < TRACE.size() && want[k] == TRACE[k]) k++;
+    check(o.r && o.clean && want == TRACE, "D10: the " + std::to_string(TRACE.size()) + " accesses through the glue = MI50Device's own on the card (equal up to " +
+          std::to_string(k) + " of " + std::to_string(want.size()) + ")"); }
+
+  // ================= D2/D3: no BAR5 aperture -> false before any device access =================
+  c = card(); BAR5.err = (kern_return_t)0xe00002c0;
+  o = start(*c);
+  l = logged("tinygpu: mi50: no BAR5 register aperture (0xe00002c0)");
+  check(!o.r && o.clean && ACCESSES == 0 && l != "", "D2: GetBARInfo(5) fails -> false, no access: " + l);
+  BAR5.err = 0; BAR5.size = 2;
+  o = start(*c);
+  l = logged("tinygpu: mi50: no BAR5 register aperture (0x0)");
+  check(!o.r && o.clean && ACCESSES == 0 && l != "", "D3: BAR5 smaller than a register -> false, no access: " + l);
+  BAR5.size = 512u << 10;
+
+  // ================= D4: no MI50BarFix (BAR0 below 4 GiB) -> 5 s, then the bring-up goes on =================
+  c = card(false);
+  o = start(*c);
+  l = logged("tinygpu: mi50: BAR0 not placed (no MI50BarFix?), going on after ");
+  unsigned long ms = l.empty() ? 0 : strtoul(l.c_str() + l.rfind("after ") + 6, nullptr, 10);
+  check(o.r && o.clean && handed_over(*c) && ms >= 5000 && ms < 5100 && logged("tinygpu: mi50: initialised in ") != "", "D4: " + l);
+
+  // ================= D5: the bring-up fails -> false with the reason =================
+  c = card(); c->fail_smu_msg = PPSMC_MSG_EnableAllSmuFeatures;
+  o = start(*c);
+  l = logged("tinygpu: mi50: INITIALISATION FAILED after ");
+  check(!o.r && o.clean && !handed_over(*c) && l.find("response 0xff") != std::string::npos && l.find(" - power the card down") != std::string::npos, "D5: " + l);
+
+  // ================= D7: a 256 KiB BAR5: the glue's aperture is BAR5 size / 4 dwords, the rest through PCIE_INDEX2 =================
+  c = card(); c->mmio_size_dwords = (256u << 10) / 4; BAR5.size = 256u << 10;
+  o = start(*c);
+  check(o.r && o.clean && handed_over(*c) && c->indirect > 0, "D7: BAR5 256 KiB -> no access past it, " + std::to_string(c->indirect) + " registers through PCIE_INDEX2/DATA2");
+  BAR5.size = 512u << 10;
+
+  // ================= L: the provider chain -> the link partner's caps (t_mi50 G/L7 expectations; default = no partner, 0x10106) =================
+  struct LC { const char *tag; std::function<void()> chain; int fail_at; const char *log; std::vector<uint32_t> ov; size_t keys; };
+  LC ls[] = {
+    {"L2 partner without IOPCIExpressLinkCapabilities -> not found", [] { set_chain(tb_chain(-1, -1)); }, 0, "link partner not found (default caps) lnkcap 0x0 lnkcap2 0x0", {0x10106}, 5},
+    {"L3 CopyProviderProperties fails", [] { set_chain(tb_chain(0x00473903, 0x0e)); CHAIN_ERR = (kern_return_t)0xe00002c7; }, 0,
+     "provider chain unavailable (0xe00002c7): default PCIe caps", {0x10106}, 5},
+    {"L4 the card is not in the chain", [] { set_chain({other(), pci(0x1002, 0x14a1, GEN4_CAP, GEN4_CAP2), pci(0x8086, 0x2222, 0x00473903, 0x0e)}); }, 0,
+     "link partner not found", {0x10106}, 5},
+    {"L5 the card's vendor-id is 2 bytes -> not a PCI entry", [] { set_chain(tb_chain(0x00473903, 0x0e, pci(0x1002, 0x66a1, GEN4_CAP, GEN4_CAP2, 2))); }, 0,
+     "link partner not found", {0x10106}, 5},
+    {"L6 partner with LNKCAP only (8 GT/s) -> lnkcap2 0 -> GEN1..2", [] { set_chain(tb_chain(0x00473903, -1)); }, 0,
+     "link partner found lnkcap 0x473903 lnkcap2 0x0", {0x10106}, 5},
+    {"L7 non-dictionary entries in the chain are passed over", [] { auto v = tb_chain(0x00473903, 0x0e); OSString *s = OSString::withCString("x"); s->retain();
+       v.insert(v.begin() + 1, s); v.insert(v.begin() + 4, s); set_chain(v); }, 0, "link partner found lnkcap 0x473903 lnkcap2 0xe", {0x10206}, 5},
+    {"L8 CopyProviderProperties succeeds with no array", [] { set_chain({}); CHAIN_NULL = true; }, 0, "provider chain unavailable (0x0)", {0x10106}, 5},
+    {"L9 OSArray::withCapacity for the keys fails -> default caps", [] { set_chain(tb_chain(0x00473903, 0x0e)); }, 1, nullptr, {0x10106}, 0},
+    {"L10 OSString for vendor-id fails -> no entry is PCI", [] { set_chain(tb_chain(0x00473903, 0x0e)); }, 2, "link partner not found", {0x10106}, 4},
+    {"L11 only the card's own switch above it", [] { set_chain({other(), pci(0x1002, 0x66a1), pci(0x1002, 0x14a1, GEN4_CAP, GEN4_CAP2), other()}); }, 0,
+     "link partner not found", {0x10106}, 5}};
+  for (auto &k : ls) {
+    c = card(); k.chain(); fake_os_fail_at = k.fail_at;
+    o = start(*c);
+    std::string got = k.log ? logged(std::string("tinygpu: mi50: ") + k.log) : "";
+    bool silent = k.log || (logged("link partner") == "" && logged("provider chain") == "");
+    check(o.r && o.clean && handed_over(*c) && (k.log ? got != "" : silent) && o.ov == k.ov && KEYS.size() == k.keys,
+          std::string(k.tag) + ":" + ovs(o) + (got.empty() ? "" : " - " + got));
+    CHAIN_ERR = 0; CHAIN_NULL = false; fake_os_fail_at = 0;
+  }
+
+  printf("\n%d ok, %d FAIL\n", nok, nfail);
+  return nfail ? 1 : 0;
+}

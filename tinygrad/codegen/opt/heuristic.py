@@ -24,6 +24,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     1: allows kernels with multiple reduce axes and also multiplication of Ops.CAST'd buffers
     2: allows kernels with M, N, K axes that are not multiples of the tensor core dimensions by applying padding those axes as needed
   """
+  if not NOLOCALS and k.ren.target.arch.split(":", 1)[0] == "gfx906":
+    from tinygrad.codegen.opt.gfx906 import try_gfx906_gemm
+    if (tiled := try_gfx906_gemm(k)) is not None: return tiled
   # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis
   if USE_TC > 0 and (len(k.axes_of(AxisType.GROUP_REDUCE, AxisType.REDUCE)) == 1 or (TC_OPT.value >= 1)):
     for axis in range(3):
@@ -110,11 +113,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.target.device == "DSP"
+  # gfx9 (GCN/CDNA, 64-lane waves) reduce kernels block 8x8 outputs per thread. Measured on the MI50 (gfx906, 2026-10-18, 4096^2 fp32
+  # matmul): upcast 4x4 2.43-2.49 TFLOP/s, 8x8 with unroll 4 and locals 8x16 3.95-4.26
+  gfx9 = k.ren is not None and k.ren.target.arch.startswith("gfx9")
+  mm8 = gfx9 and k.reduceop is not None
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
-    # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    # consider all upcastable axes with 3 or 4 upcast (128 on the DSP, 8 on a gfx9 reduce kernel)
+    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [8] if mm8 else [3,4]):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -139,7 +146,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() <= 64 if mm8 else k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
@@ -167,9 +174,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
                               for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK) if k.rngs[axis].src[0].op is Ops.CONST]
       to_local: list[tuple[int, int]] = []
+      # gfx9 (GCN/CDNA) runs 64-lane waves only: a 32-wide first axis leaves half of every wave idle. Measured on the MI50 (gfx906,
+      # 2026-10-18, 64M fp32 elementwise): local 32 238.6 GB/s, 64 475.5, 128 869-873, 256 793-806. Kernels without a reduce only
+      # (Leon 2026-10-18): on a 4096^2 A@v it cut the launch to 8 workgroups, 2.12 -> 4.9-5.7 ms
+      first_local = 128 if gfx9 and k.reduceop is None else 32
       for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
         local_size = prod(sz for _, sz in to_local)
-        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
+        local_sz: int|None = next((x for x in ([first_local] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
         if local_sz is not None: to_local.append((axis, local_sz))
       deleted_shape = 0
       for axis, local_sz in sorted(to_local[:3]):

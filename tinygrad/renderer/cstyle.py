@@ -4,6 +4,7 @@ from collections import defaultdict, Counter
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters
 from tinygrad.helpers import strip_parens, getenv, prod, dedup, Target, NUM_CPU_THREADS, IMAGE, FLOAT16, is_image_shape
+from tinygrad.helpers import MI50_PREFETCH, MI50_PREFETCH_TAG
 from tinygrad.dtype import dtypes, DType, AddrSpace, truncate, float_to_bf16
 from tinygrad.renderer import Renderer
 
@@ -478,6 +479,29 @@ class NVCCRenderer(CUDARenderer):
 def fp8_index(dtype: DType): return (dtypes.fp8e4m3, dtypes.fp8e5m2).index(dtype)
 def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
 
+def gfx906_dot2_pattern(name="dot"):
+  return UPat(Ops.CUSTOM, dtype=dtypes.float, arg="gfx906_dot2", name=name, src=(
+    UPat(dtype=dtypes.half), UPat(dtype=dtypes.half),
+    UPat(dtype=dtypes.half), UPat(dtype=dtypes.half), UPat(dtype=dtypes.float)))
+
+def fuse_gfx906_dot2(dot:UOp, acc:UOp) -> UOp|None:
+  if dot.shape != () or acc.shape != () or any(s.shape != () for s in dot.src): return None
+  zero = dot.src[4]
+  while zero.op is Ops.CAST: zero = zero.src[0]
+  if zero.op is not Ops.CONST or zero.val != 0: return None
+  return dot.replace(src=dot.src[:4]+(acc,))
+
+pm_gfx906_dot2 = PatternMatcher([
+  (gfx906_dot2_pattern()+UPat.var("acc", dtypes.float), fuse_gfx906_dot2),
+])
+
+pm_gfx906_fma = PatternMatcher([
+  (UPat.var("a", (dtypes.float, dtypes.double))*UPat.var("b", (dtypes.float, dtypes.double))+
+   UPat.var("c", (dtypes.float, dtypes.double)),
+   lambda a,b,c: a.alu(Ops.MULACC, b, c)
+   if a.dtype == b.dtype == c.dtype and all(u.shape == () for u in (a,b,c)) else None),
+])
+
 class HIPRenderer(CStyleLanguage):
   shared_max = 65536
   # NOTE: this is only really needed on gfx12, even though gfx11 reports the same limitation
@@ -493,6 +517,16 @@ class HIPRenderer(CStyleLanguage):
     from tinygrad.runtime.support.compiler_amd import HIPCompiler, HIPCCCompiler
     self.compiler, self.tensor_cores = (HIPCCCompiler if use_hipcc else HIPCompiler)(target.arch), tc.get_amd(target.arch)
     if not self.is_cdna4(target.arch): self.extra_matcher += pm_manual_bf16_cast
+    if target.arch.split(":", 1)[0] == "gfx906":
+      self.extra_matcher += pm_gfx906_dot2+pm_gfx906_fma
+      self.string_rewrite = PatternMatcher([
+        (UPat(Ops.BITCAST, dtype=dtypes.uint, src=(UPat(Ops.PARAM, dtype=dtypes.half),), tag=MI50_PREFETCH_TAG, name="x"),
+         lambda ctx,x: f"((gfx906_alias_u32*)({ctx[x.src[0]]}))"
+         if MI50_PREFETCH and getattr(ctx, "mi50_tuning", False) and x.addrspace is AddrSpace.GLOBAL else None),
+        (gfx906_dot2_pattern("x"), lambda ctx,x: f"__gfx906_dot2({', '.join(ctx[s] for s in x.src)})"),
+        (UPat(Ops.MULACC, dtype=(dtypes.float, dtypes.double), name="x"),
+         lambda ctx,x: f"__builtin_fma{'f' if x.dtype == dtypes.float else ''}({', '.join(ctx[s] for s in x.src)})"),
+      ])+self.string_rewrite
     if self.is_cdna(target.arch):
       self.string_rewrite = PatternMatcher([
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
@@ -528,6 +562,11 @@ class HIPRenderer(CStyleLanguage):
     (UPat.cvar('x', dtypes.bfloat16), lambda x: cast_float_to_bf16(UOp.const(x.val, dtypes.float))),
   ])
 
+  def render(self, uops:list[UOp]) -> str:
+    if self.target.arch.split(":", 1)[0] == "gfx906" and any(u.op is Ops.WMMA for u in uops):
+      raise RuntimeError("gfx906 has no WMMA/MFMA path")
+    return super().render(uops)
+
   def asm(self, prg:UOp, lin:UOp) -> bytes:
     from tinygrad.renderer.amd.elf import assemble_linear
     return assemble_linear(prg, lin, self.target.arch)
@@ -541,6 +580,10 @@ class HIPRenderer(CStyleLanguage):
     prefix, ockl = [], []
     type_map = { dtypes.bfloat16: "bf16", dtypes.float: "f32", dtypes.half: "f16", dtypes.fp8e4m3: "_fp8_fp8", dtypes.fp8e5m2: "_bf8_bf8" }
     used_dtypes = uops_to_dtypes(uops)
+    if MI50_PREFETCH and getattr(self, "mi50_tuning", False) and self.target.arch.split(":", 1)[0] == "gfx906" and any(
+      u.op is Ops.BITCAST and u.tag == MI50_PREFETCH_TAG and u.dtype == dtypes.uint
+      and u.addrspace is AddrSpace.GLOBAL and u.src[0].op is Ops.PARAM and u.src[0].dtype == dtypes.half for u in uops):
+      prefix.append("typedef unsigned int __attribute__((may_alias, aligned(2))) gfx906_alias_u32;")
     if any(u.op is Ops.CAST and u.src[0].op is Ops.CONST and not math.isfinite(u.src[0].val) for u in uops):
       prefix += ["#define INFINITY (__builtin_inff())", "#define NAN (__builtin_nanf(\"\"))"]
     if any(u.op is Ops.SPECIAL for u in uops):
@@ -552,6 +595,13 @@ class HIPRenderer(CStyleLanguage):
     if any(dt == dtypes.bfloat16 for dt, _ in used_dtypes):
       prefix.append(f"typedef {'__bf16' if self.is_cdna4(self.target.arch) else 'unsigned short'} hip_bfloat16;")
     if any(dt == dtypes.half for dt, _ in used_dtypes): prefix.append("#define half _Float16")
+    if any(u.op is Ops.CUSTOM and u.arg == "gfx906_dot2" for u in uops):
+      prefix.append("""typedef _Float16 gfx906_half2 __attribute__((ext_vector_type(2)));
+static inline __attribute__((device, always_inline))
+float __gfx906_dot2(_Float16 a0, _Float16 a1, _Float16 b0, _Float16 b1, float c) {
+  gfx906_half2 a = {a0, a1}, b = {b0, b1};
+  return __builtin_amdgcn_fdot2(a, b, c, false);
+}""")
     if any(dt in dtypes.fp8s for dt, _ in used_dtypes):
       prefix += ["typedef unsigned char hip_bf8;", "typedef unsigned char hip_fp8;"]
     if any((u.op is Ops.CAST and u.dtype in dtypes.fp8s and u.src[0].dtype == dtypes.float) or

@@ -9,6 +9,9 @@ enum TinyGPURPC
 	WriteCfg,
 	Reset,
 	PrepareDMA,
+	ReleaseDMA,   // mi50: scalar in = the mapping's first segment address; CompleteDMA + release of that one mapping
+	QuiesceOnStop,   // mi50: no scalars; when this user client stops, bus master is cleared before any DMA mapping is released
+	MI50,            // mi50: struct in = mi50::Mi50Req (72 bytes), struct out = mi50::Mi50Resp (1568 bytes): one MI50 tuning operation
 };
 
 class TinyGPUDriverUserClient : public IOUserClient

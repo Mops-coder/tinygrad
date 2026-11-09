@@ -1,0 +1,196 @@
+// Stand-ins for the DriverKit / PCIDriverKit API the TinyGPU driver uses (TinyGPUDriver.cpp, TinyGPUDriverUserClient.cpp), with the
+// DriverKit25.5 SDK's signatures and documented semantics (retained results, setObject retains, getObject does not, CreateMapping's
+// offset/length/alignment contract), so the tests compile the driver's own files unchanged on the host. What needs the virtual MI50 or a
+// test's records - the IOPCIDevice accesses, IOLib's time and memory, os_log, IOService::CopyProviderProperties - is declared here and
+// defined in test/dk_card.hpp. DriverKit/DriverKit.h, OSCollections.h, OSSharedPtr.h and PCIDriverKit/PCIDriverKit.h include this file;
+// fake_driverkit/TinyGPUDriver.h and TinyGPUDriverUserClient.h stand in for the iig output.
+#pragma once
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>   // before the clock_gettime_nsec_np macro below
+#include <new>
+#include <map>
+#include <string>
+#include <vector>
+#include <IOKit/IOReturn.h>
+
+typedef int kern_return_t;
+#define SUPERDISPATCH 0
+#define LOCALONLY
+#define IMPL(cls, name) cls::name##_Impl(uint64_t type, uint64_t* options, IOMemoryDescriptor** memory)
+#define IOVMPageSize 16384
+
+// ---- IOLib, os_log (dk_card.hpp) ----
+void IODelay(uint64_t us);
+void IOSleep(uint64_t ms);
+void *IOMallocZero(size_t length);
+void IOFree(void *address, size_t length);
+uint64_t fake_uptime_ns(clockid_t clock);
+#define clock_gettime_nsec_np(c) fake_uptime_ns(c)
+#define OS_LOG_DEFAULT ((void *)0)
+void fake_os_log(void *log, const char *fmt, ...) __attribute__((format(os_log, 2, 3)));
+#define os_log(log, fmt, ...) fake_os_log(log, fmt, ##__VA_ARGS__)
+inline std::vector<std::string> g_logs;   // every os_log line, {public} dropped
+
+// ---- failure points and records of the vendor paths ----
+inline int g_allocs = 0, g_alloc_fail_at = 0, g_init_fail = 0;   // IONewZero's g_alloc_fail_at-th call fails; IOService::init fails
+// g_fail: DriverKit calls that fail - IOService::Start / Stop, GetBARInfo, _CopyDeviceMemoryWithIndex, IODMACommand::Create, PrepareForDMA,
+// IOBufferMemoryDescriptor::Create
+enum { F_START = 1, F_STOP = 2, F_BARINFO = 4, F_DEVMEM = 8, F_DMACREATE = 16, F_DMAPREP = 32, F_BUFCREATE = 64 };
+inline int g_fail = 0;
+inline int g_map_fail = 0, g_completes = 0, g_cmd_alive = 0, g_ent_calls = 0, g_cmdw_completes = -1, g_create_kind = 0, g_create_freed = 0,
+           g_registers = 0;
+inline uint64_t g_next_iova = 0x80000000, g_map_off = 0, g_map_len = 0, g_map_align = 0;
+inline void (*g_on_power_ack)(uint32_t flags) = nullptr;   // called by IOService::SetPowerState(..., SUPERDISPATCH): the acknowledgement
+
+// ---- OSObject and the collections: reference counted; live = objects not yet freed ----
+inline long fake_os_live = 0;
+inline int fake_os_creates = 0, fake_os_fail_at = 0;   // the fake_os_fail_at-th (1-based) factory / OSArray::setObject call fails (0 = never)
+inline bool fake_os_create_ok() { return ++fake_os_creates != fake_os_fail_at; }
+
+struct OSObject {
+  mutable int rc = 1;
+  OSObject() { fake_os_live++; }
+  virtual ~OSObject() { fake_os_live--; }
+  virtual void retain() const { rc++; }
+  virtual void release() const { if (--rc == 0) delete this; }
+};
+typedef OSObject OSMetaClassBase;
+#define OSDynamicCast(type, inst) dynamic_cast<type *>(inst)
+#define OSSafeReleaseNULL(inst) do { if (NULL != (inst)) { (inst)->release(); (inst) = NULL; } } while (0)   // IOLib.h, verbatim
+
+struct OSString : OSObject {
+  std::string s;
+  OSString() {}
+  explicit OSString(const char *c) : s(c) {}
+  static OSString *withCString(const char *c) { if (!fake_os_create_ok()) return nullptr; return new OSString(c); }
+  bool isEqualTo(const char *c) const { return s == c; }
+  const char *getCStringNoCopy() const { return s.c_str(); }
+};
+struct OSBoolean : OSObject { bool v; explicit OSBoolean(bool b) : v(b) {} };
+struct OSData : OSObject {
+  std::vector<uint8_t> b;
+  static OSData *withBytes(const void *p, uint32_t n) { auto *o = new OSData; o->b.assign((const uint8_t *)p, (const uint8_t *)p + n); return o; }
+  uint32_t getLength() const { return (uint32_t)b.size(); }
+  const void *getBytesNoCopy() const { return b.empty() ? nullptr : b.data(); }
+};
+struct OSNumber : OSObject {
+  uint64_t v = 0;
+  static OSNumber *withNumber(uint64_t value, uint32_t bits) { auto *o = new OSNumber; o->v = bits < 64 ? value & ((1ull << bits) - 1) : value; return o; }
+  uint32_t unsigned32BitValue() const { return (uint32_t)v; }
+};
+struct OSArray : OSObject {   // owns one reference to each element
+  std::vector<OSObject *> a;
+  ~OSArray() override { for (auto *o : a) o->release(); }
+  static OSArray *withCapacity(uint32_t) { return fake_os_create_ok() ? new OSArray : nullptr; }
+  bool setObject(const OSMetaClassBase *o) { if (!o || !fake_os_create_ok()) return false; o->retain(); a.push_back(const_cast<OSObject *>(o)); return true; }
+  uint32_t getCount() const { return (uint32_t)a.size(); }
+  OSObject *getObject(uint32_t i) const { return i < a.size() ? a[i] : nullptr; }
+};
+struct OSDictionary : OSObject {   // owns one reference to each value
+  std::map<std::string, OSObject *> d;
+  ~OSDictionary() override { for (auto &kv : d) kv.second->release(); }
+  static OSDictionary *withCapacity(uint32_t) { return new OSDictionary; }
+  bool setObject(const char *k, const OSMetaClassBase *o) {
+    if (!o) return false;
+    o->retain(); auto it = d.find(k); if (it != d.end()) it->second->release(); d[k] = const_cast<OSObject *>(o); return true;
+  }
+  OSObject *getObject(const char *k) const { auto it = d.find(k); return it == d.end() ? nullptr : it->second; }
+};
+struct OSRetainTag {}; static const OSRetainTag OSRetain{};
+template <class T> struct OSSharedPtr { T* p = nullptr; OSSharedPtr() {} OSSharedPtr(std::nullptr_t) {} OSSharedPtr(T* q, OSRetainTag) : p(q) { if (p) p->retain(); }
+  OSSharedPtr& operator=(OSSharedPtr&& o) { reset(); p = o.p; o.p = nullptr; return *this; } ~OSSharedPtr() { reset(); }
+  void reset() { if (p) p->release(); p = nullptr; } T* get() const { return p; } T* operator->() const { return p; } };
+
+// ---- IOLock (IOLib.h:381-420): a mutex; the tests count locks and unlocks, and a lock taken twice by one thread is a test failure ----
+struct IOLock { int held = 0; };
+inline int g_lock_allocs = 0, g_lock_frees = 0, g_lock_takes = 0, g_lock_fail_alloc = 0;
+inline IOLock *IOLockAlloc() { if (g_lock_fail_alloc) return nullptr; g_lock_allocs++; return new IOLock; }
+inline void IOLockFree(IOLock *l) { if (l->held) { fprintf(stderr, "FAIL IOLockFree on a held lock\n"); abort(); } g_lock_frees++; delete l; }
+inline void IOLockLock(IOLock *l) { if (l->held) { fprintf(stderr, "FAIL IOLockLock on a lock this thread holds (deadlock)\n"); abort(); } l->held = 1; g_lock_takes++; }
+inline void IOLockUnlock(IOLock *l) { if (!l->held) { fprintf(stderr, "FAIL IOLockUnlock on a lock not held\n"); abort(); } l->held = 0; }
+
+// ---- power (IOService.iig:53-58) ----
+enum { kIOServicePowerCapabilityOff = 0x00000000, kIOServicePowerCapabilityOn = 0x00000002, kIOServicePowerCapabilityLow = 0x00010000 };
+
+// ---- IONewZero / IOSafeDeleteNULL ----
+template <class T> T* IONewZeroImpl(size_t n) { if (++g_allocs == g_alloc_fail_at) return nullptr;
+  T* p = (T*)calloc(n, sizeof(T)); for (size_t i = 0; i < n; i++) new (p + i) T(); return p; }
+template <class T> void IODeleteImpl(T* p, size_t n) { if (!p) return; for (size_t i = 0; i < n; i++) p[i].~T(); free(p); }
+#define IONewZero(T, n) IONewZeroImpl<T>(n)
+#define IOSafeDeleteNULL(ptr, T, n) do { IODeleteImpl<T>(ptr, n); ptr = nullptr; } while (0)
+
+// ---- memory descriptors and DMA ----
+typedef char IOServiceName[128];
+struct IOAddressSegment { uint64_t address, length; };
+struct IOMemoryMap : OSObject { void* addr; uint64_t GetAddress() { return (uint64_t)addr; } };
+struct IOMemoryDescriptor : OSObject { std::vector<uint8_t> mem; uint64_t len = 0;
+  kern_return_t GetLength(uint64_t* l) { *l = len; return 0; }
+  // DriverKit's contract (IOMemoryDescriptor.h, SDK 25.5 / 27.0): offset = start in the descriptor, length 0 = all or <= the descriptor,
+  // "Only zero for no alignment is supported"; anything else is refused here. The last call is recorded for the checks.
+  kern_return_t CreateMapping(uint64_t opt, uint64_t addr, uint64_t off, uint64_t length, uint64_t align, IOMemoryMap** m) {
+    g_map_off = off; g_map_len = length; g_map_align = align;
+    if (g_map_fail) return kIOReturnNoMemory;
+    if (align != 0 || off > len || (length ? length : len - off) > len - off) return kIOReturnBadArgument;
+    if (mem.size() < len) mem.resize(len); auto mm = new IOMemoryMap; mm->addr = mem.data() + off; *m = mm; return 0; } };
+enum { kIOMemoryDirectionInOut = 3 };
+struct IOBufferMemoryDescriptor : IOMemoryDescriptor {
+  static kern_return_t Create(uint64_t, uint64_t size, uint64_t, IOBufferMemoryDescriptor** out) { if (g_fail & F_BUFCREATE) return kIOReturnNoMemory;
+    auto b = new IOBufferMemoryDescriptor; b->len = size; *out = b; return 0; } };
+struct IODMACommandSpecification { uint64_t options; uint64_t maxAddressBits; };
+enum { kIODMACommandCreateNoOptions = 0, kIODMACommandPrepareForDMANoOptions = 0, kIODMACommandCompleteDMANoOptions = 0 };
+struct IODMACommand : OSObject { bool prepared = false; ~IODMACommand() { g_cmd_alive--; }
+  static kern_return_t Create(void*, uint64_t, IODMACommandSpecification*, IODMACommand** out) { if (g_fail & F_DMACREATE) return kIOReturnNoMemory;
+    *out = new IODMACommand; g_cmd_alive++; return 0; }
+  kern_return_t PrepareForDMA(uint64_t, IOMemoryDescriptor*, uint64_t, uint64_t size, uint64_t*, uint32_t* n, IOAddressSegment* seg) {
+    if (g_fail & F_DMAPREP) return kIOReturnError;
+    seg[0] = {g_next_iova, size}; g_next_iova += 0x100000; *n = 1; prepared = true; return 0; }
+  kern_return_t CompleteDMA(uint64_t) { g_completes++; prepared = false; return 0; } };
+
+// ---- IOService, IOPCIDevice ----
+enum { kIOPCIConfigurationOffsetVendorID = 0, kIOPCIConfigurationOffsetDeviceID = 2, kIOPCIConfigurationOffsetCommand = 4 };
+enum { kIOPCICommandIOSpace = 1, kIOPCICommandMemorySpace = 2, kIOPCICommandBusMaster = 4 };
+enum { kIOPCIDeviceResetTypeFunctionReset = 1, kIOPCIDeviceResetTypeHotReset = 2 };
+struct IOService : OSObject {
+  virtual bool init() { return !g_init_fail; } virtual void free() {}
+  kern_return_t Start(IOService*, int) { return (g_fail & F_START) ? kIOReturnError : 0; } kern_return_t Stop(IOService*, int) { return (g_fail & F_STOP) ? kIOReturnError : 0; }
+  kern_return_t SetPowerState(uint32_t f, int) { if (g_on_power_ack) g_on_power_ack(f); return 0; }   // IOService's own: acknowledges the change
+                                                                       // (g_on_power_ack: a test sees the driver's state at that moment)
+  void SetName(const char*) {} void RegisterService() { g_registers++; }
+  kern_return_t Create(IOService*, const char*, IOService** out);   // below: g_create_kind 0 fails, 1 a non-user-client object, 2 a user client
+  virtual kern_return_t CopyProviderProperties(OSArray *propertyKeys, OSArray **properties);   // dk_card.hpp
+};
+// a device without the virtual MI50 behind it is its 4 KiB configuration space (cfg); with the card attached (dk_card.hpp: CARD) every
+// configuration and BAR5 access goes to the card
+struct IOPCIDevice : IOService { uint8_t cfg[4096] = {}; int opens = 0, closes = 0;
+  kern_return_t Open(IOService*, uint32_t) { opens++; return 0; } void Close(IOService*, uint32_t) { closes++; }
+  void ConfigurationRead8(uint64_t offset, uint8_t *readData);
+  void ConfigurationRead16(uint64_t offset, uint16_t *readData);
+  void ConfigurationRead32(uint64_t offset, uint32_t *readData);
+  void ConfigurationWrite8(uint64_t offset, uint8_t data);
+  void ConfigurationWrite16(uint64_t offset, uint16_t data);
+  void ConfigurationWrite32(uint64_t offset, uint32_t data);
+  void MemoryRead32(uint8_t memoryIndex, uint64_t offset, uint32_t *readData);
+  void MemoryWrite32(uint8_t memoryIndex, uint64_t offset, uint32_t data);
+  kern_return_t GetBARInfo(uint8_t barIndex, uint8_t *memoryIndex, uint64_t *barSize = 0, uint8_t *barType = 0);
+  kern_return_t _CopyDeviceMemoryWithIndex(uint8_t idx, IOMemoryDescriptor** m, IOService*) { if (g_fail & F_DEVMEM) return kIOReturnNoMemory;
+    auto d = new IOMemoryDescriptor; d->len = 1 << 20; *m = d; return 0; }
+  int reset_fail = 0;   // reset types (kIOPCIDeviceResetType*) that fail
+  kern_return_t Reset(int t) { return (reset_fail & t) ? kIOReturnError : 0; } };
+
+// ---- user clients ----
+struct IOUserClientMethodDispatch {};
+// the SDK's fields in a different order (the tests fill the first six positionally); structureOutput is set by the driver, released by the OS
+struct IOUserClientMethodArguments { const uint64_t* scalarInput; uint32_t scalarInputCount; uint64_t* scalarOutput; uint32_t scalarOutputCount;
+  IOMemoryDescriptor* structureInputDescriptor; IOMemoryDescriptor* structureOutputDescriptor;
+  OSData* structureInput = nullptr; OSData* structureOutput = nullptr; uint64_t structureOutputMaximumSize = 0; };
+enum { kIOUserClientVariableStructureSize = 0xffffffff };
+inline OSDictionary* g_ents = nullptr;
+struct IOUserClient : IOService { kern_return_t CopyClientEntitlements(OSDictionary** out) { g_ent_calls++; if (g_ents) g_ents->retain(); *out = g_ents; return g_ents ? 0 : kIOReturnNotFound; } };
+struct PlainService : IOService { ~PlainService() { g_create_freed++; } };
+inline kern_return_t IOService::Create(IOService*, const char*, IOService** out) {
+  *out = g_create_kind == 1 ? (IOService*)new PlainService : g_create_kind == 2 ? (IOService*)new IOUserClient : nullptr; return g_create_kind ? 0 : kIOReturnUnsupported; }

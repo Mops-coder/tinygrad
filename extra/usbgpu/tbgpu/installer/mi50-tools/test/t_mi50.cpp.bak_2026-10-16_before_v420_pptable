@@ -1,0 +1,977 @@
+// t_mi50.cpp - the TinyGPU driver's MI50 bring-up (MI50Device) on the virtual MI50, offline. The cases and their expectations follow the
+// reference's own test of the same boot (vcard/t_vcard_amdev.py: A cold, C warm through mode1, P PMFW alive/dead/hung, D POST resets BAR0,
+// E RAS boot config) plus what the driver adds (already-up card, failure handling) and the boot-memory addresses.
+// Build/run: see mi50-tools/build_and_test.sh.
+#include <algorithm>
+#include <array>
+#include <memory>
+#include <cstddef>
+#include <initializer_list>
+#include "vmi50.hpp"
+#include "../../TinyGPUDriverExtension/MI50/MI50Device.h"
+
+using namespace vm;
+static int nfail = 0, nok = 0;
+static void check(bool c, const std::string &m) { printf("%s %s\n", c ? "ok  " : "FAIL", m.c_str()); if (c) nok++; else nfail++; }
+static std::string hx(uint64_t v) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v); return b; }
+
+static std::string FWDIR, V420;
+static LinuxFw FW;
+constexpr uint64_t PLACED_BAR0 = 0x50000000;
+constexpr uint64_t FB = 0x8000ull << 24;   // FB_LOCATION_BASE 0x8000 -> MC base
+
+// vmi50 test setup: what IOPCIFamily + MI50BarFix leave before any driver (REBAR 256 MiB, BAR0 placed, BAR2/BAR5 assigned) and the link /
+// error-reporting state macOS leaves (TEST values, all off the power-on values)
+struct Setup { uint32_t fw_cap = 0; const Umc *umc = nullptr; int post_resets_bar = 0; int rebar_bars = 1; uint32_t boot_cfg = 0; uint64_t reset_window_ns = 200000000ull; };
+static const uint32_t MACOS_STATE[][3] = {{CFG_PCIE + 0x08, 0x2830, 2}, {CFG_PCIE + 0x28, 0x0400, 2}, {CFG_PCIE + 0x30, 0x0002, 2}, {0x324, 0x10011001, 4},
+                                          {0x158, 0x00400000, 4}, {0x15C, 0x00062030, 4}, {0x164, 0x00002001, 4}, {0x168, 0x00000140, 4}};
+static Card *make_from(const std::vector<uint8_t> &img, const Setup &s);
+static Card *make(const Setup &s, PPTable_t *exp) {
+  Vbios v = build_vbios(s.fw_cap, s.umc);
+  if (exp) *exp = v.exp;
+  return make_from(v.img, s);
+}
+static Card *make_from(const std::vector<uint8_t> &img, const Setup &s) {
+  Card *c = new Card(img, FW);
+  c->post_resets_bar = s.post_resets_bar; c->rebar_bars = s.rebar_bars; c->boot_cfg = s.boot_cfg; c->reset_window_ns = s.reset_window_ns;
+  c->start();
+  c->cfg_wr(CFG_REBAR + 8, 8u << 8, 4);
+  c->cfg_wr(0x10, (uint32_t)PLACED_BAR0, 4); c->cfg_wr(0x14, (uint32_t)(PLACED_BAR0 >> 32), 4);
+  c->cfg_wr(0x18, 0x40000000, 4); c->cfg_wr(0x1c, 0, 4); c->cfg_wr(0x24, 0x40200000, 4);
+  for (auto &m : MACOS_STATE) c->cfg_wr(m[0], m[1], m[2]);
+  c->cfg_writes.clear(); c->events.clear();
+  return c;
+}
+// vega20_set_default_registry_data + vega20_set_allowed_featuresmask (Linux), independently of the driver
+static uint64_t allowed_mask(uint32_t smc_version) {
+  static const uint32_t bits[34] = {FEATURE_DPM_PREFETCHER_BIT, FEATURE_DPM_GFXCLK_BIT, FEATURE_DPM_UCLK_BIT, FEATURE_DPM_SOCCLK_BIT, FEATURE_DPM_UVD_BIT,
+    FEATURE_DPM_VCE_BIT, FEATURE_ULV_BIT, FEATURE_DPM_MP0CLK_BIT, FEATURE_DPM_LINK_BIT, FEATURE_DPM_DCEFCLK_BIT, FEATURE_DS_GFXCLK_BIT, FEATURE_DS_SOCCLK_BIT,
+    FEATURE_DS_LCLK_BIT, FEATURE_PPT_BIT, FEATURE_TDC_BIT, FEATURE_THERMAL_BIT, FEATURE_GFX_PER_CU_CG_BIT, FEATURE_RM_BIT, FEATURE_DS_DCEFCLK_BIT, FEATURE_ACDC_BIT,
+    FEATURE_VR0HOT_BIT, FEATURE_VR1HOT_BIT, FEATURE_FW_CTF_BIT, FEATURE_LED_DISPLAY_BIT, FEATURE_FAN_CONTROL_BIT, FEATURE_GFX_EDC_BIT, FEATURE_GFXOFF_BIT,
+    FEATURE_CG_BIT, FEATURE_DPM_FCLK_BIT, FEATURE_DS_FCLK_BIT, FEATURE_DS_MP1CLK_BIT, FEATURE_DS_MP0CLK_BIT, FEATURE_XGMI_BIT, FEATURE_ECC_BIT};
+  uint64_t dis = 0xE0041C00ull | (smc_version < 0x282100 ? FEATURE_ECC_MASK : 0), m = 0;
+  for (int i = 0; i < 34; i++) if (!((dis >> i) & 1)) m |= 1ull << bits[i];
+  return m;
+}
+static uint32_t field(uint32_t v, uint32_t mask, uint32_t shift) { return (v & mask) >> shift; }
+static bool has(const std::vector<std::string> &v, const std::string &s) { return std::find(v.begin(), v.end(), s) != v.end(); }
+static bool has_sub(const std::vector<std::string> &v, const std::string &s) { for (auto &x : v) if (x.find(s) != std::string::npos) return true; return false; }
+static std::vector<uint32_t> params(const Card &c, uint32_t msg) { std::vector<uint32_t> v; for (auto &m : c.smu_log) if (m.first == msg) v.push_back(m.second); return v; }
+static int per_clock(const Card &c, uint32_t msg, uint32_t clk) { int n = 0; for (auto &m : c.smu_log) if (m.first == msg && (m.second >> 16) == clk) n++; return n; }
+
+// one init() on a fresh device, which is gone afterwards; clean: every buffer it allocated came back, with the size it was allocated with
+struct Outcome { mi50::MI50Device::Result r; std::string err; uint32_t caps; bool clean; };
+static Outcome run(Card &c) {
+  Outcome o;
+  { mi50::MI50Device d(c); o.r = d.init(); o.err = d.error(); o.caps = d.od8_caps(); }
+  o.clean = c.outstanding == 0 && !has(c.events, "release_size_mismatch") && !has(c.events, "release_unknown_pointer");
+  return o;
+}
+// FAILED with the reason, buffers back, and not AM's clean hand-over state (REG7 = version with REG6 = 0), so the next open boots or resets
+// instead of trusting the card; booted: FULL_BOOT and that hand-over state
+static bool failed(const Outcome &o, Card &c, const std::string &why) {
+  return o.r == mi50::MI50Device::FAILED && o.err.find(why) != std::string::npos && o.clean &&
+         !(c.regs[GC_SCRATCH_REG7] == mi50::AM_VERSION && c.regs[GC_SCRATCH_REG6] == 0);
+}
+static bool booted(const Outcome &o, Card &c) {
+  return o.r == mi50::MI50Device::FULL_BOOT && o.clean && c.regs[GC_SCRATCH_REG7] == mi50::AM_VERSION && c.regs[GC_SCRATCH_REG6] == 0;
+}
+static std::string why(const Outcome &o) { return o.err.empty() ? std::string("") : " (" + o.err + ")"; }
+// the synthetic VBIOS with one change; PP: its PowerPlay table edited in place
+static std::vector<uint8_t> vbios_with(void (*edit)(std::vector<uint8_t> &)) { Vbios v = build_vbios(); edit(v.img); return v.img; }
+static std::vector<uint8_t> pp_with(void (*edit)(ATOM_Vega20_POWERPLAYTABLE &)) {
+  Vbios v = build_vbios(); ATOM_Vega20_POWERPLAYTABLE pp; memcpy(&pp, &v.img[PPT], sizeof(pp)); edit(pp); memcpy(&v.img[PPT], &pp, sizeof(pp)); return v.img;
+}
+static void w16(std::vector<uint8_t> &img, uint32_t o, uint32_t x) { img[o] = x & 0xff; img[o + 1] = (x >> 8) & 0xff; }
+#define MDT_ENTRY(name) (MDT + 4 + (uint32_t)offsetof(struct atom_master_list_of_data_tables_v2_1, name))
+
+// tinygrad support/memory.py TLSFAllocator (allocations only, as AM's boot region uses it): the reference that the driver's fixed boot
+// layout (MI50Device::boot_layout) must reproduce. A block record carries its free-list membership (storage[l1][l2], seq = list position).
+static int bit_length(uint64_t v) { int n = 0; while (v) { n++; v >>= 1; } return n; }
+static uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+struct Tlsf {
+  static constexpr int MAXB = 128;   // block records (the reference's dict grows)
+  uint64_t size = 0, base = 0;
+  struct Blk { uint64_t start, size, next; int64_t prev; bool is_free, used; int l1, l2; uint64_t seq; bool listed; } blk[MAXB] = {};
+  int lv1_entries[64] = {};
+  uint64_t seq = 0;
+  static int lv1(uint64_t s) { return bit_length(s); }
+  static int lv2(uint64_t s) { int bl = bit_length(s); int sh = bl - 5 > 0 ? bl - 5 : 0; return (int)((s - (1ull << (bl - 1))) >> sh); }   // l2_cnt 5
+  Blk *find(uint64_t start) { for (auto &b : blk) if (b.used && b.start == start) return &b; return nullptr; }
+  void insert_block(Blk *b, uint64_t start, uint64_t sz, int64_t prev) { *b = {start, sz, start + sz, prev, true, true, lv1(sz), lv2(sz), seq++, true}; lv1_entries[lv1(sz)]++; }
+  void remove_block(Blk *b) { lv1_entries[b->l1]--; b->is_free = false; b->listed = false; }
+  bool split_block(Blk *b, uint64_t new_size) {   // false: no record for the rest (the table is full), nothing changed
+    Blk *rest = nullptr;
+    for (auto &x : blk) if (!x.used) { rest = &x; break; }
+    if (!rest) return false;
+    uint64_t start = b->start, sz = b->size, nxt = b->next;
+    remove_block(b);
+    insert_block(b, start, new_size, b->prev);
+    insert_block(rest, start + new_size, sz - new_size, (int64_t)start);
+    if (Blk *n = find(nxt)) n->prev = (int64_t)(start + new_size);
+    return true;
+  }
+  void init(uint64_t total, uint64_t base_) { *this = Tlsf(); size = total; base = base_; if (total > 0) insert_block(&blk[0], 0, total, -1); }
+  bool alloc(uint64_t req_size, uint64_t align, uint64_t *out) {   // false: MemoryError, or the record table is full
+    if (req_size < 16) req_size = 16;
+    uint64_t sz = req_size + align - 1 > 16 ? req_size + align - 1 : 16;
+    sz = round_up(sz, 1ull << (bit_length(sz) - 5));
+    for (int l1 = lv1(sz); l1 < bit_length(size) + 1; l1++) {
+      if (lv1_entries[l1] == 0) continue;
+      for (int l2 = (l1 == bit_length(sz) ? lv2(sz) : 0); l2 < 32; l2++) {
+        Blk *b = nullptr;
+        for (auto &x : blk) if (x.used && x.listed && x.l1 == l1 && x.l2 == l2 && (!b || x.seq < b->seq)) b = &x;
+        if (!b) continue;
+        uint64_t new_start = round_up(b->start, align);
+        if (new_start != b->start) { if (!split_block(b, new_start - b->start)) return false; b = find(new_start); }
+        if (b->size > req_size && !split_block(b, req_size)) return false;
+        remove_block(b);
+        *out = b->start + base;
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
+// the boot-memory layout: AM's init_sw order through support/memory.py TLSFAllocator(32 MiB), derived by hand (see the review notes):
+// root 0, memscratch 0x1000, dummy 0x2000, IH ring0 0x3000, rwptr0 0x43000, ring1 0x44000, rwptr1 0x84000, msg1 0x100000 (1 MiB aligned, leaves
+// a hole 0x85000..0xfffff), cmd 0x85000, fence 0x86000, ring 0x87000, RAS 0x98000 (16 KiB aligned), TMR 0x200000, SMU tables 0x9c000, 0x9d000,
+// 0x9e000 (PMSTATUSLOG), 0xb7000 (OVERDRIVE), 0xb8000, 0xb9000. The reference's own run recorded root 0 and TMR 0x200000 (out_t_vcard_amdev.txt).
+enum : uint64_t { A_ROOT = 0, A_MEMSCRATCH = 0x1000, A_DUMMY = 0x2000, A_IH0 = 0x3000, A_RW0 = 0x43000, A_IH1 = 0x44000, A_RW1 = 0x84000, A_MSG1 = 0x100000,
+                  A_CMD = 0x85000, A_FENCE = 0x86000, A_RING = 0x87000, A_RAS = 0x98000, A_TMR = 0x200000, A_PP = 0x9c000, A_PMLOG = 0x9e000, A_OD = 0xb7000 };
+
+// vega20_setup_default_dpm_tables' reads with every DPM feature on: per clock the level count, then each level (the card's level counts)
+static void dpm_reads(std::vector<std::pair<uint32_t, uint32_t>> &e) {
+  struct { uint32_t clk; int n; } t[] = {{PPCLK_SOCCLK, 3}, {PPCLK_GFXCLK, 4}, {PPCLK_UCLK, 3}, {PPCLK_ECLK, 1}, {PPCLK_VCLK, 1}, {PPCLK_DCLK, 1},
+                                         {PPCLK_DCEFCLK, 2}, {PPCLK_PIXCLK, 1}, {PPCLK_DISPCLK, 1}, {PPCLK_PHYCLK, 1}, {PPCLK_FCLK, 2}};
+  for (auto &x : t) { e.push_back({PPSMC_MSG_GetDpmFreqByIndex, x.clk << 16 | 0xff}); for (int i = 0; i < x.n; i++) e.push_back({PPSMC_MSG_GetDpmFreqByIndex, x.clk << 16 | i}); }
+}
+// AM_SMU._vega20_live_state (ip.py): backend_init's GetSmuVersion + ReadSerialNum, get_features, the DPM tables, GetPptLimit - reads only
+static std::vector<std::pair<uint32_t, uint32_t>> expected_live_log() {
+  std::vector<std::pair<uint32_t, uint32_t>> e = {{PPSMC_MSG_GetSmuVersion, 0}, {PPSMC_MSG_ReadSerialNumTop32, 0}, {PPSMC_MSG_ReadSerialNumBottom32, 0},
+                                                  {PPSMC_MSG_GetEnabledSmuFeaturesLow, 0}, {PPSMC_MSG_GetEnabledSmuFeaturesHigh, 0}};
+  dpm_reads(e);
+  e.push_back({PPSMC_MSG_GetPptLimit, POWER_SOURCE_AC << 16});
+  return e;
+}
+static std::vector<std::pair<uint32_t, uint32_t>> expected_smu_log(uint64_t allowed, bool curve) {
+  std::vector<std::pair<uint32_t, uint32_t>> e;
+  auto m = [&](uint32_t msg, uint32_t p) { e.push_back({msg, p}); };
+  m(PPSMC_MSG_SetToolsDramAddrHigh, (uint32_t)((FB + A_PMLOG) >> 32)); m(PPSMC_MSG_SetToolsDramAddrLow, (uint32_t)(FB + A_PMLOG));
+  m(PPSMC_MSG_GetSmuVersion, 0); m(PPSMC_MSG_ReadSerialNumTop32, 0); m(PPSMC_MSG_ReadSerialNumBottom32, 0);
+  m(PPSMC_MSG_NumOfDisplays, 0); m(PPSMC_MSG_SetAllowedFeaturesMaskHigh, (uint32_t)(allowed >> 32)); m(PPSMC_MSG_SetAllowedFeaturesMaskLow, (uint32_t)allowed);
+  m(PPSMC_MSG_SetMinDeepSleepDcefclk, 100);   // getsmuclockinfo 100 MHz in Hz / 10000 / 100
+  m(PPSMC_MSG_SetDriverDramAddrHigh, (uint32_t)((FB + A_PP) >> 32)); m(PPSMC_MSG_SetDriverDramAddrLow, (uint32_t)(FB + A_PP));
+  m(PPSMC_MSG_TransferTableDram2Smu, TABLE_PPTABLE);
+  m(PPSMC_MSG_RunBtc, 0); m(PPSMC_MSG_RunAfllBtc, 0); m(PPSMC_MSG_EnableAllSmuFeatures, 0);
+  m(PPSMC_MSG_GetEnabledSmuFeaturesLow, 0); m(PPSMC_MSG_GetEnabledSmuFeaturesHigh, 0);
+  m(PPSMC_MSG_OverridePcieParameters, 0x10106);   // level 1: gen min(3, 1) = 1, width 6 (no link partner: GEN1|GEN2, X1..X16)
+  m(PPSMC_MSG_SetUclkFastSwitch, 1); m(PPSMC_MSG_SetFclkGfxClkRatio, 0);
+  dpm_reads(e);
+  m(PPSMC_MSG_GetDcModeMaxDpmFreq, PPCLK_UCLK << 16); m(PPSMC_MSG_GetMaxDpmFreq, PPCLK_UCLK << 16);   // the card's DC max for UCLK is 0
+  m(PPSMC_MSG_GetDcModeMaxDpmFreq, PPCLK_SOCCLK << 16);
+  for (uint32_t c : {PPCLK_DCEFCLK, PPCLK_DISPCLK, PPCLK_PHYCLK, PPCLK_PIXCLK}) m(PPSMC_MSG_GetDcModeMaxDpmFreq, c << 16);
+  m(PPSMC_MSG_SetDriverDramAddrHigh, (uint32_t)((FB + A_OD) >> 32)); m(PPSMC_MSG_SetDriverDramAddrLow, (uint32_t)(FB + A_OD));
+  m(PPSMC_MSG_TransferTableSmu2Dram, TABLE_OVERDRIVE);
+  if (curve) for (uint32_t f : {800u, 1262u, 1725u}) m(PPSMC_MSG_GetAVFSVoltageByDpm, (0u << 24) | (85u << 16) | f);
+  m(PPSMC_MSG_SetDriverDramAddrHigh, (uint32_t)((FB + A_OD) >> 32)); m(PPSMC_MSG_SetDriverDramAddrLow, (uint32_t)(FB + A_OD));
+  m(PPSMC_MSG_TransferTableDram2Smu, TABLE_OVERDRIVE);
+  m(PPSMC_MSG_GetPptLimit, POWER_SOURCE_AC << 16);
+  m(PPSMC_MSG_SetFanTemperatureTarget, 105);
+  return e;
+}
+
+static void check_cold_boot(const std::string &tag, Card &c, const PPTable_t &exp_pp, mi50::MI50Device &d, mi50::MI50Device::Result r) {
+  check(r == mi50::MI50Device::FULL_BOOT, tag + ": init() = FULL_BOOT (" + std::string(d.error()) + ")");
+  check(c.events.size() == 1 && c.events[0] == "posted" && c.last_mark == 172500, tag + ": no anomaly, one POST, ASIC_Init got PS[0] = bootup sclk 172500");
+  auto &p = c.psp_log;
+  check(p.size() >= 4 && p[0].kind == "BL" && p[0].a == 0x10000 && p[0].ok && p[1].kind == "BL" && p[1].a == 0x20000 && p[1].ok,
+        tag + ": bootloader SYS_DRV then SOS, both byte-equal to Linux's split of vega20_sos.bin");
+  check(p.size() >= 3 && p[2].kind == "RING_CREATE" && p[2].a == FB + A_RING && p[2].b == 0x10000, tag + ": KM ring at MC " + hx(p.size() > 2 ? p[2].a : 0) + ", 64 KiB");
+  check(p.size() >= 4 && p[3].kind == "SETUP_TMR" && p[3].a == FB + A_TMR && p[3].b == A_TMR && p[3].c == 0x400000 && p[3].d == 1,
+        tag + ": SETUP_TMR: MC FB + 0x200000, VRAM pa 0x200000, 4 MiB, virt_phy_addr 1");
+  bool ipok = p.size() >= 4 + FW.ip.size();
+  for (size_t i = 0; ipok && i < FW.ip.size(); i++) ipok = p[4 + i].kind == "LOAD_IP_FW" && p[4 + i].a == FW.ip[i].first && p[4 + i].ok;
+  check(ipok, tag + ": " + std::to_string(FW.ip.size()) + " LOAD_IP_FW in Linux's ucode-enum order, every payload byte-equal to Linux's");
+  size_t k = 4 + FW.ip.size();
+  check(p.size() > k && p[k].kind == "LOAD_ASD" && p[k].ok && p[k].a == 0 && p[k].b == 0, tag + ": LOAD_ASD = vega20_asd.bin ucode, no shared buffer");
+  const uint8_t flags[16] = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0};
+  check(!p.empty() && p.back().kind == "LOAD_TA" && p.back().ok && p.back().a == FB + A_RAS && p.back().b == 0x4000 && p.back().flags.size() == 16 &&
+        memcmp(p.back().flags.data(), flags, 16) == 0, tag + ": LOAD_TA last = the RAS image; init_flags dgpu 1, xcc_mask 1, umc mask 0, vram_type HBM 6");
+  // SMU
+  uint64_t am = allowed_mask(FW.smc_version);
+  auto want = expected_smu_log(am, true);
+  bool same = c.smu_log == want;
+  std::string diff;
+  if (!same) for (size_t i = 0; i < std::max(want.size(), c.smu_log.size()); i++) {
+    auto g = i < c.smu_log.size() ? c.smu_log[i] : std::make_pair(0u, 0u), w = i < want.size() ? want[i] : std::make_pair(0u, 0u);
+    if (g != w) { diff = " first difference at #" + std::to_string(i) + ": got " + hx(g.first) + "/" + hx(g.second) + " want " + hx(w.first) + "/" + hx(w.second); break; }
+  }
+  check(same, tag + ": SMU messages exactly vega20_start_smu + hwmgr_hw_init's sequence (" + std::to_string(c.smu_log.size()) + ")" + diff);
+  PPTable_t boot = exp_pp; boot.SocketPowerLimitAc0 = boot.SocketPowerLimitDc = 250;
+  auto up = c.smu.tables[TABLE_PPTABLE];
+  check(up.size() == sizeof(boot) && memcmp(up.data(), &boot, sizeof(boot)) == 0,
+        tag + ": PPTable upload = VBIOS smcPPTable + smc_dpm_info + Linux overrides, with the boot cap 250 W in SocketPowerLimitAc0/Dc and nothing else");
+  check(c.smu.enabled == am, tag + ": SMU features enabled = allowed " + hx(am));
+  check(d.power_limit_w() == 250 && d.smu_version() == FW.smc_version, tag + ": GetPptLimit 250 W (the uploaded table), SMU version " + hx(d.smu_version()));
+  OverDriveTable_t od; memcpy(&od, c.smu.tables[TABLE_OVERDRIVE].data(), sizeof(od));
+  check(od.GfxclkFreq1 == 800 && od.GfxclkFreq2 == 1262 && od.GfxclkFreq3 == 1725 && od.GfxclkVolt1 == 4 * 780 && od.GfxclkVolt2 == 4 * 826 && od.GfxclkVolt3 == 4 * 872,
+        tag + ": OverDrive table: curve points from Fmin/Fmax, voltages from GetAVFSVoltageByDpm (mV * 4)");
+  // config space
+  check((c.cfg_rd(CFG_PCIE + 0x10, 2) & 3) == 0, tag + ": LnkCtl ASPM cleared");
+  check(c.cfg_rd(4, 2) & 4, tag + ": bus master on");
+  check(c.bar0() == PLACED_BAR0, tag + ": BAR0 as the kext placed it: " + hx(c.bar0()));
+  // SOC
+  uint32_t flush = NBIO_BIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL << 2;
+  check(c.regs[NBIO_REMAP_HDP_MEM_FLUSH_CNTL] == flush && c.regs[NBIO_REMAP_HDP_REG_FLUSH_CNTL] == flush + 4, tag + ": HDP remap = coherency-flush dword << 2 (+0/+4)");
+  for (int i = 0; i < 2; i++) {
+    uint32_t x = c.regs[i ? NBIO_BIF_SDMA1_DOORBELL_RANGE : NBIO_BIF_SDMA0_DOORBELL_RANGE];
+    check(field(x, NBIO_BIF_SDMA0_DOORBELL_RANGE__OFFSET_MASK, NBIO_BIF_SDMA0_DOORBELL_RANGE__OFFSET__SHIFT) == (0x100u + i * 0xA) << 1 &&
+          field(x, NBIO_BIF_SDMA0_DOORBELL_RANGE__SIZE_MASK, NBIO_BIF_SDMA0_DOORBELL_RANGE__SIZE__SHIFT) == 20, tag + ": BIF_SDMA" + std::to_string(i) + "_DOORBELL_RANGE");
+  }
+  check(c.regs[NBIO_RCC_DOORBELL_APER_EN] == 1, tag + ": doorbell aperture on");
+  // GMC (MM hub)
+  check(c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32] == (A_ROOT | 1) && c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32] == 0, tag + ": context0 page table = root PT | valid");
+  check(c.regs[MMHUB_MC_VM_SYSTEM_APERTURE_LOW_ADDR] == (FB >> 18) && c.regs[MMHUB_MC_VM_SYSTEM_APERTURE_HIGH_ADDR] == (((uint64_t)0x87ff << 24) >> 18),
+        tag + ": system aperture = FB location");
+  check(c.regs[MMHUB_MC_VM_AGP_BOT] == 0xffffff && c.regs[MMHUB_MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB] == (A_MEMSCRATCH >> 12) &&
+        c.regs[MMHUB_VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32] == (A_DUMMY >> 12), tag + ": AGP off, default page = memscratch, fault page = dummy");
+  check(c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32] == 0 && c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32] == 2 &&
+        c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32] == 0xffffffff && c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32] == 7,
+        tag + ": VM aperture 0x200000000000 .. min(0x200000000000 + 2^48 - 1, 0x7fffffffffff) = 0x7fffffffffff (>> 12): start " +
+        hx(c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32]) + ":" +
+        hx(c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32]) + " end " + hx(c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32]) + ":" +
+        hx(c.regs[MMHUB_VM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32]));
+  uint32_t c0 = c.regs[MMHUB_VM_CONTEXT0_CNTL];
+  check(field(c0, MMHUB_VM_CONTEXT0_CNTL__ENABLE_CONTEXT_MASK, MMHUB_VM_CONTEXT0_CNTL__ENABLE_CONTEXT__SHIFT) == 1 &&
+        field(c0, MMHUB_VM_CONTEXT0_CNTL__PAGE_TABLE_DEPTH_MASK, MMHUB_VM_CONTEXT0_CNTL__PAGE_TABLE_DEPTH__SHIFT) == 2 &&
+        field(c0, MMHUB_VM_CONTEXT0_CNTL__PAGE_TABLE_BLOCK_SIZE_MASK, MMHUB_VM_CONTEXT0_CNTL__PAGE_TABLE_BLOCK_SIZE__SHIFT) == 9, tag + ": context0 on, 3 levels, block size 9");
+  check(c.regs[MMHUB_VM_INVALIDATE_ENG17_ADDR_RANGE_LO32] == 0xffffffff && c.regs[MMHUB_VM_INVALIDATE_ENG17_ADDR_RANGE_HI32] == 0x1f, tag + ": invalidation ranges");
+  // IH
+  uint32_t rb = c.regs[OSSSYS_IH_RB_CNTL];
+  check(c.regs[OSSSYS_IH_RB_BASE] == (uint32_t)((FB + A_IH0) >> 8) && c.regs[OSSSYS_IH_RB_BASE_RING1] == (uint32_t)((FB + A_IH1) >> 8) &&
+        c.regs[OSSSYS_IH_RB_WPTR_ADDR_LO] == (uint32_t)(FB + A_RW0) && c.regs[OSSSYS_IH_RB_WPTR_ADDR_HI] == (uint32_t)((FB + A_RW0) >> 32), tag + ": IH rings and wptr address");
+  check(field(rb, OSSSYS_IH_RB_CNTL__RB_ENABLE_MASK, OSSSYS_IH_RB_CNTL__RB_ENABLE__SHIFT) == 1 && field(rb, OSSSYS_IH_RB_CNTL__ENABLE_INTR_MASK, OSSSYS_IH_RB_CNTL__ENABLE_INTR__SHIFT) == 1 &&
+        field(rb, OSSSYS_IH_RB_CNTL__RB_SIZE_MASK, OSSSYS_IH_RB_CNTL__RB_SIZE__SHIFT) == 16 && field(rb, OSSSYS_IH_RB_CNTL__MC_SPACE_MASK, OSSSYS_IH_RB_CNTL__MC_SPACE__SHIFT) == 4,
+        tag + ": IH ring 0 on, interrupts on, 256 KiB, MC space 4");
+  // THM
+  uint32_t th = c.regs[THM_THM_THERMAL_INT_CTRL];
+  check(field(th, THM_THM_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK, THM_THM_THERMAL_INT_CTRL__DIG_THERM_INTH__SHIFT) == 118 &&
+        field(th, THM_THM_THERMAL_INT_CTRL__DIG_THERM_INTL_MASK, THM_THM_THERMAL_INT_CTRL__DIG_THERM_INTL__SHIFT) == 0 &&
+        field(th, THM_THM_THERMAL_INT_CTRL__MAX_IH_CREDIT_MASK, THM_THM_THERMAL_INT_CTRL__MAX_IH_CREDIT__SHIFT) == 5 &&
+        field(th, THM_THM_THERMAL_INT_CTRL__THERM_IH_HW_ENA_MASK, THM_THM_THERMAL_INT_CTRL__THERM_IH_HW_ENA__SHIFT) == 1, tag + ": thermal alert 0..118 C (SoftwareShutdownTemp), IH credit 5");
+  // hand-over
+  check(c.regs[GC_SCRATCH_REG7] == mi50::AM_VERSION && c.regs[GC_SCRATCH_REG6] == 0, tag + ": SCRATCH_REG7 = AM version, REG6 = 0 (what AM finds after its own session)");
+  std::set<uint32_t> named;
+  for (auto &n : ALL) named.insert(n.addr);
+  std::string unnamed;
+  for (uint32_t a : c.touched) if (!named.count(a)) unnamed += " " + hx(a);
+  check(unnamed.empty(), tag + ": every register the driver touched has a Linux name:" + unnamed);
+  uint8_t z[0x1000], zero[0x1000] = {};
+  c.vram_io(A_ROOT, z, sizeof(z), false);
+  check(memcmp(z, zero, sizeof(z)) == 0, tag + ": root page table zeroed");
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3) { fprintf(stderr, "usage: t_mi50 <vega20 firmware dir> <V420.rom>\n"); return 2; }
+  FWDIR = argv[1]; V420 = argv[2]; FW = linux_fw(FWDIR);
+
+  // ================= A: cold boot =================
+  PPTable_t exp; Card *c = make({}, &exp);
+  mi50::MI50Device *d = new mi50::MI50Device(*c);
+  auto r = d->init();
+  check_cold_boot("A", *c, exp, *d, r);
+  check(has(c->logs, "ATOM: unimplemented!") && std::count(c->us_delays.begin(), c->us_delays.end(), 77u) == 1 &&
+        std::count(c->ms_sleeps.begin(), c->ms_sleeps.end(), 3u) == 1, "A: ASIC_Init's DELAY_US 77, DELAY_MS 3 and REPEAT reach the card's delay_us, sleep_ms, log");
+  check(c->clk_calls == std::vector<uint32_t>{0x100, 0x500, 0x000, 0x400, 0x300, 0x003},
+        "A: firmwareinfo v3.2 -> getsmuclockinfo for the SMU11 ids SOCCLK 1, DCEFCLK 5, ECLK 0, VCLK 4, DCLK 3, FCLK 0 with syspll 3");
+  check(d->od8_caps() == 0x1FF, "A: OD8 caps = GFXCLK limits + curve, UCLK max, power limit, fan acoustic + min speed, temperature fan + system, "
+        "memory timing (Linux vega20_od8_initialize_default_settings on these limits): " + hx(d->od8_caps()));
+
+  // ================= B: the same card again (a driver restart): AM's state is there -> no boot; the SMU state is read as AM's partial boot
+  // reads it (ip.py AM_SMU._vega20_live_state, Leon 2026-10-13: nothing written) =================
+  size_t np = c->psp_log.size(), ns = c->smu_log.size(), nclk = c->clk_calls.size(); int posts = c->posted;
+  mi50::MI50Device d2(*c);
+  r = d2.init();
+  std::vector<std::pair<uint32_t, uint32_t>> live(c->smu_log.begin() + (long)ns, c->smu_log.end());
+  check(r == mi50::MI50Device::ALREADY_UP && c->psp_log.size() == np && c->posted == posts && c->regs[GC_SCRATCH_REG7] == mi50::AM_VERSION &&
+        c->regs[GC_SCRATCH_REG6] == 0, std::string("B: SCRATCH_REG7 = version, REG6 = 0 -> ALREADY_UP, no PSP command, no POST, hand-over kept (") + d2.error() + ")");
+  check(live == expected_live_log(), "B: SMU messages = _vega20_live_state's reads only (GetSmuVersion, ReadSerialNum, GetEnabledSmuFeatures, "
+        "GetDpmFreqByIndex per enabled clock, GetPptLimit): " + std::to_string(live.size()) + " of " + std::to_string(expected_live_log().size()));
+  check(d2.smu_version() == FW.smc_version && d2.enabled_features() == c->smu.enabled && d2.power_limit_w() == 250 && d2.vram_size() == (uint64_t)0x7ff0 << 20 &&
+        !d2.posted_here(), "B: read-outs = the running SMU's: version " + hx(d2.smu_version()) + ", features " + hx(d2.enabled_features()) + ", PPT " +
+        std::to_string(d2.power_limit_w()) + " W (the previous session's upload), VRAM " + std::to_string(d2.vram_size() >> 20) + " MiB");
+  check(std::vector<uint32_t>(c->clk_calls.begin() + (long)nclk, c->clk_calls.end()) == std::vector<uint32_t>{0x100, 0x500, 0x000, 0x400, 0x300, 0x003},
+        "B: the VBIOS boot clocks read through getsmuclockinfo as init reads them");
+  delete d;
+
+  // ================= B2-B4: the live state cannot be read -> FAILED with the reason, SCRATCH_REG6 = 1 (not the hand-over state), and the next
+  // start takes AM's full-reset path =================
+  struct { const char *tag; int k; const char *why; } bs[] = {{"B2 SMU hung", 0, "SMU msg 0x2 timeout"}, {"B3 GetSmuVersion refused", 1, "response 0xff"},
+                                                             {"B4 17 GFXCLK DPM levels (Linux keeps 16)", 2, "17 DPM levels for clock"}};
+  for (auto &b : bs) {
+    std::unique_ptr<Card> cb(make({}, &exp));
+    { mi50::MI50Device a(*cb); if (a.init() != mi50::MI50Device::FULL_BOOT) check(false, std::string(b.tag) + ": first boot: " + a.error()); }
+    cb->ns_per_call = 1000000; size_t bp = cb->psp_log.size(); int bpost = cb->posted;
+    if (b.k == 0) cb->smu_hung = true;
+    if (b.k == 1) cb->fail_smu_msg = PPSMC_MSG_GetSmuVersion;
+    if (b.k == 2) cb->dpm_levels[PPCLK_GFXCLK] = std::vector<uint32_t>(17, 1000);
+    Outcome o = run(*cb);
+    check(failed(o, *cb, b.why) && cb->regs[GC_SCRATCH_REG6] == 1 && cb->psp_log.size() == bp && cb->posted == bpost,
+          std::string(b.tag) + ": FAILED, REG6 = 1, no PSP command, no POST" + why(o));
+    cb->smu_hung = false; cb->fail_smu_msg = 0; cb->dpm_levels.clear(); cb->events.clear();
+    Outcome o2 = run(*cb);
+    check(booted(o2, *cb) && cb->mode1_count == 1, std::string(b.tag) + ": the next start: malformed state -> mode1 reset -> full boot" + why(o2));
+  }
+
+  // ================= C/P: a card left by a session that never finalized (REG6 = 1), PMFW alive / dead / hung; fast and slow link return =================
+  struct { const char *tag; int pmfw; uint64_t window; } cs[] = {{"C[0.2s alive]", 0, 200000000ull}, {"C[1.5s alive]", 0, 1500000000ull},
+                                                                {"P[dead]", 1, 200000000ull}, {"P[hung]", 2, 200000000ull}};
+  for (auto &k : cs) {
+    std::string tag = k.tag;
+    Setup s; s.reset_window_ns = k.window;
+    Card *cc = make(s, &exp);
+    { mi50::MI50Device a(*cc); if (a.init() != mi50::MI50Device::FULL_BOOT) check(false, tag + ": first boot: " + std::string(a.error())); }
+    cc->regs[GC_SCRATCH_REG6] = 1;   // a session in progress / killed without fini
+    if (k.pmfw == 1) cc->smu_alive = false;
+    if (k.pmfw == 2) cc->smu_hung = true;
+    uint32_t ext[9][2] = {{CFG_PCIE + 0x08, 0}, {CFG_PCIE + 0x10, 0}, {CFG_PCIE + 0x28, 0}, {CFG_PCIE + 0x30, 0}, {0x324, 0}, {0x158, 0}, {0x15C, 0}, {0x164, 0}, {0x168, 0}};
+    for (auto &e : ext) e[1] = cc->cfg_rd(e[0], e[0] < 0x100 ? 2 : 4);
+    cc->events.clear(); cc->timeline.clear(); cc->psp_log.clear(); cc->smu_log.clear();
+    mi50::MI50Device b(*cc);
+    r = b.init();
+    check(r == mi50::MI50Device::FULL_BOOT && cc->mode1_count == 1 && cc->posted == 2, tag + ": sOS alive -> one PSP mode1 reset, re-POST, full boot (" + std::string(b.error()) + ")");
+    check(cc->smu_alive && cc->smu.enabled == allowed_mask(FW.smc_version), tag + ": the reloaded PMFW runs with all allowed features");
+    size_t i = 0; while (i < cc->timeline.size() && cc->timeline[i] != "MODE1_RST") i++;
+    std::vector<std::string> pre;
+    for (size_t j = 0; j < i; j++) if (cc->timeline[j].rfind("thm", 0) == 0 || cc->timeline[j].rfind("smu", 0) == 0) pre.push_back(cc->timeline[j]);
+    std::string dis = std::to_string(PPSMC_MSG_DisableAllSmuFeatures), prep = std::to_string(PPSMC_MSG_PrepareMp1ForShutdown);
+    std::vector<std::string> want = k.pmfw == 0 ? std::vector<std::string>{"thm_int_ena=0", "smu:" + dis, "smu:" + prep}
+                                 : k.pmfw == 2 ? std::vector<std::string>{"thm_int_ena=0", "smu_ignored:" + dis, "smu_ignored:" + prep} : std::vector<std::string>{};
+    check(pre == want, tag + ": right before MODE1_RST: THM alert off, DisableAllSmuFeatures, PrepareMp1ForShutdown (only while the PMFW runs)");
+    bool back = true;
+    for (auto &e : ext) back = back && cc->cfg_rd(e[0], e[0] < 0x100 ? 2 : 4) == e[1];
+    check(back && cc->bar0() == PLACED_BAR0 && (cc->cfg_rd(CFG_REBAR + 8, 4) >> 8 & 0x3f) == 8,
+          tag + ": LTR, DEVCTL, LNKCTL, DEVCTL2, LNKCTL2, AER controls, REBAR 256 MiB and BAR0 back after the reset");
+    std::vector<uint32_t> w; for (size_t j = cc->reset_cfg_index; j < cc->cfg_writes.size(); j++) w.push_back(cc->cfg_writes[j].off);
+    auto first = [&](std::initializer_list<uint32_t> offs) { size_t f = SIZE_MAX; for (size_t j = 0; j < w.size(); j++) for (auto o : offs) if (w[j] == o && j < f) f = j; return f; };
+    size_t a1 = first({0x324, CFG_PCIE + 0x08, CFG_PCIE + 0x10, CFG_PCIE + 0x28, CFG_PCIE + 0x30}), a2 = first({CFG_REBAR + 8}), a3 = first({0x158, 0x15C, 0x164, 0x168}),
+           a4 = first({0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c});
+    check(a1 < a2 && a2 < a3 && a3 < a4 && a4 != SIZE_MAX, tag + ": restore order LTR/PCIe words -> REBAR -> AER controls -> dwords");
+    check(cc->regs[GC_SCRATCH_REG7] == mi50::AM_VERSION && cc->regs[GC_SCRATCH_REG6] == 0, tag + ": hand-over state after the recovery");
+  }
+
+  // ================= D: POST resets REBAR / BAR0 =================
+  { Setup s; s.post_resets_bar = 1; std::unique_ptr<Card> cd(make(s, &exp)); mi50::MI50Device dd(*cd); r = dd.init();
+    check(r == mi50::MI50Device::FULL_BOOT && cd->bar0() == PLACED_BAR0 && (cd->cfg_rd(CFG_REBAR + 8, 4) >> 8 & 0x3f) == 8, "D: after ASIC_Init reset them, REBAR 256 MiB and BAR0 are put back");
+    size_t i = 0; while (i < cd->cfg_writes.size() && !(cd->cfg_writes[i].off == 4 && cd->cfg_writes[i].size == 2 && !(cd->cfg_writes[i].val & 2))) i++;
+    bool seq = i + 4 < cd->cfg_writes.size() && cd->cfg_writes[i + 1].off == CFG_REBAR + 8 && cd->cfg_writes[i + 2].off == 0x14 && cd->cfg_writes[i + 3].off == 0x10 &&
+               cd->cfg_writes[i + 4].off == 4 && (cd->cfg_writes[i + 4].val & 2);
+    check(seq, "D: memory decoding off -> REBAR -> BAR0 hi -> lo -> command restored");
+    }
+
+  // ================= E: RAS boot config (psp_ras_initialize branches) =================
+  Umc ecc_on = {3, 3, 0x2, 0x10000}, ecc_capable = {3, 3, 0x0, 0x10000};
+  struct { const char *tag; uint32_t cap; const Umc *umc; uint32_t bcfg; std::vector<std::array<uint32_t, 3>> want; } es[] = {
+    {"E1 mem+default ECC, cfg off", 0x20200, &ecc_on, 0, {{BOOTCFG_CMD_GET, 0, 0}, {BOOTCFG_CMD_SET, 1, 1}}},
+    {"E2 mem+default ECC, cfg on", 0x20200, &ecc_on, 1, {{BOOTCFG_CMD_GET, 0, 0}}},
+    {"E3 no UMC, cfg off", 0x20000, nullptr, 0, {{BOOTCFG_CMD_GET, 0, 0}}},
+    {"E4 no UMC, cfg on", 0x20000, nullptr, 1, {{BOOTCFG_CMD_GET, 0, 0}, {BOOTCFG_CMD_SET, 0, 0}}},
+    {"E5 ECC capable, default off, cfg on", 0x20200, &ecc_capable, 1, {{BOOTCFG_CMD_GET, 0, 0}}}};
+  for (auto &e : es) {
+    Setup s; s.fw_cap = e.cap; s.umc = e.umc; s.boot_cfg = e.bcfg;
+    std::unique_ptr<Card> ce(make(s, &exp)); mi50::MI50Device de(*ce); r = de.init();
+    std::vector<std::array<uint32_t, 3>> got;
+    for (auto &p : ce->psp_log) if (p.kind == "BOOT_CFG") got.push_back({(uint32_t)p.a, (uint32_t)p.b, (uint32_t)p.c});
+    check(r == mi50::MI50Device::FULL_BOOT && got == e.want, std::string(e.tag) + ": BOOT_CFG commands == Linux's branch");
+  }
+
+  // ================= F: failures stop the bring-up with the reason; the next open does AM's full boot =================
+  { std::unique_ptr<Card> cf(make({}, &exp)); cf->fail_smu_msg = PPSMC_MSG_EnableAllSmuFeatures; mi50::MI50Device df(*cf); r = df.init();
+    check(r == mi50::MI50Device::FAILED && strstr(df.error(), "response 0xff") && cf->regs[GC_SCRATCH_REG6] == 1 && cf->regs[GC_SCRATCH_REG7] != mi50::AM_VERSION,
+          std::string("F1: EnableAllSmuFeatures refused -> FAILED (") + df.error() + "), SCRATCH_REG6 = 1, no hand-over state");
+    }
+  { std::unique_ptr<Card> cf(make({}, &exp)); cf->fail_ip_type = GFX_FW_TYPE_RLC_G; mi50::MI50Device df(*cf); r = df.init();
+    check(r == mi50::MI50Device::FAILED && strstr(df.error(), "PSP command failed") && cf->smu_log.empty(),
+          std::string("F2: PSP refuses RLC_G -> FAILED (") + df.error() + "), the SMU is never driven");
+    }
+  { Vbios v = build_vbios(); v.img[0] = 0; std::unique_ptr<Card> cf(new Card(v.img, FW)); cf->start(); mi50::MI50Device df(*cf); r = df.init();
+    check(r == mi50::MI50Device::FAILED && strstr(df.error(), "no AMD ROM") && cf->posted == 0, std::string("F3: no ROM signature -> FAILED before POST (") + df.error() + ")");
+    }
+
+  // ================= G: link partner caps -> PCIe overrides =================
+  { std::unique_ptr<Card> cg(make({}, &exp)); cg->have_partner = true; cg->partner_cap = 0x00473904 & ~0xfu; cg->partner_cap |= 3; cg->partner_cap2 = 0x0e;   // 8 GT/s x16
+    mi50::MI50Device dg(*cg); r = dg.init();
+    std::vector<uint32_t> ov; for (auto &m : cg->smu_log) if (m.first == PPSMC_MSG_OverridePcieParameters) ov.push_back(m.second);
+    check(r == mi50::MI50Device::FULL_BOOT && ov == std::vector<uint32_t>{0x10206}, "G: partner 8 GT/s x16 -> gen mask GEN1..3 -> level 1 gen 2 width 6: " +
+          (ov.empty() ? std::string("none") : hx(ov[0])));
+    }
+
+  // ================= H: the real Radeon Pro V420 VBIOS (the MI50's sister board): tables parse, boot PowerPlay table =================
+  { std::string rom = slurp(V420);
+    std::vector<uint8_t> img(rom.begin(), rom.end());
+    uint32_t len = (uint32_t)img[2] << 9;
+    check(len > 0x49 && img[0] == 0x55 && img[1] == 0xaa && len <= img.size(), "H: V420.rom is an AMD ROM image, length " + hx(len));
+    // the V420's own tables, read here with the AMD structs (independently of the driver)
+    auto r16 = [&](uint32_t o) { return (uint32_t)img[o] | (uint32_t)img[o + 1] << 8; };
+    uint32_t hdr = r16(0x48), mdt = r16(hdr + 0x20);
+    auto entry = [&](size_t off_in_list) { return r16(mdt + 4 + (uint32_t)off_in_list); };
+    uint32_t fwi = entry(offsetof(struct atom_master_list_of_data_tables_v2_1, firmwareinfo)), ppt = entry(offsetof(struct atom_master_list_of_data_tables_v2_1, powerplayinfo)),
+             sdi = entry(offsetof(struct atom_master_list_of_data_tables_v2_1, smc_dpm_info));
+    struct atom_firmware_info_v3_1 f; memcpy(&f, &img[fwi], sizeof(f));
+    ATOM_Vega20_POWERPLAYTABLE pp; memcpy(&pp, &img[ppt], sizeof(pp));
+    struct atom_smc_dpm_info_v4_4 dpm; memcpy(&dpm, &img[sdi], sizeof(dpm));
+    check(img[fwi + 2] == 3 && pp.sHeader.format_revision >= 11 && pp.smcPPTable.Version == 3 && pp.usSmallPowerLimit1 == 178 &&
+          pp.smcPPTable.SocketPowerLimitAc0 == 178 && pp.smcPPTable.MinVoltageGfx == 2950 && pp.smcPPTable.MaxVoltageGfx == 4500,
+          "H: V420 tables: firmwareinfo v3." + std::to_string(img[fwi + 3]) + ", PowerPlay rev " + std::to_string(pp.sHeader.format_revision) +
+          ", 178 W, VDDGFX 2950..4500 (mV*4)");
+    std::unique_ptr<Card> ch(new Card(std::vector<uint8_t>(img.begin(), img.begin() + len), FW)); ch->start();
+    ch->regs[f.bios_scratch_reg_startaddr + 7] = 0x200;   // posted (no ATOM ASIC_Init on a model of the memory controller)
+    mi50::MI50Device dh(*ch);
+    r = dh.init();
+    check(r == mi50::MI50Device::FULL_BOOT && ch->posted == 0, std::string("H: full boot on the V420's own tables (") + dh.error() + ")");
+    PPTable_t want = pp.smcPPTable;   // append_vbios_pptable from the V420's smc_dpm_info, fan target 105, boot cap 250
+    want.MaxVoltageStepGfx = dpm.maxvoltagestepgfx; want.MaxVoltageStepSoc = dpm.maxvoltagestepsoc; want.VddGfxVrMapping = dpm.vddgfxvrmapping;
+    want.VddSocVrMapping = dpm.vddsocvrmapping; want.VddMem0VrMapping = dpm.vddmem0vrmapping; want.VddMem1VrMapping = dpm.vddmem1vrmapping;
+    want.GfxUlvPhaseSheddingMask = dpm.gfxulvphasesheddingmask; want.SocUlvPhaseSheddingMask = dpm.soculvphasesheddingmask; want.ExternalSensorPresent = dpm.externalsensorpresent;
+    want.GfxMaxCurrent = dpm.gfxmaxcurrent; want.GfxOffset = dpm.gfxoffset; want.Padding_TelemetryGfx = dpm.padding_telemetrygfx;
+    want.SocMaxCurrent = dpm.socmaxcurrent; want.SocOffset = dpm.socoffset; want.Padding_TelemetrySoc = dpm.padding_telemetrysoc;
+    want.Mem0MaxCurrent = dpm.mem0maxcurrent; want.Mem0Offset = dpm.mem0offset; want.Padding_TelemetryMem0 = dpm.padding_telemetrymem0;
+    want.Mem1MaxCurrent = dpm.mem1maxcurrent; want.Mem1Offset = dpm.mem1offset; want.Padding_TelemetryMem1 = dpm.padding_telemetrymem1;
+    want.AcDcGpio = dpm.acdcgpio; want.AcDcPolarity = dpm.acdcpolarity; want.VR0HotGpio = dpm.vr0hotgpio; want.VR0HotPolarity = dpm.vr0hotpolarity;
+    want.VR1HotGpio = dpm.vr1hotgpio; want.VR1HotPolarity = dpm.vr1hotpolarity; want.Padding1 = dpm.padding1; want.Padding2 = dpm.padding2;
+    want.LedPin0 = dpm.ledpin0; want.LedPin1 = dpm.ledpin1; want.LedPin2 = dpm.ledpin2;
+    want.PllGfxclkSpreadEnabled = dpm.pllgfxclkspreadenabled; want.PllGfxclkSpreadPercent = dpm.pllgfxclkspreadpercent; want.PllGfxclkSpreadFreq = dpm.pllgfxclkspreadfreq;
+    want.UclkSpreadEnabled = 0; want.UclkSpreadPercent = dpm.uclkspreadpercent; want.UclkSpreadFreq = dpm.uclkspreadfreq;
+    want.FclkSpreadEnabled = dpm.fclkspreadenabled; want.FclkSpreadPercent = dpm.fclkspreadpercent; want.FclkSpreadFreq = dpm.fclkspreadfreq;
+    want.FllGfxclkSpreadEnabled = dpm.fllgfxclkspreadenabled; want.FllGfxclkSpreadPercent = dpm.fllgfxclkspreadpercent; want.FllGfxclkSpreadFreq = dpm.fllgfxclkspreadfreq;
+    for (int i = 0; i < I2C_CONTROLLER_NAME_COUNT; i++) {
+      want.I2cControllers[i].Enabled = dpm.i2ccontrollers[i].enabled; want.I2cControllers[i].SlaveAddress = dpm.i2ccontrollers[i].slaveaddress;
+      want.I2cControllers[i].ControllerPort = dpm.i2ccontrollers[i].controllerport; want.I2cControllers[i].ThermalThrottler = dpm.i2ccontrollers[i].thermalthrottler;
+      want.I2cControllers[i].I2cProtocol = dpm.i2ccontrollers[i].i2cprotocol; want.I2cControllers[i].I2cSpeed = dpm.i2ccontrollers[i].i2cspeed;
+    }
+    want.FanTargetTemperature = 105; want.SocketPowerLimitAc0 = want.SocketPowerLimitDc = 250;
+    auto up = ch->smu.tables[TABLE_PPTABLE];
+    check(up.size() == sizeof(want) && memcmp(up.data(), &want, sizeof(want)) == 0, "H: V420 PPTable upload = its smcPPTable + its smc_dpm_info + Linux overrides + 250 W");
+    check(dh.power_limit_w() == 250, "H: PPT limit read back 250 W");
+    // the V420's GFX/UCLK levels reach the SMU through the uploaded table (the card model serves them back)
+    std::vector<uint32_t> gl; for (auto &m : ch->smu_log) if (m.first == PPSMC_MSG_GetDpmFreqByIndex && (m.second >> 16) == PPCLK_GFXCLK && (m.second & 0xffff) != 0xff) gl.push_back(m.second);
+    check(!gl.empty(), "H: GFXCLK DPM levels read from the SMU (" + std::to_string(gl.size()) + ")");
+    }
+
+  // ================= I: waiting for MI50BarFix's first BAR0 placement =================
+  { std::unique_ptr<Card> ci(make({}, &exp));   // placed by the kext in the host's 64-bit range (the real card: 0x10_0000_0000), decoding on
+    ci->cfg_wr(0x10, 0x0000000C, 4); ci->cfg_wr(0x14, 0x10, 4);
+    uint64_t t0 = ci->clock; bool ok = mi50::wait_bar0_placed(*ci, 5000); uint64_t ms = (ci->clock - t0) / 1000000;
+    check(ok && ms >= 20 && ms < 100, "I1: BAR0 at 0x10_0000_0000, decoding on -> placed after 3 equal reads (" + std::to_string(ms) + " ms)"); }
+  { std::unique_ptr<Card> ci(make({}, &exp));   // IOPCIFamily's unassigned BAR0, no kext
+    ci->cfg_wr(0x10, 0x0000000C, 4); ci->cfg_wr(0x14, 0, 4);
+    uint64_t t0 = ci->clock; bool ok = mi50::wait_bar0_placed(*ci, 5000); uint64_t ms = (ci->clock - t0) / 1000000;
+    check(!ok && ms >= 5000 && ms < 5100, "I2: BAR0 never placed -> gives up after 5 s (" + std::to_string(ms) + " ms)"); }
+  { std::unique_ptr<Card> ci(make({}, &exp));   // the kext mid-placement: decoding off
+    ci->cfg_wr(0x14, 0x10, 4); ci->cfg_wr(4, ci->cfg_rd(4, 2) & ~2u, 2);
+    bool ok = mi50::wait_bar0_placed(*ci, 200);
+    check(!ok, "I3: memory decoding off (the kext's probe / BAR write window) is not 'placed'"); }
+
+  // ================= J: one init() per object =================
+  { std::unique_ptr<Card> cj(make({}, &exp)); mi50::MI50Device dj(*cj); dj.init(); r = dj.init();
+    check(r == mi50::MI50Device::FAILED && strstr(dj.error(), "once"), std::string("J: a second init() on the same object is refused (") + dj.error() + ")"); }
+
+  { std::unique_ptr<Card> ci(make({}, &exp));   // all-ones upper dword (the link gone)
+    ci->cfg_wr(0x14, 0xffffffff, 4);
+    check(!mi50::wait_bar0_placed(*ci, 200), "I4: BAR0 upper dword all-ones is not 'placed'"); }
+  { std::unique_ptr<Card> ci(make({}, &exp));   // a 32-bit BAR type
+    ci->put(0x10, 0x00000008); ci->cfg_wr(0x14, 0x10, 4);
+    check(!mi50::wait_bar0_placed(*ci, 200), "I5: BAR0 not a 64-bit prefetchable BAR is not 'placed'"); }
+  { std::unique_ptr<Card> ci(make({}, &exp));   // the command register reads all-ones (device gone)
+    ci->cfg_wr(0x14, 0x10, 4); ci->put(4, 0xffffffff);
+    check(!mi50::wait_bar0_placed(*ci, 200), "I6: command register 0xffff is not 'placed'"); }
+  { std::unique_ptr<Card> ci(make({}, &exp));   // the kext still moving BAR0: three different addresses, then the final one
+    ci->cfg_wr(0x10, 0x0000000C, 4); ci->cfg_wr(0x14, 0x10, 4); ci->bar0_moves = 3;
+    uint64_t t0 = ci->clock; bool ok = mi50::wait_bar0_placed(*ci, 5000); uint64_t ms = (ci->clock - t0) / 1000000;
+    check(ok && ms >= 50 && ms < 100, "I7: BAR0 moving -> placed only after 3 equal reads of the final address (" + std::to_string(ms) + " ms)"); }
+
+  // ================= K: firmwareinfo v3.1 -> the SMU9 clock ids (ppatomfwctrl.c:478-511) =================
+  { std::unique_ptr<Card> ck(make_from(vbios_with([](std::vector<uint8_t> &i) { i[FWI + 3] = 1; }), {}));
+    Outcome o = run(*ck);
+    check(booted(o, *ck) && ck->clk_calls == std::vector<uint32_t>{0x100, 0x800, 0x700, 0x600, 0x500} && params(*ck, PPSMC_MSG_SetMinDeepSleepDcefclk) == std::vector<uint32_t>{100},
+          "K: firmwareinfo v3.1 -> getsmuclockinfo for SOCCLK 1, DCEFCLK 8, ECLK 7, VCLK 6, DCLK 5, no FCLK" + why(o)); }
+
+  // ================= L: link partner LNKCAP/LNKCAP2 -> gen/width masks -> PcieGenSpeed/PcieLaneCount overrides =================
+  struct { const char *tag; uint32_t cap, cap2; std::vector<uint32_t> ov; } ls[] = {
+    {"L1 16 GT/s x16: GEN1..4 -> nothing to lower", 0x104, 0x1e, {}},
+    {"L2 32 GT/s x16: GEN1..5", 0x105, 0x3e, {}},
+    {"L3 5 GT/s x16: GEN1..2 -> level 1 gen 1", 0x102, 0x06, {0x10106}},
+    {"L4 2.5 GT/s x16: GEN1 -> level 1 gen 0", 0x101, 0x02, {0x10006}},
+    {"L5 5 GT/s, no LNKCAP2 vector: from LNKCAP", 0x102, 0, {0x10106}},
+    {"L6 2.5 GT/s, no LNKCAP2 vector", 0x101, 0, {0x10006}},
+    {"L7 8 GT/s, no LNKCAP2 vector: unknown -> GEN1..2", 0x103, 0, {0x10106}},
+    {"L8 8 GT/s x8: width 4 on both levels", 0x083, 0x0e, {0x4, 0x10204}},
+    {"L9 8 GT/s x12: width 5", 0x0c3, 0x0e, {0x5, 0x10205}},
+    {"L10 8 GT/s x32: x32 has no override code -> x16", 0x203, 0x0e, {0x10206}},
+    {"L11 8 GT/s, width 3 (no PCIe width): mask 0 -> width 0", 0x033, 0x0e, {0x0, 0x10200}},
+    {"L12 LNKCAP 0: speed and width unknown", 0, 0x0e, {0x10106}}};
+  for (auto &l : ls) {
+    std::unique_ptr<Card> cl(make({}, &exp)); cl->have_partner = true; cl->partner_cap = l.cap; cl->partner_cap2 = l.cap2;
+    Outcome o = run(*cl);
+    std::vector<uint32_t> ov = params(*cl, PPSMC_MSG_OverridePcieParameters);
+    std::string got; for (auto x : ov) got += " " + hx(x);
+    check(booted(o, *cl) && ov == l.ov, std::string(l.tag) + ":" + (got.empty() ? " none" : got) + why(o));
+  }
+
+  // ================= M: features the SMU leaves off, its DPM level counts, its version =================
+  const uint64_t am = allowed_mask(FW.smc_version);
+  { std::unique_ptr<Card> cm(make({}, &exp));
+    cm->smu_refuse = FEATURE_DPM_SOCCLK_MASK | FEATURE_DPM_DCEFCLK_MASK | FEATURE_DPM_UVD_MASK | FEATURE_DPM_VCE_MASK | FEATURE_DPM_FCLK_MASK |
+                     FEATURE_FAN_CONTROL_MASK | FEATURE_THERMAL_MASK;
+    Outcome o = run(*cm);
+    int other = 0;
+    for (uint32_t k : {PPCLK_SOCCLK, PPCLK_DCEFCLK, PPCLK_PIXCLK, PPCLK_DISPCLK, PPCLK_PHYCLK, PPCLK_ECLK, PPCLK_VCLK, PPCLK_DCLK, PPCLK_FCLK})
+      other += per_clock(*cm, PPSMC_MSG_GetDpmFreqByIndex, k);
+    check(booted(o, *cm) && other == 0 && per_clock(*cm, PPSMC_MSG_GetDpmFreqByIndex, PPCLK_GFXCLK) == 5 && per_clock(*cm, PPSMC_MSG_GetDpmFreqByIndex, PPCLK_UCLK) == 4 &&
+          params(*cm, PPSMC_MSG_GetDcModeMaxDpmFreq) == std::vector<uint32_t>{PPCLK_UCLK << 16} && cm->smu.enabled == (am & ~cm->smu_refuse) &&
+          o.caps == (0x1FFu & ~(0x10u | 0x20u | 0x40u | 0x80u)),
+          "M1: SOCCLK, DCEFCLK, UVD, VCE, FCLK, fan, thermal off -> boot clocks / no display levels, only UCLK's max clocks, no fan/temperature OD8 caps" + why(o)); }
+  { std::unique_ptr<Card> cm(make({}, &exp)); cm->smu_refuse = FEATURE_DPM_UCLK_MASK; Outcome o = run(*cm);
+    check(booted(o, *cm) && params(*cm, PPSMC_MSG_SetUclkFastSwitch).empty() && per_clock(*cm, PPSMC_MSG_GetDpmFreqByIndex, PPCLK_UCLK) == 0 &&
+          per_clock(*cm, PPSMC_MSG_GetDcModeMaxDpmFreq, PPCLK_UCLK) == 0 && params(*cm, PPSMC_MSG_GetMaxDpmFreq).empty() && o.caps == (0x1FFu & ~0x4u),
+          "M2: UCLK DPM off -> no fast switch, no UCLK levels or max clocks, no UCLK OD8 cap" + why(o)); }
+  { std::unique_ptr<Card> cm(make({}, &exp)); cm->smu_refuse = FEATURE_DPM_GFXCLK_MASK; Outcome o = run(*cm);
+    check(booted(o, *cm) && per_clock(*cm, PPSMC_MSG_GetDpmFreqByIndex, PPCLK_GFXCLK) == 0 && params(*cm, PPSMC_MSG_GetAVFSVoltageByDpm).empty() && o.caps == (0x1FFu & ~0x3u),
+          "M3: GFXCLK DPM off -> boot clock, no GFXCLK limits/curve caps, no AVFS voltage queries" + why(o)); }
+  struct { const char *tag; uint32_t clk; std::vector<uint32_t> lv; const char *err; uint32_t caps; } ms[] = {
+    {"M4: no UCLK level", PPCLK_UCLK, {}, "od8: empty memory DPM table", 0},
+    {"M5: one UCLK level (the reference's mem[len - 2] wraps to it)", PPCLK_UCLK, {500}, "", 0x1FF},
+    {"M6: UCLK levels all 0 -> no UCLK OD8 cap", PPCLK_UCLK, {0, 0, 0}, "", 0x1FB},
+    {"M7: no GFXCLK level", PPCLK_GFXCLK, {}, "empty GFX DPM table", 0},
+    {"M8: 17 SOCCLK levels (a Linux DPM table holds 16)", PPCLK_SOCCLK, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}, "SMU reports 17 DPM levels", 0}};
+  for (auto &m : ms) {
+    std::unique_ptr<Card> cm(make({}, &exp)); cm->dpm_levels[m.clk] = m.lv; Outcome o = run(*cm);
+    check(m.err[0] ? failed(o, *cm, m.err) : booted(o, *cm) && o.caps == m.caps, std::string(m.tag) + why(o));
+  }
+  { std::unique_ptr<Card> cm(make({}, &exp)); cm->fw.smc_version = 0x282000; Outcome o = run(*cm);
+    check(booted(o, *cm) && cm->smu.enabled == allowed_mask(0x282000) && !(cm->smu.enabled & FEATURE_ECC_MASK), "M9: PMFW older than 0x282100 -> ECC not allowed" + why(o)); }
+  { std::unique_ptr<Card> cm(make({}, &exp)); cm->fail_smu_msg = PPSMC_MSG_GetAVFSVoltageByDpm; Outcome o = run(*cm);
+    OverDriveTable_t od; memcpy(&od, cm->smu.tables[TABLE_OVERDRIVE].data(), sizeof(od));
+    check(booted(o, *cm) && od.GfxclkVolt1 == 0 && od.GfxclkVolt2 == 0 && od.GfxclkVolt3 == 0 && od.GfxclkFreq2 == 1262,
+          "M10: GetAVFSVoltageByDpm refused -> curve voltages 0 (the PP_ASSERT default), boot goes on" + why(o)); }
+  { std::unique_ptr<Card> cm(make({}, &exp)); cm->hang_smu_msg = PPSMC_MSG_GetAVFSVoltageByDpm; cm->ns_per_call = 1000000; Outcome o = run(*cm);
+    char w[48]; snprintf(w, sizeof(w), "SMU msg 0x%x timeout", PPSMC_MSG_GetAVFSVoltageByDpm);
+    check(failed(o, *cm, w), "M11: GetAVFSVoltageByDpm never answered -> FAILED" + why(o)); }
+
+  // ================= N: the VBIOS OverDrive8 limits -> OD8 capabilities (vega20_od8_initialize_default_settings), the thermal range =================
+  using PP = ATOM_Vega20_POWERPLAYTABLE;
+  struct { const char *tag; void (*edit)(PP &); uint32_t caps; } nv[] = {
+    {"OD8 table revision 0", [](PP &p) { p.OverDrive8Table.ucODTableRevision = 0; }, 0},
+    {"ODFeatureCount 0", [](PP &p) { p.OverDrive8Table.ODFeatureCount = 0; }, 0},
+    {"ODFeatureCount 40, ODSettingCount 40 (clamped)", [](PP &p) { p.OverDrive8Table.ODFeatureCount = 40; p.OverDrive8Table.ODSettingCount = 40; }, 0x1FF},
+    {"ODSettingCount 8: UCLK and later limits read as 0", [](PP &p) { p.OverDrive8Table.ODSettingCount = 8; }, 0x103},
+    {"GFXCLK limits: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[0] = 0; }, 0x1FE},
+    {"GFXCLK limits: fmax 0", [](PP &p) { p.OverDrive8Table.ODSettingsMax[1] = 0; }, 0x1FE},
+    {"GFXCLK limits: fmin 0", [](PP &p) { p.OverDrive8Table.ODSettingsMin[0] = 0; }, 0x1FE},
+    {"GFXCLK limits: fmax < fmin", [](PP &p) { p.OverDrive8Table.ODSettingsMax[1] = 700; }, 0x1FE},
+    {"GFXCLK curve: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[1] = 0; }, 0x1FD},
+    {"GFXCLK curve: V1 below MinVoltageGfx", [](PP &p) { p.OverDrive8Table.ODSettingsMin[3] = 600; }, 0x1FD},
+    {"GFXCLK curve: V3 above MaxVoltageGfx", [](PP &p) { p.OverDrive8Table.ODSettingsMax[7] = 1300; }, 0x1FD},
+    {"GFXCLK curve: V3 < V1", [](PP &p) { p.OverDrive8Table.ODSettingsMin[3] = 1150; p.OverDrive8Table.ODSettingsMax[7] = 1100; }, 0x1FD},
+    {"UCLK max: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[2] = 0; }, 0x1FB},
+    {"UCLK max: limit 0", [](PP &p) { p.OverDrive8Table.ODSettingsMax[8] = 0; }, 0x1FB},
+    {"UCLK max: limit below the second-highest level", [](PP &p) { p.OverDrive8Table.ODSettingsMax[8] = 500; }, 0x1FB},
+    {"power limit: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[3] = 0; }, 0x1F7},
+    {"power limit: max 0", [](PP &p) { p.OverDrive8Table.ODSettingsMax[9] = 0; }, 0x1F7},
+    {"power limit: max 101", [](PP &p) { p.OverDrive8Table.ODSettingsMax[9] = 101; }, 0x1F7},
+    {"power limit: min 0", [](PP &p) { p.OverDrive8Table.ODSettingsMin[9] = 0; }, 0x1F7},
+    {"power limit: min 101", [](PP &p) { p.OverDrive8Table.ODSettingsMin[9] = 101; }, 0x1F7},
+    {"fan acoustic: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[4] = 0; }, 0x1EF},
+    {"fan acoustic: min 0", [](PP &p) { p.OverDrive8Table.ODSettingsMin[10] = 0; }, 0x1EF},
+    {"fan acoustic: max 0", [](PP &p) { p.OverDrive8Table.ODSettingsMax[10] = 0; }, 0x1EF},
+    {"fan acoustic: max < min", [](PP &p) { p.OverDrive8Table.ODSettingsMax[10] = 400; }, 0x1EF},
+    {"fan min speed: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[5] = 0; }, 0x1DF},
+    {"fan min speed: min below FanPwmMin% of FanMaximumRpm (770)", [](PP &p) { p.OverDrive8Table.ODSettingsMin[11] = 700; }, 0x1DF},
+    {"fan min speed: max 0", [](PP &p) { p.OverDrive8Table.ODSettingsMax[11] = 0; }, 0x1DF},
+    {"fan min speed: max < min", [](PP &p) { p.OverDrive8Table.ODSettingsMax[11] = 790; }, 0x1DF},
+    {"fan target temperature: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[6] = 0; }, 0x1BF},
+    {"fan target temperature: max 0", [](PP &p) { p.OverDrive8Table.ODSettingsMax[12] = 0; }, 0x1BF},
+    {"fan target temperature: min 0", [](PP &p) { p.OverDrive8Table.ODSettingsMin[12] = 0; }, 0x1BF},
+    {"fan target temperature: max < min", [](PP &p) { p.OverDrive8Table.ODSettingsMax[12] = 20; }, 0x1BF},
+    {"operating temperature: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[7] = 0; }, 0x17F},
+    {"operating temperature: max 0", [](PP &p) { p.OverDrive8Table.ODSettingsMax[13] = 0; }, 0x17F},
+    {"operating temperature: min 0", [](PP &p) { p.OverDrive8Table.ODSettingsMin[13] = 0; }, 0x17F},
+    {"operating temperature: max < min", [](PP &p) { p.OverDrive8Table.ODSettingsMax[13] = 70; }, 0x17F},
+    {"memory timing: no feature", [](PP &p) { p.OverDrive8Table.ODFeatureCapabilities[8] = 0; }, 0x0FF},
+    {"zero-RPM control: feature and FanZeroRpmEnable", [](PP &p) { p.smcPPTable.FanZeroRpmEnable = 1; }, 0x3FF}};
+  for (auto &n : nv) {
+    std::unique_ptr<Card> cn(make_from(pp_with(n.edit), {})); Outcome o = run(*cn);
+    bool curve = n.caps & 0x2;
+    check(booted(o, *cn) && o.caps == n.caps && params(*cn, PPSMC_MSG_GetAVFSVoltageByDpm).size() == (curve ? 3u : 0u),
+          std::string("N: ") + n.tag + " -> OD8 caps " + hx(o.caps) + (o.caps == n.caps ? "" : " want " + hx(n.caps)) + why(o));
+  }
+  { std::unique_ptr<Card> cn(make_from(pp_with([](PP &p) { p.ucThermalControllerType = 0; }), {})); Outcome o = run(*cn);
+    check(booted(o, *cn) && params(*cn, PPSMC_MSG_SetFanTemperatureTarget).empty() && cn->regs[THM_THM_THERMAL_INT_CTRL] == 0,
+          "N: no thermal controller -> no thermal alert range, no fan target" + why(o)); }
+  { std::unique_ptr<Card> cn(make_from(pp_with([](PP &p) { p.usSoftwareShutdownTemp = 300; }), {})); Outcome o = run(*cn);
+    check(booted(o, *cn) && field(cn->regs[THM_THM_THERMAL_INT_CTRL], THM_THM_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK, THM_THM_THERMAL_INT_CTRL__DIG_THERM_INTH__SHIFT) == 255,
+          "N: SoftwareShutdownTemp 300 -> alert high stays at the 255 maximum" + why(o)); }
+
+  // ================= O: VBIOS images the driver refuses or reads around =================
+  struct { const char *tag; void (*edit)(std::vector<uint8_t> &); const char *err; } os[] = {
+    {"ROM length 0", [](std::vector<uint8_t> &i) { i[2] = 0; }, "VBIOS mem is null"},
+    {"no ROM table pointer", [](std::vector<uint8_t> &i) { w16(i, 0x48, 0); }, "Can't locate VBIOS header"},
+    {"ROM table pointer at the image end", [](std::vector<uint8_t> &i) { w16(i, 0x48, 0xFFFE); }, "VBIOS header is broken"},
+    {"no ATOM/MOTA magic", [](std::vector<uint8_t> &i) { memcpy(&i[HDR + 4], "XXXX", 4); }, "no ATOM/MOTA"},
+    {"MOTA magic: check_atom_bios takes it, atom_parse does not", [](std::vector<uint8_t> &i) { memcpy(&i[HDR + 4], "MOTA", 4); }, "ATOM: Invalid BIOS magic"},
+    {"ROM header cut by the image end", [](std::vector<uint8_t> &i) { w16(i, 0x48, 0xFFF4); memcpy(&i[0xFFF8], "ATOM", 4); }, "atom_rom_header_v2_2 at 0xfff4 past the image"},
+    {"firmwareinfo entry past the image", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(firmwareinfo), 0xFFFE); }, "data table entry 0xfffe past the image"},
+    {"no firmwareinfo", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(firmwareinfo), 0); }, "no firmwareinfo table"},
+    {"firmwareinfo v3.3", [](std::vector<uint8_t> &i) { i[FWI + 3] = 3; }, "firmwareinfo v3.3"},
+    {"firmwareinfo v2.2", [](std::vector<uint8_t> &i) { i[FWI + 2] = 2; }, "firmwareinfo v2.2"},
+    {"firmwareinfo cut by the image end", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(firmwareinfo), 0xFFF0); i[0xFFF2] = 3; i[0xFFF3] = 2; }, "firmwareinfo at 0xfff0 past the image"},
+    {"no vram_usagebyfirmware (20 KiB ATOM scratch)", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(vram_usagebyfirmware), 0); }, ""},
+    {"vram_usagebyfirmware v2.1 with the SR-IOV flag", [](std::vector<uint8_t> &i) { i[VRU + 7] |= 0x80; i[VRU + 7] &= ~0x40; }, ""},
+    {"vram_usagebyfirmware v2.1 cut by the image end", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(vram_usagebyfirmware), 0xFFF8); i[0xFFFA] = 2; i[0xFFFB] = 1; }, "vram_usagebyfirmware past the image"},
+    {"vram_usagebyfirmware v2.2", [](std::vector<uint8_t> &i) { i[VRU + 3] = 2; }, ""},
+    {"vram_usagebyfirmware v2.2 cut by the image end", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(vram_usagebyfirmware), 0xFFF8); i[0xFFFA] = 2; i[0xFFFB] = 2; }, "vram_usagebyfirmware past the image"},
+    {"vram_usagebyfirmware v1.0", [](std::vector<uint8_t> &i) { i[VRU + 2] = 1; i[VRU + 3] = 0; }, ""},
+    {"no gfx_info", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(gfx_info), 0); }, "no gfx_info table"},
+    {"gfx_info v2.3", [](std::vector<uint8_t> &i) { i[GFX + 3] = 3; }, "gfx_info v2.3"},
+    {"gfx_info v1.4", [](std::vector<uint8_t> &i) { i[GFX + 2] = 1; }, "gfx_info v1.4"},
+    {"gfx_info cut by the image end", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(gfx_info), 0xFFF0); i[0xFFF2] = 2; i[0xFFF3] = 4; }, "gfx_info past the image"},
+    {"no powerplayinfo", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(powerplayinfo), 0); }, "no powerplayinfo table"},
+    {"powerplayinfo size past the image", [](std::vector<uint8_t> &i) { w16(i, PPT, 0xFC00); }, "powerplayinfo at 0x600"},
+    {"powerplayinfo 256 bytes", [](std::vector<uint8_t> &i) { w16(i, PPT, 0x100); }, "Invalid PowerPlay Table! 256"},
+    {"PowerPlay format revision 10", [](std::vector<uint8_t> &i) { i[PPT + 2] = 10; }, "Unsupported PPTable format! revision 10"},
+    {"no smc_dpm_info", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(smc_dpm_info), 0); }, "Failed to retrieve Smc Dpm Table"},
+    {"smc_dpm_info cut by the image end", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(smc_dpm_info), 0xFFF0); }, "smc_dpm_info past the image"},
+    {"no ASIC_Init", [](std::vector<uint8_t> &i) { w16(i, CMT + 4, 0); }, "amdgpu_atom_asic_init returned 1"},
+    {"vram_usagebyfirmware entry past the image", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(vram_usagebyfirmware), 0xFFFE); }, "data table entry 0xfffe past the image"},
+    {"gfx_info entry past the image", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(gfx_info), 0xFFFE); }, "data table entry 0xfffe past the image"},
+    {"powerplayinfo entry past the image", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(powerplayinfo), 0xFFFE); }, "data table entry 0xfffe past the image"},
+    {"smc_dpm_info entry past the image", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(smc_dpm_info), 0xFFFE); }, "data table entry 0xfffe past the image"}};
+  for (auto &v : os) {
+    std::unique_ptr<Card> co(make_from(vbios_with(v.edit), {})); co->ns_per_call = 1000000; Outcome o = run(*co);
+    check(v.err[0] ? failed(o, *co, v.err) && co->smu_log.empty() : booted(o, *co), std::string("O: ") + v.tag + " -> " + (v.err[0] ? "FAILED" : "boots") + why(o));
+  }
+  { std::unique_ptr<Card> co(make_from(pp_with([](PP &p) { p.smcPPTable.Version = 2; }), {})); Outcome o = run(*co);
+    check(failed(o, *co, "Unmatch PPTable version: V2"), "O: PPTable version 2 -> FAILED" + why(o)); }
+  { std::unique_ptr<Card> co(make({}, &exp)); co->rom_glitch = 0xffffffff; Outcome o = run(*co);
+    check(failed(o, *co, "VBIOS signature incorrect ff ff"), "O: the second ROM pass reads all-ones (link glitch) -> the image check catches it" + why(o)); }
+  { std::vector<uint8_t> img = build_vbios().img;   // the master data table moved so its indirect-IO entry (atom.c:1624) lies past the image
+    const uint32_t md = 0x10000 - 0x32; memcpy(&img[md], &img[MDT], 0x32); w16(img, HDR + 0x20, md);
+    std::unique_ptr<Card> co(make_from(img, {})); Outcome o = run(*co);
+    check(failed(o, *co, "ATOM: table read past the VBIOS image"), "O: atom_parse reads past the image -> ATOM_EFAULT, FAILED" + why(o)); }
+  { std::unique_ptr<Card> co(make_from(vbios_with([](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(umc_info), 0xFFFE); w16(i, MDT_ENTRY(vram_info), 0xFFFE); }), {}));
+    Outcome o = run(*co);
+    check(booted(o, *co) && o.err.empty() && !co->psp_log.empty() && co->psp_log.back().flags.size() == 16 && co->psp_log.back().flags[12] == 0,
+          "O: umc_info / vram_info entries past the image read as absent tables: boots, no stale error, RAS vram_type 0" + why(o)); }
+  struct { const char *tag; void (*edit)(std::vector<uint8_t> &); uint32_t module; uint8_t want; } vt[] = {
+    {"vram_info v2.3 type 0x50 -> GDDR5 5", [](std::vector<uint8_t> &i) { i[VRI + 24 + 23] = 0x50; }, 0, 5},
+    {"type 0x61 -> HBM 6", [](std::vector<uint8_t> &i) { i[VRI + 24 + 23] = 0x61; }, 0, 6},
+    {"type 0x80 -> HBM 6", [](std::vector<uint8_t> &i) { i[VRI + 24 + 23] = 0x80; }, 0, 6},
+    {"type 0x70 -> GDDR6 9", [](std::vector<uint8_t> &i) { i[VRI + 24 + 23] = 0x70; }, 0, 9},
+    {"type 0x81 -> HBM3 13", [](std::vector<uint8_t> &i) { i[VRI + 24 + 23] = 0x81; }, 0, 13},
+    {"type 0x99 -> unknown 0", [](std::vector<uint8_t> &i) { i[VRI + 24 + 23] = 0x99; }, 0, 0},
+    {"vram_info v3.0", [](std::vector<uint8_t> &i) { i[VRI + 2] = 3; i[VRI + 3] = 0; i[VRI + 24] = 0x70; }, 0, 9},
+    {"vram_info v2.5 layout", [](std::vector<uint8_t> &i) { i[VRI + 3] = 5; i[VRI + 24 + 13] = 0x81; }, 0, 13},
+    {"vram_info v2.7 (not read)", [](std::vector<uint8_t> &i) { i[VRI + 3] = 7; }, 0, 0},
+    {"vram_info v1.0 (not read)", [](std::vector<uint8_t> &i) { i[VRI + 2] = 1; }, 0, 0},
+    {"module 1 of 2", [](std::vector<uint8_t> &i) { i[VRI + 20] = 2; i[VRI + 24 + 0x30 + 23] = 0x70; }, 1, 9},
+    {"module 3 of 2 -> module 0", [](std::vector<uint8_t> &i) { i[VRI + 20] = 2; i[VRI + 24 + 0x30 + 23] = 0x70; }, 3, 6}};
+  for (auto &v : vt) {
+    std::unique_ptr<Card> co(make_from(vbios_with(v.edit), {})); co->regs[NBIO_BIOS_SCRATCH_4] = v.module << 16; Outcome o = run(*co);
+    bool ok = booted(o, *co) && !co->psp_log.empty() && co->psp_log.back().flags.size() == 16 && co->psp_log.back().flags[12] == v.want;
+    check(ok, std::string("O: ") + v.tag + " -> RAS init vram_type " + std::to_string(v.want) + why(o));
+  }
+
+  // ================= E (more): mem_ecc table versions, boot-config and RAS TA failures (psp_ras_initialize) =================
+  Umc u31 = {3, 1, 0x2, 0}, u32 = {3, 2, 0x0, 0}, u40 = {4, 0, 0x2, 0x10000}, u50 = {5, 0, 0x2, 0x10000};
+  struct { const char *tag; uint32_t cap; const Umc *umc; uint32_t bcfg; int fail_n, hang_n; uint32_t ras; std::vector<std::array<uint32_t, 3>> want; const char *log; } ex[] = {
+    {"E6 umc 3.1 ECC, cfg off -> GECC is disabled", 0x20000, &u31, 0, 0, 0, 0, {{BOOTCFG_CMD_GET, 0, 0}}, "GECC is disabled"},
+    {"E7 umc 3.2 no ECC, cfg on -> disable", 0x20000, &u32, 1, 0, 0, 0, {{BOOTCFG_CMD_GET, 0, 0}, {BOOTCFG_CMD_SET, 0, 0}}, "GECC will be disabled in next boot cycle"},
+    {"E8 umc 4.0 ECC + default, cfg off -> enable", 0x20000, &u40, 0, 0, 0, 0, {{BOOTCFG_CMD_GET, 0, 0}, {BOOTCFG_CMD_SET, 1, 1}}, "GECC will be enabled in next boot cycle"},
+    {"E9 umc 5.0 (not read), cfg off", 0x20000, &u50, 0, 0, 0, 0, {{BOOTCFG_CMD_GET, 0, 0}}, "GECC is disabled"},
+    {"E10 get boot config never answered -> enable", 0x20000, &ecc_on, 0, 0, 17, 0, {{BOOTCFG_CMD_GET, 0, 0}, {BOOTCFG_CMD_SET, 1, 1}}, "PSP get boot config failed"},
+    {"E11 set boot config never answered", 0x20000, &ecc_on, 0, 0, 18, 0, {{BOOTCFG_CMD_GET, 0, 0}, {BOOTCFG_CMD_SET, 1, 1}}, "PSP set boot config failed"},
+    {"E12 get boot config status != 0: a warning, the answer is used", 0x20000, &ecc_on, 1, 17, 0, 0, {{BOOTCFG_CMD_GET, 0, 0}}, "GECC is enabled"},
+    {"E13 RAS TA load never answered: not fatal", 0, nullptr, 0, 0, 17, 0, {}, "RAS: Failed to initialize RAS"},
+    {"E14 RAS TA load status != 0: a warning", 0, nullptr, 0, 17, 0, 0, {}, "PSP command failed"},
+    {"E15 RAS TA init status 5", 0, nullptr, 0, 0, 0, 5, {}, "RAS Init Status: 0x5"}};
+  for (auto &e : ex) {
+    Setup s; s.fw_cap = e.cap; s.umc = e.umc; s.boot_cfg = e.bcfg;
+    std::unique_ptr<Card> ce(make(s, &exp)); ce->fail_psp_nth = e.fail_n; ce->hang_psp_nth = e.hang_n; ce->ras_init_status = e.ras; ce->ns_per_call = 1000000;
+    Outcome o = run(*ce);
+    std::vector<std::array<uint32_t, 3>> got;
+    for (auto &p : ce->psp_log) {
+      if (p.kind == "BOOT_CFG") got.push_back({(uint32_t)p.a, (uint32_t)p.b, (uint32_t)p.c});
+      else if (p.kind == "HANG" && p.a == GFX_CMD_ID_BOOT_CFG) got.push_back({(uint32_t)p.b, (uint32_t)p.c, (uint32_t)p.d});
+    }
+    check(booted(o, *ce) && got == e.want && has_sub(ce->logs, e.log), std::string(e.tag) + why(o));
+  }
+
+  // ================= P: every SMU message, PSP command and allocation of the boot failing in turn =================
+  { const auto seq = expected_smu_log(am, true); int bad = 0; std::string first;
+    for (size_t n = 1; n <= seq.size(); n++) for (int hang = 0; hang < 2; hang++) {
+      std::unique_ptr<Card> cp(make({}, &exp)); cp->ns_per_call = 1000000; (hang ? cp->hang_smu_nth : cp->fail_smu_nth) = (int)n;
+      Outcome o = run(*cp); uint32_t msg = seq[n - 1].first;
+      bool tolerated = msg == PPSMC_MSG_NumOfDisplays || (!hang && msg == PPSMC_MSG_GetAVFSVoltageByDpm);
+      char w[48]; snprintf(w, sizeof(w), hang ? "SMU msg 0x%x timeout" : "SMU msg 0x%x param", msg);
+      bool ok = tolerated ? booted(o, *cp) : failed(o, *cp, w) && cp->smu_count == (int)n;
+      if (!ok && !bad++) first = " first: #" + std::to_string(n) + (hang ? " hang " : " fail ") + hx(msg) + why(o);
+    }
+    check(bad == 0, "P1: each of the " + std::to_string(seq.size()) + " SMU messages refused / never answered -> FAILED on that message, nothing sent after it, "
+          "except NumOfDisplays (ignored) and a refused GetAVFSVoltageByDpm" + first); }
+  { const int npsp = 3 + (int)FW.ip.size(); int bad = 0; std::string first;
+    for (int n = 1; n <= npsp; n++) for (int hang = 0; hang < 2; hang++) {
+      std::unique_ptr<Card> cp(make({}, &exp)); cp->ns_per_call = 1000000; (hang ? cp->hang_psp_nth : cp->fail_psp_nth) = n;
+      Outcome o = run(*cp);
+      bool ok = n == npsp ? booted(o, *cp) && has_sub(cp->logs, hang ? "RAS: Failed to initialize RAS" : "PSP command failed")
+                          : failed(o, *cp, hang ? "sOS ring not responding" : "PSP command failed") && cp->psp_count == n && cp->smu_log.empty();
+      if (!ok && !bad++) first = " first: #" + std::to_string(n) + (hang ? " hang" : " fail") + why(o);
+    }
+    check(bad == 0, "P2: each of the " + std::to_string(npsp) + " PSP ring commands failing / never answered -> FAILED on it, except the RAS TA (warning)" + first); }
+  { std::unique_ptr<Card> c0(make({}, &exp)); run(*c0); const int nalloc = c0->allocs; int bad = 0; std::string first;
+    for (int n = 1; n <= nalloc; n++) {
+      std::unique_ptr<Card> cp(make({}, &exp)); cp->fail_alloc_nth = n; Outcome o = run(*cp);
+      if (!failed(o, *cp, "out of memory") && !bad++) first = " first: #" + std::to_string(n) + why(o);
+    }
+    check(bad == 0 && nalloc == 5, "P3: each of the " + std::to_string(nalloc) + " allocations failing -> FAILED 'out of memory', every other buffer released" + first); }
+
+  // ================= Q: PSP bootloader / sOS / ring stages, the SMU start =================
+  struct { const char *tag; int stall; bool bl_dead, sysdrv_sos, no_smu; uint32_t r71, r67; const char *err; } qs[] = {
+    {"Q1 bootloader never ready", 0, true, false, false, 0, 0, "BL not ready"},
+    {"Q2 sOS never starts", 2, false, false, false, 0, 0, "sOS failed to start"},
+    {"Q3 sOS up but never ready for a ring", 4, false, false, false, 0, 0, "sOS not ready"},
+    {"Q4 KM ring never created", 3, false, false, false, 0, 0, "sOS ring not created"},
+    {"Q5 SYS_DRV already starts the sOS: SOS not loaded", 0, false, true, false, 0, 0, ""},
+    {"Q6 a ring left from before: destroyed first", 0, false, false, false, 0x10000, 0, ""},
+    {"Q7 ring write pointer left past the ring", 0, false, false, false, 0, 0x4000, "PSP ring: wptr 16384 past"},
+    {"Q8 SMU firmware loaded but the PMFW does not run", 0, false, false, true, 0, 0, "SMC is not running"},
+    {"Q9 bootloader not ready again after SYS_DRV", 5, false, false, false, 0, 0, "BL not ready"}};
+  for (auto &q : qs) {
+    std::unique_ptr<Card> cq(make({}, &exp)); cq->ns_per_call = 1000000;
+    cq->psp_stall = q.stall; cq->sysdrv_starts_sos = q.sysdrv_sos; cq->smu_no_start = q.no_smu;
+    if (q.bl_dead) cq->regs[MP0_MP0_SMN_C2PMSG_35] = 0;
+    if (q.r71) cq->regs[MP0_MP0_SMN_C2PMSG_71] = q.r71;
+    if (q.r67) cq->regs[MP0_MP0_SMN_C2PMSG_67] = q.r67;
+    Outcome o = run(*cq);
+    int bl = 0; size_t destroy = SIZE_MAX, create = SIZE_MAX;
+    for (size_t j = 0; j < cq->psp_log.size(); j++) { if (cq->psp_log[j].kind == "BL") bl++; if (cq->psp_log[j].kind == "DESTROY_RINGS") destroy = j; if (cq->psp_log[j].kind == "RING_CREATE" && create == SIZE_MAX) create = j; }
+    bool ok = q.err[0] ? failed(o, *cq, q.err) : booted(o, *cq);
+    if (q.sysdrv_sos) ok = ok && bl == 1;
+    if (q.r71) ok = ok && destroy != SIZE_MAX && destroy + 1 == create;
+    check(ok, std::string(q.tag) + why(o));
+  }
+
+  // ================= R: the mode1 path's failures (sOS alive, REG6 = 1) =================
+  struct { const char *tag; int knob; const char *err; } rs[] = {
+    {"R1 PSP without its response flag: no reset, PMFW left running", 1, "PSP not ready for mode1 reset"},
+    {"R2 the PSP drops its flag during the PMFW shutdown", 2, "psp is not working correctly before mode1 reset"},
+    {"R3 the link does not come back", 3, "not ready 60s after PSP mode1 reset"},
+    {"R4 RCC_CONFIG_MEMSIZE unreadable after the reset", 4, "RCC_CONFIG_MEMSIZE after mode1 reset"},
+    {"R5 bootloader dead after the reset", 5, "BL not ready"},
+    {"R6 ASIC_Init fails after the reset", 6, "amdgpu_atom_asic_init returned -14 (after PSP mode1 reset)"}};
+  for (auto &rr : rs) {
+    std::unique_ptr<Card> cr(make({}, &exp));
+    { mi50::MI50Device a(*cr); a.init(); }
+    cr->regs[GC_SCRATCH_REG6] = 1; cr->ns_per_call = 1000000; cr->events.clear();
+    if (rr.knob == 1) cr->regs[MP0_MP0_SMN_C2PMSG_64] = 0;
+    if (rr.knob == 2) cr->shutdown_drops_psp = true;
+    if (rr.knob == 3) cr->reset_window_ns = 200000000000ull;
+    if (rr.knob == 4) cr->memsize_after_reset = 0xffffffff;
+    if (rr.knob == 5) cr->bl_dead_after_reset = true;
+    if (rr.knob == 6) cr->post_fails_after_reset = true;
+    Outcome o = run(*cr);
+    check(failed(o, *cr, rr.err) && cr->mode1_count == (rr.knob <= 2 ? 0 : 1), std::string(rr.tag) + why(o));
+  }
+
+  // ================= S: init()'s own checks, a smaller BAR5 (registers past it go through PCIE_INDEX2/DATA2) =================
+  { std::unique_ptr<Card> cs(make({}, &exp)); cs->mmio_size_dwords = 0; Outcome o = run(*cs);
+    check(failed(o, *cs, "no BAR5 register aperture") && cs->posted == 0, "S1: no BAR5 -> FAILED before any access" + why(o)); }
+  { std::unique_ptr<Card> cs(make({}, &exp)); cs->put(0, 0x66af1002); Outcome o = run(*cs);
+    check(failed(o, *cs, "not the MI50") && cs->posted == 0, "S2: another device id -> FAILED" + why(o)); }
+  for (uint32_t m : {0u, 0xffffffffu}) {
+    std::unique_ptr<Card> cs(make({}, &exp)); cs->regs[NBIO_RCC_CONFIG_MEMSIZE] = m; Outcome o = run(*cs);
+    check(failed(o, *cs, "RCC_CONFIG_MEMSIZE unreadable after POST"), "S3: RCC_CONFIG_MEMSIZE " + hx(m) + " after POST -> FAILED" + why(o));
+  }
+  { std::unique_ptr<Card> cs(make({}, &exp)); { mi50::MI50Device a(*cs); a.init(); }
+    cs->regs[GC_VM_L2_PROTECTION_FAULT_STATUS] = 1; cs->logs.clear();
+    Outcome o = run(*cs);
+    check(booted(o, *cs) && cs->mode1_count == 1 && has(cs->logs, "MI50: malformed state, issuing a full reset"),
+          "S4: hand-over state but a VM fault pending -> malformed: mode1 reset, full boot" + why(o)); }
+  { std::unique_ptr<Card> cs(make({}, &exp)); cs->mmio_size_dwords = 0x10000;
+    mi50::MI50Device ds(*cs); r = ds.init();
+    check_cold_boot("S5 BAR5 256 KiB", *cs, exp, ds, r);
+    check(cs->indirect > 1000, "S5: registers past 256 KiB (MP0/MP1, SMUIO ROM, THM, MMHUB) reached through PCIE_INDEX2/DATA2 (" + std::to_string(cs->indirect) + ")"); }
+
+  // ================= X: config-space shapes (disable_aspm, ext_cap, rebar_ctrls, pcie_state) through a cold boot and a mode1 recovery =================
+  struct { const char *tag; int shape; bool aspm_cleared; std::vector<uint32_t> not_restored; } xs[] = {
+    {"X1 capability list loops without the PCIe capability", 1, false, {CFG_PCIE + 0x08, CFG_PCIE + 0x10, CFG_PCIE + 0x28, CFG_PCIE + 0x30}},
+    {"X2 no capability list", 2, false, {CFG_PCIE + 0x08, CFG_PCIE + 0x10, CFG_PCIE + 0x28, CFG_PCIE + 0x30}},
+    {"X3 PCIe capability version 1: no DEVCTL2/LNKCTL2", 3, true, {CFG_PCIE + 0x28, CFG_PCIE + 0x30}},
+    {"X4 no extended capabilities (header 0): no REBAR, LTR, AER", 4, true, {CFG_REBAR + 8, 0x324, 0x158, 0x15C, 0x164, 0x168}},
+    {"X5 extended capability pointing at itself: 48 steps, nothing found", 5, true, {CFG_REBAR + 8, 0x324, 0x158, 0x15C, 0x164, 0x168}},
+    {"X6 no REBAR capability: the chain ends", 6, true, {CFG_REBAR + 8}},
+    {"X7 REBAR with a bar count of 0 reads as one", 7, true, {}},
+    {"X8 no LTR capability", 8, true, {0x324}},
+    {"X9 no AER capability", 9, true, {0x158, 0x15C, 0x164, 0x168}},
+    {"X10 registers already at their power-on values are not rewritten", 10, true, {0x324, 0x158, CFG_PCIE + 0x08}},
+    {"X11 extended capability header all-ones (link gone)", 11, true, {CFG_REBAR + 8, 0x324, 0x158, 0x15C, 0x164, 0x168}},
+    {"X12 REBAR already at its power-on size is not rewritten", 12, true, {CFG_REBAR + 8}}};
+  for (auto &x : xs) {
+    Setup s; if (x.shape == 6) s.rebar_bars = 0;
+    std::unique_ptr<Card> cx(make(s, &exp));
+    auto shape = [&] {
+      switch (x.shape) {
+        case 1: cx->put(0x50, 0x0003u << 16 | 0x50u << 8 | 0x01); break;                                 // 0x50 -> 0x50
+        case 2: cx->put(0x34, 0); break;
+        case 3: cx->put(CFG_PCIE, 0x0001u << 16 | 0xA0u << 8 | 0x10); break;
+        case 4: cx->put(0x100, 0); break;
+        case 5: cx->put(0x100, 0x100u << 20 | 1u << 16 | 0x000b); break;
+        case 7: cx->put(CFG_REBAR + 8, cx->dw(CFG_REBAR + 8) & ~0xE0u); break;
+        case 8: cx->put(0x270, 0x000u << 20 | 1u << 16 | 0x0019); break;
+        case 9: cx->put(0x150, 0x200u << 20 | 2u << 16 | 0x000b); break;                               // AER (0x150) becomes vendor-specific
+        case 10: cx->put(0x324, 0); cx->put(0x158, 0); cx->put(CFG_PCIE + 0x08, 0x2810); break;
+        case 11: cx->put(0x100, 0xffffffff); break;
+        case 12: cx->put(CFG_REBAR + 8, (cx->dw(CFG_REBAR + 8) & ~0x3f00u) | 15u << 8); break;   // the reset default (cfg_defaults)
+      }
+    };
+    shape();
+    Outcome o1 = run(*cx);
+    bool aspm = (cx->cfg_rd(CFG_PCIE + 0x10, 2) & 3) == 0;
+    cx->regs[GC_SCRATCH_REG6] = 1; shape();   // a stale session, same shape
+    Outcome o2 = run(*cx);
+    std::set<uint32_t> w; for (size_t j = cx->reset_cfg_index; j < cx->cfg_writes.size(); j++) w.insert(cx->cfg_writes[j].off);
+    bool none = true; for (uint32_t off : x.not_restored) none = none && !w.count(off);
+    check(booted(o1, *cx) && aspm == x.aspm_cleared && booted(o2, *cx) && cx->mode1_count == 1 && none, std::string(x.tag) + why(o1) + why(o2));
+  }
+
+  // ================= V: VBIOS corners: glitches, tables at the image end, versions not read, no getsmuclockinfo, a lane cap =================
+  struct { const char *tag; void (*edit)(std::vector<uint8_t> &); const char *err; } vs2[] = {
+    {"V1 ROM byte 1 not 0xAA", [](std::vector<uint8_t> &i) { i[1] = 0; }, "no AMD ROM through ROM_INDEX/ROM_DATA"},
+    {"V2 ROM signature text wrong", [](std::vector<uint8_t> &i) { i[0x31] = 'X'; }, "no AMD ROM through ROM_INDEX/ROM_DATA"},
+    {"V3 ROM table 4 bytes before the end: no room for the magic", [](std::vector<uint8_t> &i) { w16(i, 0x48, 0xFFFA); }, "no ATOM/MOTA"},
+    {"V4 vram_usagebyfirmware v2.0", [](std::vector<uint8_t> &i) { i[VRU + 3] = 0; }, ""},
+    {"V5 umc_info v3.3 at the image end: its config bytes read as 0", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(umc_info), 0xFFF0); i[0xFFF2] = 3; i[0xFFF3] = 3; }, ""},
+    {"V6 umc_info v3.4 (not read)", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(umc_info), UMC); i[UMC + 2] = 3; i[UMC + 3] = 4; }, ""},
+    {"V7 umc_info v4.1 (not read)", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(umc_info), UMC); i[UMC + 2] = 4; i[UMC + 3] = 1; }, ""},
+    {"V8 no getsmuclockinfo: boot clocks 0", [](std::vector<uint8_t> &i) { w16(i, CMT + 4 + 2 * 41, 0); }, ""},
+    {"V9 no getsmuclockinfo, firmwareinfo v3.1", [](std::vector<uint8_t> &i) { w16(i, CMT + 4 + 2 * 41, 0); i[FWI + 3] = 1; }, ""},
+    {"V10 master data table ending on an odd byte: entries past it read short", [](std::vector<uint8_t> &i) {
+       const uint32_t md = 0xFFCB; memcpy(&i[md], &i[MDT], 0x10000 - md); w16(i, HDR + 0x20, md); }, ""}};
+  for (auto &v : vs2) {
+    std::unique_ptr<Card> cv(make_from(vbios_with(v.edit), {})); Outcome o = run(*cv);
+    check(v.err[0] ? failed(o, *cv, v.err) : booted(o, *cv), std::string(v.tag) + why(o));
+  }
+  { std::unique_ptr<Card> cv(make_from(vbios_with([](std::vector<uint8_t> &i) { w16(i, CMT + 4 + 2 * 41, 0); }), {})); Outcome o = run(*cv);
+    check(booted(o, *cv) && cv->clk_calls.empty() && params(*cv, PPSMC_MSG_SetMinDeepSleepDcefclk) == std::vector<uint32_t>{0},
+          "V8: no getsmuclockinfo -> SetMinDeepSleepDcefclk(0)" + why(o)); }
+  struct { const char *tag; void (*edit)(std::vector<uint8_t> &); } vr[] = {
+    {"V11 no vram_info", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(vram_info), 0); }},
+    {"V12 vram_info v2.3 at the image end", [](std::vector<uint8_t> &i) { w16(i, MDT_ENTRY(vram_info), 0xFFF0); i[0xFFF2] = 2; i[0xFFF3] = 3; }},
+    {"V13 vram_info v3.1 (not read)", [](std::vector<uint8_t> &i) { i[VRI + 2] = 3; i[VRI + 3] = 1; }},
+    {"V14 vram_info v2.2 (not read)", [](std::vector<uint8_t> &i) { i[VRI + 3] = 2; }}};
+  for (auto &v : vr) {
+    std::unique_ptr<Card> cv(make_from(vbios_with(v.edit), {})); Outcome o = run(*cv);
+    check(booted(o, *cv) && !cv->psp_log.empty() && cv->psp_log.back().flags.size() == 16 && cv->psp_log.back().flags[12] == 0,
+          std::string(v.tag) + " -> RAS init vram_type 0" + why(o));
+  }
+  { std::unique_ptr<Card> cv(make({}, &exp)); cv->rom_glitch = 0x00000055; Outcome o = run(*cv);
+    check(failed(o, *cv, "VBIOS signature incorrect 55 0"), "V15: the second ROM pass reads 55 00 -> the image check catches it" + why(o)); }
+  { std::unique_ptr<Card> cv(make_from(pp_with([](PP &p) { p.smcPPTable.PcieLaneCount[1] = 4; }), {})); Outcome o = run(*cv);
+    check(booted(o, *cv) && params(*cv, PPSMC_MSG_OverridePcieParameters) == std::vector<uint32_t>{0x10104},
+          "V16: VBIOS link level 1 at x8 (4) below the platform's x16: width kept, gen lowered -> 0x10104" + why(o)); }
+
+  // ================= D (more): ASIC_Init resetting only BAR0's upper dword / only REBAR =================
+  for (int k : {2, 3}) {   // BAR0 placed above 4 GiB (as MI50BarFix does), so a reset upper dword is a change
+    Setup s; s.post_resets_bar = k; std::unique_ptr<Card> cd(make(s, &exp));
+    cd->cfg_wr(0x14, 0x10, 4); cd->cfg_writes.clear();
+    const uint64_t placed = 0x10ull << 32 | PLACED_BAR0;
+    Outcome o = run(*cd);
+    std::set<uint32_t> w; for (auto &cw : cd->cfg_writes) w.insert(cw.off);
+    bool ok = booted(o, *cd) && cd->bar0() == placed && (cd->cfg_rd(CFG_REBAR + 8, 4) >> 8 & 0x3f) == 8 && w.count(CFG_REBAR + 8) == (k == 3 ? 1u : 0u) &&
+              w.count(0x14) == 1;
+    check(ok, std::string(k == 2 ? "D2: ASIC_Init reset only BAR0's upper dword: put back, REBAR untouched" : "D3: ASIC_Init reset only REBAR: put back") + why(o));
+  }
+
+  // ================= I8, J2 =================
+  { std::unique_ptr<Card> ci(make({}, &exp));
+    ci->cfg_wr(0x10, 0x0000000C, 4); ci->cfg_wr(0x14, 0x10, 4); ci->bar0_hi_moves = 2;
+    uint64_t t0 = ci->clock; bool ok = mi50::wait_bar0_placed(*ci, 5000); uint64_t ms = (ci->clock - t0) / 1000000;
+    check(ok && ms >= 40 && ms < 100, "I8: BAR0's upper dword moving -> placed after 3 equal reads of the final address (" + std::to_string(ms) + " ms)"); }
+  { Vbios v = build_vbios(); v.img[0] = 0; std::unique_ptr<Card> cj(new Card(v.img, FW)); cj->start(); mi50::MI50Device dj(*cj);
+    dj.init(); r = dj.init();
+    check(r == mi50::MI50Device::FAILED && strstr(dj.error(), "no AMD ROM"), std::string("J2: init() again after a failed one is refused, the first cause stays (") + dj.error() + ")"); }
+
+  // ================= E16: default ECC without memory ECC (UMC not RAS-supported) =================
+  { Umc u = {4, 0, 0x2, 0}; Setup s; s.fw_cap = 0x20000; s.umc = &u; std::unique_ptr<Card> ce(make(s, &exp)); Outcome o = run(*ce);
+    int cfgs = 0; for (auto &p : ce->psp_log) cfgs += p.kind == "BOOT_CFG";
+    check(booted(o, *ce) && cfgs == 1 && has(ce->logs, "GECC is disabled"), "E16: umc 4.0 default ECC but no memory ECC -> UMC not supported: GECC is disabled" + why(o)); }
+
+  // ================= T0: the driver's fixed boot layout = AM's init_sw requests through the reference TLSFAllocator =================
+  { // AM's requests in order (amdev.py init_sw, ip.py AM_GMC/AM_IH/AM_PSP/AM_SMU init_sw), each palloc'd: size rounded up to 4 KiB
+    const uint64_t req[mi50::MI50Device::B_COUNT][2] = {{0x1000, 0x1000}, {0x1000, 0x1000}, {0x1000, 0x1000},
+      {256 << 10, 0x1000}, {0x1000, 0x1000}, {256 << 10, 0x1000}, {0x1000, 0x1000},
+      {1 << 20, 1 << 20}, {0x1000, 0x1000}, {0x1000, 0x1000}, {0x10000, 0x1000}, {0x4000, 0x4000}, {0x1300000, 1 << 20},
+      {sizeof(PPTable_t), 0x1000}, {sizeof(Watermarks_t), 0x1000}, {0x19000, 0x1000}, {sizeof(OverDriveTable_t), 0x1000}, {sizeof(SmuMetrics_t), 0x1000},
+      {sizeof(DpmActivityMonitorCoeffInt_t), 0x1000}};
+    const mi50::MI50Device::BootBuf *bl = mi50::MI50Device::boot_layout();
+    Tlsf t; t.init(32ull << 20, 0); int bad = 0; std::string first;
+    for (int i = 0; i < mi50::MI50Device::B_COUNT; i++) {
+      uint64_t a = ~0ull; bool ok = t.alloc(round_up(req[i][0], 0x1000), req[i][1], &a);
+      if (!(ok && a == bl[i].addr && bl[i].size == req[i][0] && bl[i].align == req[i][1]) && !bad++)
+        first = " first: #" + std::to_string(i) + " reference " + hx(a) + " driver " + hx(bl[i].addr);
+    }
+    check(bad == 0, "T0: every one of the driver's " + std::to_string((int)mi50::MI50Device::B_COUNT) + " boot buffers has the size, alignment and address "
+          "the reference allocator gives AM's request" + first); }
+
+  // ================= T: the reference TLSF allocator itself, against hand traces =================
+  { Tlsf t; uint64_t a = 0;
+    t.init(0, 0);
+    check(!t.alloc(16, 16, &a), "T1: an empty region allocates nothing");
+    std::vector<std::pair<uint64_t, uint64_t>> got;   // (address, size)
+    const uint64_t base = 0x40000, total = 0x10000;
+    bool ok = true; t.init(total, base);
+    const uint64_t req[][2] = {{0x1000, 0x1000}, {0x100, 0x1000}, {1, 1}, {1, 1}, {0x3000, 0x4000}, {0x20, 0x10}};
+    for (auto &q : req) { ok = ok && t.alloc(q[0], q[1], &a) && (a - base) % q[1] == 0; got.push_back({a, std::max<uint64_t>(q[0], 16)}); }
+    while (t.alloc(0x400, 0x400, &a)) got.push_back({a, 0x400});
+    for (size_t i = 0; i < got.size(); i++) {
+      ok = ok && got[i].first >= base && got[i].first + got[i].second <= base + total;
+      for (size_t j = 0; j < i; j++) ok = ok && (got[i].first + got[i].second <= got[j].first || got[j].first + got[j].second <= got[i].first);
+    }
+    check(ok && got.size() > 10, "T2: TLSF allocations aligned, inside the region, never overlapping, until the region is used up (" + std::to_string(got.size()) + ")");
+    int n = 0; t.init(total, 0);
+    while (t.alloc(16, 1, &a)) n++;
+    check(n == Tlsf::MAXB - 1, "T3: 16-byte allocations stop when the 128 block records are used (" + std::to_string(n) + " made)");
+    t.init(total, 0); bool seq_ok = true;
+    for (int i = 0; i < 125; i++) seq_ok = seq_ok && t.alloc(16, 1, &a);   // 126 records, 2 spare; the free rest starts at 2000 (not 32-aligned)
+    uint64_t x1 = 0, x2 = 0;
+    bool aligned = t.alloc(16, 32, &x1);   // the alignment split and the size split take the last 2 records: 2016, leaving [2000, 2016) free
+    bool refused = !t.alloc(16, 32, &x2);   // 2032 needs an alignment split: no record left, nothing changed
+    bool frag = t.alloc(16, 1, &x2);        // the 16-byte fragment fits exactly: no split needed
+    check(seq_ok && aligned && x1 == 2016 && refused && frag && x2 == 2000,
+          "T3b: an aligned allocation without a free record for its split is refused with the allocator unchanged (fragment 2000 still served)");
+    // T4: a sequence traced by hand through tinygrad's TLSFAllocator.alloc (support/memory.py) on 128 KiB
+    t.init(0x20000, 0); uint64_t r[5] = {}; bool okr[5];
+    okr[0] = t.alloc(0x7800, 1, &r[0]);       // block 0 (l1 18) split: [0, 0x7800) taken, [0x7800, 0x20000) free (l1 17, l2 8)
+    okr[1] = t.alloc(0x100, 0x10000, &r[1]);  // bucket (17, 1): align split at 0x10000 leaves [0x7800, 0x10000) (16, 1), size split leaves 0xFF00 (16, 15)
+    okr[2] = t.alloc(0xF000, 1, &r[2]);       // bucket (16, 14) -> the 0xFF00 block at 0x10100
+    okr[3] = t.alloc(0x9000, 1, &r[3]);       // bucket (16, 2): level 16 only has (16, 1) -> nothing larger anywhere: MemoryError
+    okr[4] = t.alloc(0x8800, 1, &r[4]);       // bucket (16, 1): the 0x8800 block, an exact fit (no split)
+    check(okr[0] && r[0] == 0 && okr[1] && r[1] == 0x10000 && okr[2] && r[2] == 0x10100 && !okr[3] && okr[4] && r[4] == 0x7800,
+          "T4: hand-traced TLSF sequence: 0, 0x10000, 0x10100, MemoryError, 0x7800 (exact fit): " + hx(r[0]) + " " + hx(r[1]) + " " + hx(r[2]) + " " + hx(r[4]));
+    // T5: two free 16-byte fragments in one bucket (storage[5][0]) are served oldest first, like the reference's list[0]
+    t.init(0x1000, 0); uint64_t f[5] = {};
+    bool okf = t.alloc(16, 1, &f[0]) && t.alloc(16, 32, &f[1]) && t.alloc(16, 64, &f[2]);   // fragments [16, 32) then [48, 64)
+    okf = okf && t.alloc(16, 1, &f[3]) && t.alloc(16, 1, &f[4]);
+    check(okf && f[0] == 0 && f[1] == 32 && f[2] == 64 && f[3] == 16 && f[4] == 48,
+          "T5: fragments of one bucket go out oldest first: " + hx(f[3]) + " then " + hx(f[4]));
+    // T6: a younger fragment in a lower record ([80, 96) re-inserted into record 3 after [48, 64) went into record 5): still oldest first
+    t.init(0x1000, 0); uint64_t g[7] = {};
+    bool okg = t.alloc(16, 1, &g[0]) && t.alloc(16, 64, &g[1]) && t.alloc(16, 32, &g[2]) && t.alloc(16, 32, &g[3]) &&
+               t.alloc(16, 1, &g[4]) && t.alloc(16, 1, &g[5]) && t.alloc(16, 1, &g[6]);
+    check(okg && g[0] == 0 && g[1] == 64 && g[2] == 32 && g[3] == 96 && g[4] == 16 && g[5] == 48 && g[6] == 80,
+          "T6: three fragments of one bucket, records out of age order: served 16, 48, 80: " + hx(g[4]) + " " + hx(g[5]) + " " + hx(g[6])); }
+
+  printf("\n%d ok / %d FAIL\n", nok, nfail);
+  return nfail ? 1 : 0;
+}
